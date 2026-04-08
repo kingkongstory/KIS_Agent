@@ -21,6 +21,9 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# CLI
+clap = { version = "4", features = ["derive"] }
+
 # 환경변수
 dotenvy = "0.15"
 

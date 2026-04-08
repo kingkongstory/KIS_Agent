@@ -242,7 +242,7 @@ impl PostgresStore {
         interval_min: i16,
     ) -> Result<Vec<MinuteCandle>, KisError> {
         let rows: Vec<MinuteRow> = sqlx::query_as(
-            "SELECT datetime, open, high, low, close, volume, interval_min FROM minute_ohlcv
+            "SELECT datetime::timestamp as datetime, open, high, low, close, volume, interval_min FROM minute_ohlcv
              WHERE stock_code = $1 AND datetime >= $2 AND datetime <= $3 AND interval_min = $4
              ORDER BY datetime ASC",
         )
@@ -274,7 +274,7 @@ impl PostgresStore {
         stock_code: &str,
     ) -> Result<Option<NaiveDate>, KisError> {
         let row: Option<(NaiveDateTime,)> = sqlx::query_as(
-            "SELECT datetime FROM minute_ohlcv WHERE stock_code = $1 ORDER BY datetime DESC LIMIT 1",
+            "SELECT datetime::timestamp as datetime FROM minute_ohlcv WHERE stock_code = $1 ORDER BY datetime DESC LIMIT 1",
         )
         .bind(stock_code)
         .fetch_optional(&self.pool)

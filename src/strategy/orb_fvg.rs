@@ -1,0 +1,680 @@
+use chrono::NaiveTime;
+use tracing::{debug, info};
+
+use super::candle::{self, MinuteCandle};
+use super::fvg::{self, FairValueGap, FvgDirection};
+use super::types::*;
+
+/// ORB+FVG 전략 설정
+#[derive(Debug, Clone)]
+pub struct OrbFvgConfig {
+    /// 손익비 (기본 2.0)
+    pub rr_ratio: f64,
+    /// OR 시작 시각
+    pub or_start: NaiveTime,
+    /// OR 종료 시각 (= 스캐닝 시작)
+    pub or_end: NaiveTime,
+    /// 신규 진입 마감 시각
+    pub entry_cutoff: NaiveTime,
+    /// 강제 청산 시각
+    pub force_exit: NaiveTime,
+    /// 시간 스탑: 진입 후 N캔들 내 1R 미달 시 청산 (기본 6 = 30분)
+    pub time_stop_candles: usize,
+    /// 트레일링 스탑 간격 (R 배수, 기본 0.5R)
+    pub trailing_r: f64,
+    /// ATR 기반 최소 손절 배수 (기본 1.5 × ATR)
+    pub atr_sl_multiplier: f64,
+    /// FVG 유효시간 (캔들 수, 기본 4 = 20분)
+    pub fvg_expiry_candles: usize,
+    /// 2차 진입 허용 최소 1차 수익률 (%, 기본 0.5)
+    pub min_first_pnl_for_second: f64,
+}
+
+impl Default for OrbFvgConfig {
+    fn default() -> Self {
+        Self {
+            rr_ratio: 2.0,
+            or_start: NaiveTime::from_hms_opt(9, 0, 0).unwrap(),
+            or_end: NaiveTime::from_hms_opt(9, 15, 0).unwrap(),
+            entry_cutoff: NaiveTime::from_hms_opt(15, 20, 0).unwrap(),
+            force_exit: NaiveTime::from_hms_opt(15, 25, 0).unwrap(),
+            time_stop_candles: 6,
+            trailing_r: 0.5,
+            atr_sl_multiplier: 1.5,
+            fvg_expiry_candles: 4,
+            min_first_pnl_for_second: 0.5,
+        }
+    }
+}
+
+/// ORB+FVG 전략 엔진
+pub struct OrbFvgStrategy {
+    pub config: OrbFvgConfig,
+}
+
+impl OrbFvgStrategy {
+    pub fn new(rr_ratio: f64) -> Self {
+        Self {
+            config: OrbFvgConfig {
+                rr_ratio,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// 백테스트용: 하루 전체 캔들 입력 → 결과 목록 반환
+    ///
+    /// 최대 2회 진입:
+    /// - 1차: OR 돌파 + FVG 동시 형성 → 리트레이스 진입
+    /// - 1차 수익 시: 같은 방향 FVG만으로 2차 진입 (OR 돌파 조건 생략)
+    /// - 1차 손실 시: 하루 종료
+    pub fn run_day(&self, candles: &[MinuteCandle]) -> Vec<TradeResult> {
+        let mut results = Vec::new();
+
+        if candles.is_empty() {
+            return results;
+        }
+
+        let is_5m_input = candles.len() >= 2
+            && (candles[1].time - candles[0].time).num_minutes() >= 4;
+
+        // 1) OR 범위 확정
+        let or_candles: Vec<_> = candles
+            .iter()
+            .filter(|c| c.time >= self.config.or_start && c.time < self.config.or_end)
+            .cloned()
+            .collect();
+
+        if or_candles.is_empty() {
+            debug!("OR 기간 캔들 없음");
+            return results;
+        }
+
+        let or_high = or_candles.iter().map(|c| c.high).max().unwrap();
+        let or_low = or_candles.iter().map(|c| c.low).min().unwrap();
+        info!("OR 범위: HIGH={or_high}, LOW={or_low} ({}개 캔들)", or_candles.len());
+
+        // 2) 5분봉 준비
+        let scan_candles: Vec<_> = candles
+            .iter()
+            .filter(|c| c.time >= self.config.or_end)
+            .cloned()
+            .collect();
+
+        let candles_5m = if is_5m_input {
+            scan_candles
+        } else {
+            candle::aggregate(&scan_candles, 5)
+        };
+        if candles_5m.is_empty() {
+            return results;
+        }
+
+        // 3) 1차 진입: OR 돌파 + FVG
+        let (first_result, exit_idx, confirmed_side) =
+            self.scan_and_trade(&candles_5m, or_high, or_low, true);
+
+        match first_result {
+            Some(trade) if trade.is_win() => {
+                let side = confirmed_side.unwrap();
+                let pnl = trade.pnl_pct();
+                results.push(trade);
+
+                // 4) 2차 진입: 1차 수익 0.5% 이상일 때만 허용
+                //    약한 1차 수익 후 2차 진입은 고점 추격이 될 위험
+                if pnl < self.config.min_first_pnl_for_second {
+                    info!("1차 거래 수익 ({:?} +{:.2}%) — 수익 부족, 2차 진입 안 함", side, pnl);
+                } else if exit_idx < candles_5m.len() {
+                    info!("1차 거래 수익 ({:?} +{:.2}%) — 같은 방향 2차 진입 탐색", side, pnl);
+                    let remaining = &candles_5m[exit_idx..];
+                    if let (Some(second), _, _) =
+                        self.scan_and_trade(remaining, or_high, or_low, false)
+                    {
+                        // 방향 일치 확인
+                        if second.side == side {
+                            info!("2차 거래: {:?} {:.2}%", second.side, second.pnl_pct());
+                            results.push(second);
+                        }
+                    }
+                }
+            }
+            Some(trade) => {
+                info!("1차 거래 손실 ({:.2}%) — 하루 종료", trade.pnl_pct());
+                results.push(trade);
+            }
+            None => {}
+        }
+
+        results
+    }
+
+    /// FVG 탐색 → 진입 → 청산까지 실행
+    ///
+    /// `require_or_breakout`: true면 OR 돌파+FVG 동시 감지, false면 FVG만
+    /// 반환: (거래 결과, 청산 시점 캔들 인덱스, 확인된 방향)
+    fn scan_and_trade(
+        &self,
+        candles_5m: &[MinuteCandle],
+        or_high: i64,
+        or_low: i64,
+        require_or_breakout: bool,
+    ) -> (Option<TradeResult>, usize, Option<PositionSide>) {
+        let mut pending_fvg: Option<FairValueGap> = None;
+        let mut breakout_side: Option<PositionSide> = None;
+        let mut fvg_formed_idx: usize = 0;
+
+        for (idx, c5) in candles_5m.iter().enumerate() {
+            if c5.time >= self.config.entry_cutoff {
+                break;
+            }
+
+            // FVG 유효시간 체크
+            if pending_fvg.is_some() && idx - fvg_formed_idx > self.config.fvg_expiry_candles {
+                info!(
+                    "{}: FVG 유효시간 초과 ({}캔들) — 폐기, 재탐색",
+                    c5.time, self.config.fvg_expiry_candles
+                );
+                pending_fvg = None;
+                breakout_side = None;
+            }
+
+            // 1단계: FVG 감지
+            if pending_fvg.is_none() && idx >= 2 {
+                let a = &candles_5m[idx - 2];
+                let b = &candles_5m[idx - 1];
+                let c = c5;
+
+                // Bullish FVG
+                if b.is_bullish() && a.high < c.low {
+                    let or_ok = !require_or_breakout || b.close > or_high;
+                    if or_ok {
+                        let label = if require_or_breakout { "OR HIGH 돌파 + " } else { "2차 " };
+                        let gap = FairValueGap {
+                            direction: FvgDirection::Bullish,
+                            top: c.low,
+                            bottom: a.high,
+                            candle_b_idx: idx - 1,
+                            stop_loss: a.low,
+                        };
+                        info!(
+                            "{}: {label}Bullish FVG — 갭 [{}, {}], SL={}",
+                            b.time, gap.bottom, gap.top, gap.stop_loss
+                        );
+                        pending_fvg = Some(gap);
+                        breakout_side = Some(PositionSide::Long);
+                        fvg_formed_idx = idx;
+                        continue;
+                    }
+                }
+
+                // Bearish FVG
+                if b.is_bearish() && a.low > c.high {
+                    let or_ok = !require_or_breakout || b.close < or_low;
+                    if or_ok {
+                        let label = if require_or_breakout { "OR LOW 돌파 + " } else { "2차 " };
+                        let gap = FairValueGap {
+                            direction: FvgDirection::Bearish,
+                            top: a.low,
+                            bottom: c.high,
+                            candle_b_idx: idx - 1,
+                            stop_loss: a.high,
+                        };
+                        info!(
+                            "{}: {label}Bearish FVG — 갭 [{}, {}], SL={}",
+                            b.time, gap.bottom, gap.top, gap.stop_loss
+                        );
+                        pending_fvg = Some(gap);
+                        breakout_side = Some(PositionSide::Short);
+                        fvg_formed_idx = idx;
+                        continue;
+                    }
+                }
+            }
+
+            // 2단계: FVG 리트레이스 진입
+            if let Some(ref gap) = pending_fvg {
+                let side = breakout_side.unwrap();
+                let retrace_price = match side {
+                    PositionSide::Long => c5.low,
+                    PositionSide::Short => c5.high,
+                };
+
+                if gap.contains_price(retrace_price) {
+                    let entry_price = gap.mid_price();
+                    let stop_loss = gap.stop_loss;
+                    let risk = (entry_price - stop_loss).abs();
+                    let take_profit = match side {
+                        PositionSide::Long => entry_price + (risk as f64 * self.config.rr_ratio) as i64,
+                        PositionSide::Short => entry_price - (risk as f64 * self.config.rr_ratio) as i64,
+                    };
+
+                    info!(
+                        "{}: {:?} 진입 — entry={}, SL={}, TP={} (RR=1:{:.1})",
+                        c5.time, side, entry_price, stop_loss, take_profit, self.config.rr_ratio
+                    );
+
+                    let result = self.simulate_exit(
+                        side,
+                        entry_price,
+                        stop_loss,
+                        take_profit,
+                        c5.time,
+                        &candles_5m[idx + 1..],
+                    );
+
+                    // 청산 시점의 캔들 인덱스 계산
+                    let exit_candle_idx = if let Some(ref r) = result {
+                        candles_5m.iter().position(|c| c.time >= r.exit_time)
+                            .unwrap_or(candles_5m.len())
+                    } else {
+                        candles_5m.len()
+                    };
+
+                    return (result, exit_candle_idx, Some(side));
+                }
+            }
+        }
+
+        (None, candles_5m.len(), None)
+    }
+
+    /// 진입 후 청산 시뮬레이션
+    ///
+    /// 청산 우선순위 (매 캔들마다):
+    /// 1. 원래 SL 또는 트레일링 SL 터치 → 손절/트레일링/본전 청산
+    /// 2. TP 도달 → 익절
+    /// 3. 시간 스탑: N캔들 경과 후 1R 미달 → 현재가 청산
+    /// 4. 장마감 → 강제 청산
+    fn simulate_exit(
+        &self,
+        side: PositionSide,
+        entry_price: i64,
+        stop_loss: i64,
+        take_profit: i64,
+        entry_time: NaiveTime,
+        remaining: &[MinuteCandle],
+    ) -> Option<TradeResult> {
+        let risk = (entry_price - stop_loss).abs() as f64;
+        let trailing_dist = (risk * self.config.trailing_r) as i64;
+        let mut current_sl = stop_loss;
+        let mut best_price = entry_price; // 유리한 방향 최고/최저가 추적
+        let mut reached_1r = false;
+
+        for (i, c) in remaining.iter().enumerate() {
+            // 유리한 방향 최적가 갱신
+            let favorable_price = match side {
+                PositionSide::Long => c.high,
+                PositionSide::Short => c.low,
+            };
+            best_price = match side {
+                PositionSide::Long => best_price.max(favorable_price),
+                PositionSide::Short => best_price.min(favorable_price),
+            };
+
+            // 1R 도달 체크 → 본전 스탑 활성화
+            let profit_from_entry = match side {
+                PositionSide::Long => best_price - entry_price,
+                PositionSide::Short => entry_price - best_price,
+            };
+            if !reached_1r && profit_from_entry >= risk as i64 {
+                reached_1r = true;
+                current_sl = entry_price; // 본전 스탑
+                info!("{}: 1R 도달 — 본전 스탑 활성화 (SL → {})", c.time, current_sl);
+            }
+
+            // 트레일링 스탑 갱신 (1R 도달 후)
+            if reached_1r {
+                let new_sl = match side {
+                    PositionSide::Long => best_price - trailing_dist,
+                    PositionSide::Short => best_price + trailing_dist,
+                };
+                let improved = match side {
+                    PositionSide::Long => new_sl > current_sl,
+                    PositionSide::Short => new_sl < current_sl,
+                };
+                if improved {
+                    current_sl = new_sl;
+                    debug!("{}: 트레일링 SL 갱신 → {}", c.time, current_sl);
+                }
+            }
+
+            // SL 체크 (원래 SL 또는 트레일링/본전 SL)
+            let sl_hit = match side {
+                PositionSide::Long => c.low <= current_sl,
+                PositionSide::Short => c.high >= current_sl,
+            };
+            if sl_hit {
+                let reason = if reached_1r && current_sl > stop_loss {
+                    if current_sl == entry_price {
+                        ExitReason::BreakevenStop
+                    } else {
+                        ExitReason::TrailingStop
+                    }
+                } else {
+                    ExitReason::StopLoss
+                };
+                info!("{}: {:?} — SL={}", c.time, reason, current_sl);
+                return Some(TradeResult {
+                    side,
+                    entry_price,
+                    exit_price: current_sl,
+                    stop_loss,
+                    take_profit,
+                    entry_time,
+                    exit_time: c.time,
+                    exit_reason: reason,
+                });
+            }
+
+            // TP 체크
+            let tp_hit = match side {
+                PositionSide::Long => c.high >= take_profit,
+                PositionSide::Short => c.low <= take_profit,
+            };
+            if tp_hit {
+                info!("{}: 익절 — TP={}", c.time, take_profit);
+                return Some(TradeResult {
+                    side,
+                    entry_price,
+                    exit_price: take_profit,
+                    stop_loss,
+                    take_profit,
+                    entry_time,
+                    exit_time: c.time,
+                    exit_reason: ExitReason::TakeProfit,
+                });
+            }
+
+            // 시간 스탑: N캔들 경과 후 1R 미달 → 수익/손실 무관 현재가 청산
+            // 핵심: 모멘텀이 없으면 수익이든 손실이든 빠르게 정리
+            if !reached_1r && i + 1 >= self.config.time_stop_candles {
+                info!(
+                    "{}: 시간 스탑 — {}캔들 경과, 1R 미달, 청산 (close={})",
+                    c.time, self.config.time_stop_candles, c.close
+                );
+                return Some(TradeResult {
+                    side,
+                    entry_price,
+                    exit_price: c.close,
+                    stop_loss,
+                    take_profit,
+                    entry_time,
+                    exit_time: c.time,
+                    exit_reason: ExitReason::TimeStop,
+                });
+            }
+
+            // 장마감 강제 청산
+            if c.time >= self.config.force_exit {
+                info!("{}: 장마감 청산 — close={}", c.time, c.close);
+                return Some(TradeResult {
+                    side,
+                    entry_price,
+                    exit_price: c.close,
+                    stop_loss,
+                    take_profit,
+                    entry_time,
+                    exit_time: c.time,
+                    exit_reason: ExitReason::EndOfDay,
+                });
+            }
+        }
+
+        remaining.last().map(|last| {
+            TradeResult {
+                side,
+                entry_price,
+                exit_price: last.close,
+                stop_loss,
+                take_profit,
+                entry_time,
+                exit_time: last.time,
+                exit_reason: ExitReason::EndOfDay,
+            }
+        })
+    }
+
+    /// 실시간용: 현재까지의 5분봉으로 전략 상태 평가
+    /// 반환: (진입 신호, OR 범위)
+    pub fn evaluate_candles(
+        &self,
+        candles_1m: &[MinuteCandle],
+    ) -> (Option<Signal>, Option<(i64, i64)>) {
+        if candles_1m.is_empty() {
+            return (None, None);
+        }
+
+        // OR 범위
+        let or_candles: Vec<_> = candles_1m
+            .iter()
+            .filter(|c| c.time >= self.config.or_start && c.time < self.config.or_end)
+            .cloned()
+            .collect();
+
+        if or_candles.is_empty() {
+            return (None, None);
+        }
+
+        let or_15m = candle::aggregate(&or_candles, 15);
+        let or_high = or_15m.iter().map(|c| c.high).max().unwrap();
+        let or_low = or_15m.iter().map(|c| c.low).min().unwrap();
+
+        // 스캐닝: 돌파 + FVG 동시 감지 → 리트레이스 진입
+        let scan_candles: Vec<_> = candles_1m
+            .iter()
+            .filter(|c| c.time >= self.config.or_end)
+            .cloned()
+            .collect();
+        let candles_5m = candle::aggregate(&scan_candles, 5);
+
+        let mut breakout_side: Option<PositionSide> = None;
+        let mut pending_fvg: Option<FairValueGap> = None;
+
+        for (idx, c5) in candles_5m.iter().enumerate() {
+            if c5.time >= self.config.entry_cutoff {
+                break;
+            }
+
+            // 1단계: 돌파 + FVG 동시 감지
+            if pending_fvg.is_none() && idx >= 2 {
+                let a = &candles_5m[idx - 2];
+                let b = &candles_5m[idx - 1];
+                let c = c5;
+
+                if b.is_bullish() && b.close > or_high && a.high < c.low {
+                    pending_fvg = Some(FairValueGap {
+                        direction: FvgDirection::Bullish,
+                        top: c.low,
+                        bottom: a.high,
+                        candle_b_idx: idx - 1,
+                        stop_loss: a.low,
+                    });
+                    breakout_side = Some(PositionSide::Long);
+                    continue;
+                }
+
+                if b.is_bearish() && b.close < or_low && a.low > c.high {
+                    pending_fvg = Some(FairValueGap {
+                        direction: FvgDirection::Bearish,
+                        top: a.low,
+                        bottom: c.high,
+                        candle_b_idx: idx - 1,
+                        stop_loss: a.high,
+                    });
+                    breakout_side = Some(PositionSide::Short);
+                    continue;
+                }
+            }
+
+            // 2단계: FVG 리트레이스 진입
+            if let Some(ref gap) = pending_fvg {
+                let side = breakout_side.unwrap();
+                let retrace_price = match side {
+                    PositionSide::Long => c5.low,
+                    PositionSide::Short => c5.high,
+                };
+
+                if gap.contains_price(retrace_price) {
+                    let entry_price = gap.mid_price();
+                    let stop_loss = gap.stop_loss;
+                    let risk = (entry_price - stop_loss).abs();
+                    let take_profit = match side {
+                        PositionSide::Long => entry_price + (risk as f64 * self.config.rr_ratio) as i64,
+                        PositionSide::Short => entry_price - (risk as f64 * self.config.rr_ratio) as i64,
+                    };
+
+                    return (
+                        Some(Signal {
+                            side,
+                            entry_price,
+                            stop_loss,
+                            take_profit,
+                            signal_time: c5.time,
+                        }),
+                        Some((or_high, or_low)),
+                    );
+                }
+            }
+        }
+
+        (None, Some((or_high, or_low)))
+    }
+
+    /// 현재가 기준 SL/TP 체크
+    pub fn check_exit(&self, position: &Position, current_price: i64) -> Option<ExitReason> {
+        match position.side {
+            PositionSide::Long => {
+                if current_price <= position.stop_loss {
+                    Some(ExitReason::StopLoss)
+                } else if current_price >= position.take_profit {
+                    Some(ExitReason::TakeProfit)
+                } else {
+                    None
+                }
+            }
+            PositionSide::Short => {
+                if current_price >= position.stop_loss {
+                    Some(ExitReason::StopLoss)
+                } else if current_price <= position.take_profit {
+                    Some(ExitReason::TakeProfit)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::NaiveDate;
+
+    fn mc(hour: u32, min: u32, open: i64, high: i64, low: i64, close: i64) -> MinuteCandle {
+        let total_min = hour * 60 + min;
+        MinuteCandle {
+            date: NaiveDate::from_ymd_opt(2026, 4, 8).unwrap(),
+            time: NaiveTime::from_hms_opt(total_min / 60, total_min % 60, 0).unwrap(),
+            open,
+            high,
+            low,
+            close,
+            volume: 1000,
+        }
+    }
+
+    fn build_or_candles(or_high: i64, or_low: i64) -> Vec<MinuteCandle> {
+        // 09:00~09:14 범위에서 OR HIGH/LOW를 만들어주는 캔들
+        let mut candles = Vec::new();
+        for m in 0..15 {
+            let (o, h, l, c) = if m == 0 {
+                (or_low, or_high, or_low, (or_high + or_low) / 2)
+            } else {
+                let mid = (or_high + or_low) / 2;
+                (mid, mid + 10, mid - 10, mid)
+            };
+            candles.push(mc(9, m, o, h, l, c));
+        }
+        candles
+    }
+
+    #[test]
+    fn test_run_day_long_tp() {
+        let strategy = OrbFvgStrategy::new(2.0);
+        let mut candles = build_or_candles(10000, 9800); // OR: 9800~10000
+
+        // 09:15 돌파 양봉: close > OR HIGH
+        candles.extend((0..5).map(|m| mc(9, 15 + m, 9950, 10100, 9940, 10050)));
+
+        // 09:20~09:24: FVG 형성 캔들 A
+        candles.extend((0..5).map(|m| mc(9, 20 + m, 10050, 10060, 10040, 10055)));
+        // 09:25~09:29: 큰 양봉 B
+        candles.extend((0..5).map(|m| mc(9, 25 + m, 10055, 10200, 10050, 10180)));
+        // 09:30~09:34: C (low > A.high = 10060 → FVG!)
+        candles.extend((0..5).map(|m| mc(9, 30 + m, 10180, 10200, 10080, 10150)));
+
+        // 09:35~09:39: 리트레이스 (low가 FVG 영역 [10060, 10080] 진입)
+        candles.extend((0..5).map(|m| mc(9, 35 + m, 10150, 10160, 10065, 10100)));
+
+        // 09:40~ : 상승 → TP 도달
+        for i in 0..20 {
+            candles.extend((0..5).map(|m| {
+                let base = 10100 + (i * 30) as i64;
+                mc(9, 40 + i * 5 + m, base, base + 50, base - 10, base + 40)
+            }));
+        }
+
+        let results = strategy.run_day(&candles);
+        assert!(!results.is_empty());
+        assert_eq!(results[0].side, PositionSide::Long);
+        assert!(results[0].is_win());
+    }
+
+    #[test]
+    fn test_run_day_no_breakout() {
+        let strategy = OrbFvgStrategy::new(2.0);
+        let mut candles = build_or_candles(10000, 9800);
+
+        // 09:15 이후 OR 범위 내에서 횡보 → 돌파 없음
+        for i in 0..60 {
+            candles.push(mc(9, 15 + i, 9900, 9950, 9850, 9920));
+        }
+
+        let results = strategy.run_day(&candles);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_check_exit_sl() {
+        let strategy = OrbFvgStrategy::new(2.0);
+        let pos = Position {
+            side: PositionSide::Long,
+            entry_price: 10000,
+            stop_loss: 9900,
+            take_profit: 10200,
+            entry_time: NaiveTime::from_hms_opt(9, 30, 0).unwrap(),
+            quantity: 1,
+        };
+
+        assert_eq!(strategy.check_exit(&pos, 10100), None);
+        assert_eq!(strategy.check_exit(&pos, 9900), Some(ExitReason::StopLoss));
+        assert_eq!(strategy.check_exit(&pos, 10200), Some(ExitReason::TakeProfit));
+    }
+
+    #[test]
+    fn test_check_exit_short() {
+        let strategy = OrbFvgStrategy::new(2.0);
+        let pos = Position {
+            side: PositionSide::Short,
+            entry_price: 10000,
+            stop_loss: 10100,
+            take_profit: 9800,
+            entry_time: NaiveTime::from_hms_opt(9, 30, 0).unwrap(),
+            quantity: 1,
+        };
+
+        assert_eq!(strategy.check_exit(&pos, 9900), None);
+        assert_eq!(strategy.check_exit(&pos, 10100), Some(ExitReason::StopLoss));
+        assert_eq!(strategy.check_exit(&pos, 9800), Some(ExitReason::TakeProfit));
+    }
+}

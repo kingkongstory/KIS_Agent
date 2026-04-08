@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use clap::{Parser, Subcommand};
 use tokio::sync::broadcast;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
@@ -10,6 +11,7 @@ use kis_agent::application::services::market_data_service::MarketDataService;
 use kis_agent::application::services::trading_service::TradingService;
 use kis_agent::config::AppConfig;
 use kis_agent::domain::ports::realtime::RealtimeData;
+use kis_agent::domain::types::StockCode;
 use kis_agent::infrastructure::cache::postgres_store::PostgresStore;
 use kis_agent::infrastructure::cache::sqlite_cache::SqliteCache;
 use kis_agent::infrastructure::collector::kis_minute::KisMinuteCollector;
@@ -22,6 +24,85 @@ use kis_agent::infrastructure::kis_client::rate_limiter::KisRateLimiter;
 use kis_agent::infrastructure::kis_client::trading::KisTradingAdapter;
 use kis_agent::presentation::app_state::AppState;
 use kis_agent::presentation::routes::create_router;
+use kis_agent::strategy::backtest::BacktestEngine;
+use kis_agent::strategy::live_runner::LiveRunner;
+
+#[derive(Parser)]
+#[command(name = "kis-agent", about = "KIS 자동매매 에이전트")]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// ORB+FVG 전략 실시간 모의투자
+    Trade {
+        /// 종목코드 (6자리, 예: 005930)
+        stock_code: String,
+        /// 손익비 (기본: 2.0)
+        #[arg(long, default_value = "2.0")]
+        rr: f64,
+        /// 주문 수량 (기본: 1)
+        #[arg(long, default_value = "1")]
+        qty: u64,
+    },
+    /// ORB+FVG 전략 백테스트
+    Backtest {
+        /// 종목코드 (6자리, 예: 005930)
+        stock_code: String,
+        /// 테스트 일수 (기본: 30)
+        #[arg(long, default_value = "30")]
+        days: usize,
+        /// 손익비 (기본: 2.0)
+        #[arg(long, default_value = "2.0")]
+        rr: f64,
+    },
+    /// 네이버 금융 일봉 수집
+    CollectDaily,
+    /// KIS API 당일 분봉 수집
+    CollectMinute,
+    /// 네이버 금융 분봉 수집 (근사 OHLCV)
+    CollectMinuteNaver {
+        /// 종목코드 (쉼표 구분, 예: 122630,005930)
+        #[arg(long, default_value = "122630")]
+        codes: String,
+        /// 분봉 간격 (기본: 1)
+        #[arg(long, default_value = "1")]
+        interval: i16,
+    },
+    /// Yahoo Finance 분봉 수집 (OHLCV, 최대 1달)
+    CollectYahoo {
+        /// 종목코드 (쉼표 구분, 예: 069500,122630)
+        #[arg(long, default_value = "069500,122630")]
+        codes: String,
+        /// 분봉 간격 (5m, 15m 등)
+        #[arg(long, default_value = "5m")]
+        interval: String,
+        /// 조회 범위 (1mo, 5d 등)
+        #[arg(long, default_value = "1mo")]
+        range: String,
+    },
+    /// 웹 서버 시작
+    Server,
+}
+
+/// KIS HTTP 클라이언트 생성 헬퍼
+fn create_kis_client(config: &AppConfig) -> Arc<KisHttpClient> {
+    let token_manager = Arc::new(TokenManager::new(
+        config.appkey.clone(),
+        config.appsecret.clone(),
+        config.environment,
+    ));
+    let rate_limiter = Arc::new(KisRateLimiter::new(config.environment));
+    Arc::new(KisHttpClient::new(
+        token_manager,
+        rate_limiter,
+        config.environment,
+        config.account_no.clone(),
+        config.account_product_code.clone(),
+    ))
+}
 
 #[tokio::main]
 async fn main() {
@@ -43,30 +124,138 @@ async fn main() {
         }
     };
 
-    // CLI 서브커맨드 처리
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() > 1 {
-        match args[1].as_str() {
-            "collect-daily" => {
-                run_collect_daily(&config).await;
-                return;
-            }
-            "collect-minute" => {
-                run_collect_minute(&config).await;
-                return;
-            }
-            _ => {
-                eprintln!("사용법:");
-                eprintln!("  cargo run                  — 웹 서버 시작");
-                eprintln!("  cargo run -- collect-daily  — 네이버 금융 일봉 수집");
-                eprintln!("  cargo run -- collect-minute — KIS API 당일 분봉 수집");
-                std::process::exit(1);
-            }
+    let cli = Cli::parse();
+
+    match cli.command {
+        Some(Commands::Trade { stock_code, rr, qty }) => {
+            run_trade(&config, &stock_code, rr, qty).await;
+        }
+        Some(Commands::Backtest { stock_code, days, rr }) => {
+            run_backtest(&config, &stock_code, days, rr).await;
+        }
+        Some(Commands::CollectDaily) => {
+            run_collect_daily(&config).await;
+        }
+        Some(Commands::CollectMinute) => {
+            run_collect_minute(&config).await;
+        }
+        Some(Commands::CollectMinuteNaver { codes, interval }) => {
+            run_collect_minute_naver(&config, &codes, interval).await;
+        }
+        Some(Commands::CollectYahoo { codes, interval, range }) => {
+            run_collect_yahoo(&config, &codes, &interval, &range).await;
+        }
+        Some(Commands::Server) | None => {
+            run_server(config).await;
         }
     }
+}
 
-    // 웹 서버 모드
-    run_server(config).await;
+/// ORB+FVG 실시간 트레이딩
+async fn run_trade(config: &AppConfig, stock_code: &str, rr: f64, qty: u64) {
+    let code = match StockCode::new(stock_code) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("종목코드 오류: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let client = create_kis_client(config);
+    let runner = LiveRunner::new(client, code, rr, qty);
+
+    match runner.run().await {
+        Ok(Some(result)) => {
+            info!(
+                "거래 완료: {:?} 손익={:.2}% RR={:.2}",
+                result.side,
+                result.pnl_pct(),
+                result.realized_rr()
+            );
+        }
+        Ok(None) => {
+            info!("오늘 거래 신호 없음");
+        }
+        Err(e) => {
+            eprintln!("트레이딩 에러: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// ORB+FVG 백테스트 (DB 기반)
+async fn run_backtest(config: &AppConfig, stock_code: &str, days: usize, rr: f64) {
+    let store = Arc::new(
+        PostgresStore::new(&config.database_url)
+            .await
+            .expect("PostgreSQL 연결 실패"),
+    );
+
+    // Yahoo 5분봉 데이터 기본 사용 (1분봉이 있으면 1로 변경 가능)
+    let source_interval = 5_i16;
+    let engine = BacktestEngine::new(store, rr, source_interval);
+
+    info!("=== ORB+FVG 백테스트 시작 ===");
+    info!("종목: {stock_code}, 기간: {days}일, RR: 1:{rr:.1}");
+
+    match engine.run(stock_code, days).await {
+        Ok(report) => {
+            println!("{report}");
+        }
+        Err(e) => {
+            eprintln!("백테스트 에러: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Yahoo Finance 분봉 수집
+async fn run_collect_yahoo(config: &AppConfig, codes: &str, interval: &str, range: &str) {
+    use kis_agent::infrastructure::collector::yahoo_minute::YahooMinuteCollector;
+
+    // interval 문자열에서 분 단위 추출 (e.g. "5m" → 5)
+    let db_interval_min: i16 = interval
+        .trim_end_matches('m')
+        .parse()
+        .unwrap_or(5);
+
+    info!("=== Yahoo Finance 분봉 수집 시작 ({interval}, {range}) ===");
+
+    let store = Arc::new(
+        PostgresStore::new(&config.database_url)
+            .await
+            .expect("PostgreSQL 연결 실패"),
+    );
+    let collector = YahooMinuteCollector::new(store);
+
+    let stock_codes: Vec<&str> = codes.split(',').map(|s| s.trim()).collect();
+    match collector
+        .collect_batch(&stock_codes, interval, range, db_interval_min)
+        .await
+    {
+        Ok(count) => info!("Yahoo 분봉 수집 완료: 총 {count}건"),
+        Err(e) => eprintln!("Yahoo 분봉 수집 실패: {e}"),
+    }
+}
+
+/// 네이버 금융 분봉 수집
+async fn run_collect_minute_naver(config: &AppConfig, codes: &str, interval: i16) {
+    use kis_agent::infrastructure::collector::naver_minute::NaverMinuteCollector;
+
+    info!("=== 네이버 금융 분봉 수집 시작 ({}분봉) ===", interval);
+
+    let store = Arc::new(
+        PostgresStore::new(&config.database_url)
+            .await
+            .expect("PostgreSQL 연결 실패"),
+    );
+    let collector = NaverMinuteCollector::new(store);
+
+    let stock_codes: Vec<&str> = codes.split(',').map(|s| s.trim()).collect();
+    match collector.collect_batch(&stock_codes, interval).await {
+        Ok(count) => info!("분봉 수집 완료: 총 {count}건"),
+        Err(e) => eprintln!("분봉 수집 실패: {e}"),
+    }
 }
 
 /// 네이버 금융 일봉 + 지수 수집
