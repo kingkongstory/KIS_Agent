@@ -1,0 +1,35 @@
+@import "tailwindcss";
+
+@theme {
+  --color-app-bg: #0A0A0A;
+  --color-card: #111111;
+  --color-chart-bg: #1A1A1A;
+  --color-border: #2A2A2A;
+  --color-text-primary: #F5F5F5;
+  --color-text-muted: #A0A0A0;
+  --color-rise: #00D084;
+  --color-fall: #FF6B35;
+  --color-flat: #666666;
+  --color-accent: #3B82F6;
+}
+
+body {
+  background-color: var(--color-app-bg);
+  color: var(--color-text-primary);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  margin: 0;
+  padding: 0;
+}
+
+/* 스크롤바 */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: var(--color-app-bg);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-border);
+  border-radius: 3px;
+}
