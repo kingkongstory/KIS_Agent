@@ -72,6 +72,18 @@ impl BacktestEngine {
         }
     }
 
+    pub fn with_config(
+        store: Arc<PostgresStore>,
+        config: super::orb_fvg::OrbFvgConfig,
+        source_interval: i16,
+    ) -> Self {
+        Self {
+            store,
+            strategy: OrbFvgStrategy { config },
+            source_interval,
+        }
+    }
+
     /// DB에서 분봉 조회 → 백테스트 실행
     pub async fn run(
         &self,

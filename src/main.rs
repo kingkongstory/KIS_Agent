@@ -57,6 +57,21 @@ enum Commands {
         /// 손익비 (기본: 2.0)
         #[arg(long, default_value = "2.0")]
         rr: f64,
+        /// 트레일링 간격 R배수 (기본: 0.1)
+        #[arg(long, default_value = "0.1")]
+        trail: f64,
+        /// 시간스탑 캔들 수 (기본: 3 = 15분)
+        #[arg(long, default_value = "3")]
+        tstop: usize,
+        /// 본전스탑 활성화 R배수 (기본: 0.3)
+        #[arg(long, default_value = "0.3")]
+        be_r: f64,
+        /// FVG 유효 캔들 수 (기본: 6 = 30분)
+        #[arg(long, default_value = "6")]
+        fvg_exp: usize,
+        /// 2차진입 최소 1차수익률 % (기본: 0.0 = 수익이면 무조건)
+        #[arg(long, default_value = "0.0")]
+        min2nd: f64,
     },
     /// 네이버 금융 일봉 수집
     CollectDaily,
@@ -130,8 +145,8 @@ async fn main() {
         Some(Commands::Trade { stock_code, rr, qty }) => {
             run_trade(&config, &stock_code, rr, qty).await;
         }
-        Some(Commands::Backtest { stock_code, days, rr }) => {
-            run_backtest(&config, &stock_code, days, rr).await;
+        Some(Commands::Backtest { stock_code, days, rr, trail, tstop, be_r, fvg_exp, min2nd }) => {
+            run_backtest(&config, &stock_code, days, rr, trail, tstop, be_r, fvg_exp, min2nd).await;
         }
         Some(Commands::CollectDaily) => {
             run_collect_daily(&config).await;
@@ -184,16 +199,28 @@ async fn run_trade(config: &AppConfig, stock_code: &str, rr: f64, qty: u64) {
 }
 
 /// ORB+FVG 백테스트 (DB 기반)
-async fn run_backtest(config: &AppConfig, stock_code: &str, days: usize, rr: f64) {
+async fn run_backtest(
+    config: &AppConfig, stock_code: &str, days: usize, rr: f64,
+    trail: f64, tstop: usize, be_r: f64, fvg_exp: usize, min2nd: f64,
+) {
+    use kis_agent::strategy::orb_fvg::OrbFvgConfig;
+
     let store = Arc::new(
         PostgresStore::new(&config.database_url)
             .await
             .expect("PostgreSQL 연결 실패"),
     );
 
-    // Yahoo 5분봉 데이터 기본 사용 (1분봉이 있으면 1로 변경 가능)
+    let mut strategy_config = OrbFvgConfig::default();
+    strategy_config.rr_ratio = rr;
+    strategy_config.trailing_r = trail;
+    strategy_config.time_stop_candles = tstop;
+    strategy_config.breakeven_r = be_r;
+    strategy_config.fvg_expiry_candles = fvg_exp;
+    strategy_config.min_first_pnl_for_second = min2nd;
+
     let source_interval = 5_i16;
-    let engine = BacktestEngine::new(store, rr, source_interval);
+    let engine = BacktestEngine::with_config(store, strategy_config, source_interval);
 
     info!("=== ORB+FVG 백테스트 시작 ===");
     info!("종목: {stock_code}, 기간: {days}일, RR: 1:{rr:.1}");

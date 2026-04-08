@@ -22,6 +22,8 @@ pub struct OrbFvgConfig {
     pub time_stop_candles: usize,
     /// 트레일링 스탑 간격 (R 배수, 기본 0.5R)
     pub trailing_r: f64,
+    /// 본전 스탑 활성화 기준 (R 배수, 기본 1.0R)
+    pub breakeven_r: f64,
     /// ATR 기반 최소 손절 배수 (기본 1.5 × ATR)
     pub atr_sl_multiplier: f64,
     /// FVG 유효시간 (캔들 수, 기본 4 = 20분)
@@ -38,11 +40,12 @@ impl Default for OrbFvgConfig {
             or_end: NaiveTime::from_hms_opt(9, 15, 0).unwrap(),
             entry_cutoff: NaiveTime::from_hms_opt(15, 20, 0).unwrap(),
             force_exit: NaiveTime::from_hms_opt(15, 25, 0).unwrap(),
-            time_stop_candles: 6,
-            trailing_r: 0.5,
+            time_stop_candles: 3,
+            trailing_r: 0.1,
+            breakeven_r: 0.3,
             atr_sl_multiplier: 1.5,
-            fvg_expiry_candles: 4,
-            min_first_pnl_for_second: 0.5,
+            fvg_expiry_candles: 6,
+            min_first_pnl_for_second: 0.0,
         }
     }
 }
@@ -316,7 +319,8 @@ impl OrbFvgStrategy {
                 PositionSide::Long => best_price - entry_price,
                 PositionSide::Short => entry_price - best_price,
             };
-            if !reached_1r && profit_from_entry >= risk as i64 {
+            let breakeven_dist = (risk * self.config.breakeven_r) as i64;
+            if !reached_1r && profit_from_entry >= breakeven_dist {
                 reached_1r = true;
                 current_sl = entry_price; // 본전 스탑
                 info!("{}: 1R 도달 — 본전 스탑 활성화 (SL → {})", c.time, current_sl);
