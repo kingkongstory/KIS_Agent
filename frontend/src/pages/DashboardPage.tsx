@@ -2,6 +2,7 @@ import { useEffect, useCallback } from 'react';
 import { CandleChart } from '../components/chart/CandleChart';
 import { StockPriceCard } from '../components/stock/StockPriceCard';
 import { StrategyPanel } from '../components/strategy/StrategyPanel';
+import { AccountSummary } from '../components/account/AccountSummary';
 import { useStockStore, STOCK_CODES } from '../stores/stockStore';
 import { getPrice, getCandles } from '../api/quotations';
 
@@ -45,8 +46,13 @@ export function DashboardPage() {
 
   return (
     <div className="flex flex-col gap-4 h-full">
-      {/* 자동매매 컨트롤 */}
-      <StrategyPanel />
+      {/* 계좌 + 자동매매 컨트롤 */}
+      <div className="grid grid-cols-3 gap-4">
+        <AccountSummary />
+        <div className="col-span-2">
+          <StrategyPanel />
+        </div>
+      </div>
       {/* 두 종목 가격 카드 */}
       <div className="grid grid-cols-2 gap-4">
         <StockPriceCard index={0} />

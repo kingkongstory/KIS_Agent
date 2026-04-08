@@ -1,18 +1,21 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::{Local, NaiveTime};
 use serde::Deserialize;
-use tracing::{error, info, warn};
+use tokio::sync::RwLock;
+use tracing::{debug, error, info, warn};
 
 use crate::domain::error::KisError;
-use crate::domain::models::order::{OrderRequest, OrderSide, OrderType};
+use crate::domain::models::order::{OrderSide, OrderType, OrderRequest};
 use crate::domain::models::price::InquirePrice;
 use crate::domain::serde_utils::string_to_i64;
 use crate::domain::types::{StockCode, TransactionId};
 use crate::infrastructure::kis_client::http_client::{HttpMethod, KisHttpClient, KisResponse};
 
-use super::candle::MinuteCandle;
-use super::orb_fvg::OrbFvgStrategy;
+use super::candle::{self, MinuteCandle};
+use super::fvg::{FairValueGap, FvgDirection};
+use super::orb_fvg::{OrbFvgConfig, OrbFvgStrategy};
 use super::types::*;
 
 /// KIS 분봉 응답 항목
@@ -32,223 +35,439 @@ struct MinutePriceItem {
     cntg_vol: i64,
 }
 
+/// 실시간 러너 공유 상태 (웹에서 읽기 가능)
+#[derive(Debug, Clone)]
+pub struct RunnerState {
+    pub phase: String,
+    pub today_trades: Vec<TradeResult>,
+    pub today_pnl: f64,
+    pub current_position: Option<Position>,
+}
+
 /// 실시간 트레이딩 러너
 pub struct LiveRunner {
     client: Arc<KisHttpClient>,
     strategy: OrbFvgStrategy,
     stock_code: StockCode,
-    /// 주문 수량 (주)
+    stock_name: String,
     quantity: u64,
+    /// 외부에서 중지 요청
+    stop_flag: Arc<AtomicBool>,
+    /// 공유 상태
+    pub state: Arc<RwLock<RunnerState>>,
 }
 
 impl LiveRunner {
     pub fn new(
         client: Arc<KisHttpClient>,
         stock_code: StockCode,
-        rr_ratio: f64,
+        stock_name: String,
         quantity: u64,
+        stop_flag: Arc<AtomicBool>,
     ) -> Self {
         Self {
             client,
-            strategy: OrbFvgStrategy::new(rr_ratio),
+            strategy: OrbFvgStrategy { config: OrbFvgConfig::default() },
             stock_code,
+            stock_name,
             quantity,
+            stop_flag,
+            state: Arc::new(RwLock::new(RunnerState {
+                phase: "초기화".to_string(),
+                today_trades: Vec::new(),
+                today_pnl: 0.0,
+                current_position: None,
+            })),
         }
     }
 
-    /// 장중 실행 루프
-    pub async fn run(&self) -> Result<Option<TradeResult>, KisError> {
-        let market_open = NaiveTime::from_hms_opt(9, 0, 0).unwrap();
-        let or_end = NaiveTime::from_hms_opt(9, 15, 0).unwrap();
-        let entry_cutoff = NaiveTime::from_hms_opt(15, 20, 0).unwrap();
-        let force_exit = NaiveTime::from_hms_opt(15, 25, 0).unwrap();
+    /// 장중 실행 루프 (토글 OFF 시 중단 가능)
+    pub async fn run(&self) -> Result<Vec<TradeResult>, KisError> {
+        let cfg = &self.strategy.config;
 
-        info!("=== ORB+FVG 실시간 트레이딩 시작 ===");
-        info!("종목: {}, 수량: {}주, RR: 1:{:.1}",
-            self.stock_code, self.quantity, self.strategy.config.rr_ratio);
+        info!("=== {} ({}) 자동매매 시작 ===", self.stock_name, self.stock_code);
+        info!("수량: {}주, RR: 1:{:.1}, 트레일링: {:.1}R, 본전: {:.1}R",
+            self.quantity, cfg.rr_ratio, cfg.trailing_r, cfg.breakeven_r);
 
         // 장 시작 대기
-        self.wait_until(market_open).await;
-        info!("장 시작 — OR 범위 수집 중 (09:00~09:15)");
+        self.update_phase("장 시작 대기").await;
+        self.wait_until(cfg.or_start).await;
+        if self.is_stopped() { return Ok(Vec::new()); }
 
-        // OR 종료 대기
-        self.wait_until(or_end).await;
-        info!("OR 기간 완료 — 신호 탐색 시작");
+        self.update_phase("OR 수집 중").await;
+        self.wait_until(cfg.or_end).await;
+        if self.is_stopped() { return Ok(Vec::new()); }
 
-        // 메인 폴링 루프
-        let mut position: Option<Position> = None;
-        let mut trade_result: Option<TradeResult> = None;
+        // 메인 루프: 분봉 폴링 → 전략 평가 → 주문 실행
+        let mut all_trades: Vec<TradeResult> = Vec::new();
+        let mut trade_count = 0;
+        let max_trades = 2;
+        let mut confirmed_side: Option<PositionSide> = None;
+
+        self.update_phase("신호 탐색").await;
 
         loop {
-            let now = Local::now().time();
-
-            // 시간 초과 체크
-            if now >= force_exit {
-                // 포지션 보유 중이면 강제 청산
-                if let Some(ref pos) = position {
-                    info!("15:25 — 포지션 강제 청산");
-                    trade_result = Some(self.close_position(pos, ExitReason::EndOfDay).await?);
+            if self.is_stopped() {
+                info!("{}: 외부 중지 요청", self.stock_name);
+                // 포지션 보유 중이면 청산
+                let state = self.state.read().await;
+                if let Some(ref pos) = state.current_position {
+                    drop(state);
+                    if let Ok(result) = self.close_position_market(ExitReason::EndOfDay).await {
+                        all_trades.push(result);
+                    }
                 }
                 break;
             }
 
-            if now >= entry_cutoff && position.is_none() {
-                info!("15:20 — 신규 진입 중단, 대기 종료");
+            let now = Local::now().time();
+
+            // 강제 청산 시각
+            if now >= cfg.force_exit {
+                let state = self.state.read().await;
+                if state.current_position.is_some() {
+                    drop(state);
+                    info!("{}: 장마감 강제 청산", self.stock_name);
+                    if let Ok(result) = self.close_position_market(ExitReason::EndOfDay).await {
+                        all_trades.push(result);
+                    }
+                }
                 break;
             }
 
-            // 포지션 보유 중: SL/TP 체크
-            if let Some(ref pos) = position {
-                match self.check_and_exit(pos).await {
+            // 진입 마감
+            if now >= cfg.entry_cutoff {
+                let state = self.state.read().await;
+                if state.current_position.is_none() {
+                    info!("{}: 진입 마감 (15:20)", self.stock_name);
+                    break;
+                }
+                drop(state);
+            }
+
+            // 포지션 보유 중: 실시간 청산 관리
+            let has_position = self.state.read().await.current_position.is_some();
+            if has_position {
+                match self.manage_position().await {
                     Ok(Some(result)) => {
-                        trade_result = Some(result);
-                        break; // 하루 1회 거래
+                        let is_win = result.is_win();
+                        let pnl = result.pnl_pct();
+                        let side = result.side;
+                        all_trades.push(result);
+                        trade_count += 1;
+                        self.update_pnl(&all_trades).await;
+
+                        if trade_count >= max_trades {
+                            info!("{}: 최대 거래 횟수 도달 ({}회)", self.stock_name, max_trades);
+                            break;
+                        }
+
+                        if !is_win {
+                            info!("{}: 1차 손실 — 하루 종료", self.stock_name);
+                            break;
+                        }
+
+                        if pnl < self.strategy.config.min_first_pnl_for_second && trade_count == 1 {
+                            info!("{}: 1차 수익 {:.2}% — 부족, 2차 진입 안 함", self.stock_name, pnl);
+                            break;
+                        }
+
+                        confirmed_side = Some(side);
+                        self.update_phase("2차 신호 탐색").await;
                     }
                     Ok(None) => {} // 유지
                     Err(e) => {
-                        error!("SL/TP 체크 실패: {e}");
+                        warn!("{}: 포지션 관리 실패: {e}", self.stock_name);
                     }
                 }
-            } else {
-                // 신호 탐색
-                match self.poll_and_evaluate().await {
-                    Ok(Some(signal)) => {
-                        info!(
-                            "신호 발생: {:?} entry={} SL={} TP={}",
-                            signal.side, signal.entry_price, signal.stop_loss, signal.take_profit
-                        );
-                        match self.enter_position(&signal).await {
-                            Ok(pos) => {
-                                info!("포지션 진입 완료: {:?} {}주 @ {}", pos.side, pos.quantity, pos.entry_price);
-                                position = Some(pos);
-                            }
-                            Err(e) => {
-                                error!("주문 실패: {e}");
-                            }
-                        }
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                continue;
+            }
+
+            // 분봉 폴링 → 신호 탐색 → 진입
+            match self.poll_and_enter(trade_count == 0, confirmed_side).await {
+                Ok(true) => {
+                    self.update_phase("포지션 보유").await;
+                }
+                Ok(false) => {} // 신호 없음
+                Err(e) => {
+                    warn!("{}: 폴링 실패: {e}", self.stock_name);
+                }
+            }
+
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        }
+
+        self.update_phase("종료").await;
+        self.update_pnl(&all_trades).await;
+
+        for (i, t) in all_trades.iter().enumerate() {
+            info!(
+                "{}: {}차 거래 {:?} {:.2}% ({:?})",
+                self.stock_name, i + 1, t.side, t.pnl_pct(), t.exit_reason
+            );
+        }
+
+        Ok(all_trades)
+    }
+
+    /// 분봉 폴링 → 전략 평가 → 진입
+    async fn poll_and_enter(
+        &self,
+        require_or_breakout: bool,
+        confirmed_side: Option<PositionSide>,
+    ) -> Result<bool, KisError> {
+        let candles = self.fetch_today_minute_candles().await?;
+        if candles.is_empty() {
+            return Ok(false);
+        }
+
+        // OR 범위
+        let cfg = &self.strategy.config;
+        let or_candles: Vec<_> = candles.iter()
+            .filter(|c| c.time >= cfg.or_start && c.time < cfg.or_end)
+            .collect();
+
+        if or_candles.is_empty() {
+            return Ok(false);
+        }
+
+        let or_high = or_candles.iter().map(|c| c.high).max().unwrap();
+        let or_low = or_candles.iter().map(|c| c.low).min().unwrap();
+
+        // 5분봉 집계
+        let scan: Vec<_> = candles.iter()
+            .filter(|c| c.time >= cfg.or_end)
+            .cloned()
+            .collect();
+        let candles_5m = candle::aggregate(&scan, 5);
+
+        // FVG 탐색
+        let mut pending_fvg: Option<FairValueGap> = None;
+        let mut fvg_side: Option<PositionSide> = None;
+        let mut fvg_formed_idx: usize = 0;
+
+        for (idx, c5) in candles_5m.iter().enumerate() {
+            if c5.time >= cfg.entry_cutoff { break; }
+
+            // FVG 유효시간 체크
+            if pending_fvg.is_some() && idx - fvg_formed_idx > cfg.fvg_expiry_candles {
+                pending_fvg = None;
+                fvg_side = None;
+            }
+
+            // FVG 감지
+            if pending_fvg.is_none() && idx >= 2 {
+                let a = &candles_5m[idx - 2];
+                let b = &candles_5m[idx - 1];
+                let c = c5;
+
+                if b.is_bullish() && a.high < c.low {
+                    let or_ok = !require_or_breakout || b.close > or_high;
+                    let side_ok = confirmed_side.map_or(true, |s| s == PositionSide::Long);
+                    if or_ok && side_ok {
+                        pending_fvg = Some(FairValueGap {
+                            direction: FvgDirection::Bullish,
+                            top: c.low, bottom: a.high,
+                            candle_b_idx: idx - 1, stop_loss: a.low,
+                        });
+                        fvg_side = Some(PositionSide::Long);
+                        fvg_formed_idx = idx;
                     }
-                    Ok(None) => {}
-                    Err(e) => {
-                        warn!("분봉 조회/평가 실패: {e}");
+                }
+
+                if pending_fvg.is_none() && b.is_bearish() && a.low > c.high {
+                    let or_ok = !require_or_breakout || b.close < or_low;
+                    let side_ok = confirmed_side.map_or(true, |s| s == PositionSide::Short);
+                    if or_ok && side_ok {
+                        pending_fvg = Some(FairValueGap {
+                            direction: FvgDirection::Bearish,
+                            top: a.low, bottom: c.high,
+                            candle_b_idx: idx - 1, stop_loss: a.high,
+                        });
+                        fvg_side = Some(PositionSide::Short);
+                        fvg_formed_idx = idx;
                     }
                 }
             }
 
-            // 다음 폴링까지 대기 (포지션 보유 시 30초, 미보유 시 60초)
-            let interval = if position.is_some() { 30 } else { 60 };
-            tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+            // 리트레이스 진입 확인
+            if let Some(ref gap) = pending_fvg {
+                let side = fvg_side.unwrap();
+                let retrace = match side {
+                    PositionSide::Long => c5.low,
+                    PositionSide::Short => c5.high,
+                };
+
+                if gap.contains_price(retrace) {
+                    let entry_price = gap.mid_price();
+                    let stop_loss = gap.stop_loss;
+                    let risk = (entry_price - stop_loss).abs();
+                    let take_profit = match side {
+                        PositionSide::Long => entry_price + (risk as f64 * cfg.rr_ratio) as i64,
+                        PositionSide::Short => entry_price - (risk as f64 * cfg.rr_ratio) as i64,
+                    };
+
+                    info!(
+                        "{}: {:?} 진입 신호 — entry={}, SL={}, TP={}",
+                        self.stock_name, side, entry_price, stop_loss, take_profit
+                    );
+
+                    // 주문 실행
+                    match self.execute_entry(side, entry_price, stop_loss, take_profit).await {
+                        Ok(_) => return Ok(true),
+                        Err(e) => {
+                            error!("{}: 주문 실패: {e}", self.stock_name);
+                            return Ok(false);
+                        }
+                    }
+                }
+            }
         }
 
-        if let Some(ref result) = trade_result {
-            info!("=== 거래 결과 ===");
-            info!(
-                "{:?} 진입={} 청산={} 손익={:.2}% RR={:.2} 사유={:?}",
-                result.side,
-                result.entry_price,
-                result.exit_price,
-                result.pnl_pct(),
-                result.realized_rr(),
-                result.exit_reason
-            );
-        } else {
-            info!("=== 오늘 거래 없음 ===");
-        }
-
-        Ok(trade_result)
+        Ok(false)
     }
 
-    /// 분봉 폴링 + 전략 평가
-    async fn poll_and_evaluate(&self) -> Result<Option<Signal>, KisError> {
-        let candles = self.fetch_today_minute_candles().await?;
-        if candles.is_empty() {
-            return Ok(None);
-        }
-
-        let (signal, or_range) = self.strategy.evaluate_candles(&candles);
-        if let Some((h, l)) = or_range {
-            info!("OR 범위: HIGH={h}, LOW={l} | 캔들 수: {}", candles.len());
-        }
-
-        Ok(signal)
-    }
-
-    /// SL/TP 체크 후 청산
-    async fn check_and_exit(&self, position: &Position) -> Result<Option<TradeResult>, KisError> {
+    /// 포지션 실시간 관리 (본전스탑/트레일링/시간스탑)
+    async fn manage_position(&self) -> Result<Option<TradeResult>, KisError> {
         let price = self.fetch_current_price().await?;
         let current = price.stck_prpr;
+        let now = Local::now().time();
+        let cfg = &self.strategy.config;
 
-        if let Some(reason) = self.strategy.check_exit(position, current) {
-            info!("청산 조건 충족: {:?} (현재가={})", reason, current);
-            let result = self.close_position(position, reason).await?;
+        let mut state = self.state.write().await;
+        let pos = match state.current_position.as_mut() {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+
+        let risk = (pos.entry_price - pos.stop_loss).abs() as f64;
+        let breakeven_dist = (risk * cfg.breakeven_r) as i64;
+        let trailing_dist = (risk * cfg.trailing_r) as i64;
+
+        // 유리한 방향 최적가 추적 (best_price를 entry_time에 임시 저장 → 별도 필드 필요)
+        // 간소화: 현재가로만 판단
+        let profit = match pos.side {
+            PositionSide::Long => current - pos.entry_price,
+            PositionSide::Short => pos.entry_price - current,
+        };
+
+        // 본전스탑 + 트레일링
+        if profit >= breakeven_dist {
+            let new_sl = match pos.side {
+                PositionSide::Long => current - trailing_dist,
+                PositionSide::Short => current + trailing_dist,
+            };
+            let improved = match pos.side {
+                PositionSide::Long => new_sl > pos.stop_loss,
+                PositionSide::Short => new_sl < pos.stop_loss,
+            };
+            if improved {
+                debug!("{}: 트레일링 SL 갱신 {} → {}", self.stock_name, pos.stop_loss, new_sl);
+                pos.stop_loss = new_sl;
+            }
+        }
+
+        // 손절 체크
+        let sl_hit = match pos.side {
+            PositionSide::Long => current <= pos.stop_loss,
+            PositionSide::Short => current >= pos.stop_loss,
+        };
+        if sl_hit {
+            let reason = if pos.stop_loss != pos.entry_price && profit > 0 {
+                ExitReason::TrailingStop
+            } else if pos.stop_loss == pos.entry_price {
+                ExitReason::BreakevenStop
+            } else {
+                ExitReason::StopLoss
+            };
+            drop(state);
+            let result = self.close_position_market(reason).await?;
+            return Ok(Some(result));
+        }
+
+        // 익절 체크
+        let tp_hit = match pos.side {
+            PositionSide::Long => current >= pos.take_profit,
+            PositionSide::Short => current <= pos.take_profit,
+        };
+        if tp_hit {
+            drop(state);
+            let result = self.close_position_market(ExitReason::TakeProfit).await?;
+            return Ok(Some(result));
+        }
+
+        // 시간스탑: 진입 후 N캔들(× 5분) 경과
+        let elapsed_min = (now - pos.entry_time).num_minutes();
+        let time_limit = cfg.time_stop_candles as i64 * 5;
+        if elapsed_min >= time_limit && profit < breakeven_dist {
+            drop(state);
+            let result = self.close_position_market(ExitReason::TimeStop).await?;
             return Ok(Some(result));
         }
 
         Ok(None)
     }
 
-    /// 포지션 진입 (시장가 주문)
-    async fn enter_position(&self, signal: &Signal) -> Result<Position, KisError> {
-        let side = match signal.side {
+    /// 시장가 진입 주문
+    async fn execute_entry(
+        &self,
+        side: PositionSide,
+        entry_price: i64,
+        stop_loss: i64,
+        take_profit: i64,
+    ) -> Result<(), KisError> {
+        let order_side = match side {
             PositionSide::Long => OrderSide::Buy,
             PositionSide::Short => OrderSide::Sell,
-        };
-
-        let order = OrderRequest {
-            stock_code: self.stock_code.clone(),
-            side,
-            order_type: OrderType::Market,
-            quantity: self.quantity,
-            price: 0,
         };
 
         let body = serde_json::json!({
             "CANO": self.client.account_no(),
             "ACNT_PRDT_CD": self.client.account_product_code(),
-            "PDNO": order.stock_code.as_str(),
-            "ORD_DVSN": order.ord_dvsn(),
-            "ORD_QTY": order.quantity.to_string(),
-            "ORD_UNPR": order.ord_unpr(),
+            "PDNO": self.stock_code.as_str(),
+            "ORD_DVSN": "01",
+            "ORD_QTY": self.quantity.to_string(),
+            "ORD_UNPR": "0",
         });
 
-        let tr_id = match side {
+        let tr_id = match order_side {
             OrderSide::Buy => TransactionId::OrderCashBuy,
             OrderSide::Sell => TransactionId::OrderCashSell,
         };
 
-        let resp: KisResponse<serde_json::Value> = self
-            .client
-            .execute(
-                HttpMethod::Post,
-                "/uapi/domestic-stock/v1/trading/order-cash",
-                &tr_id,
-                None,
-                Some(&body),
-            )
+        let resp: KisResponse<serde_json::Value> = self.client
+            .execute(HttpMethod::Post, "/uapi/domestic-stock/v1/trading/order-cash", &tr_id, None, Some(&body))
             .await?;
 
         if resp.rt_cd != "0" {
             return Err(KisError::classify(resp.rt_cd, resp.msg_cd, resp.msg1));
         }
 
-        info!("주문 체결: {:?} {}주", side, self.quantity);
+        info!("{}: {:?} {}주 진입 완료", self.stock_name, order_side, self.quantity);
 
-        Ok(Position {
-            side: signal.side,
-            entry_price: signal.entry_price,
-            stop_loss: signal.stop_loss,
-            take_profit: signal.take_profit,
+        let mut state = self.state.write().await;
+        state.current_position = Some(Position {
+            side,
+            entry_price,
+            stop_loss,
+            take_profit,
             entry_time: Local::now().time(),
             quantity: self.quantity,
-        })
+        });
+        state.phase = "포지션 보유".to_string();
+
+        Ok(())
     }
 
-    /// 포지션 청산 (시장가 반대 주문)
-    async fn close_position(
-        &self,
-        position: &Position,
-        reason: ExitReason,
-    ) -> Result<TradeResult, KisError> {
-        let side = match position.side {
+    /// 시장가 청산 주문
+    async fn close_position_market(&self, reason: ExitReason) -> Result<TradeResult, KisError> {
+        let mut state = self.state.write().await;
+        let pos = state.current_position.take()
+            .ok_or_else(|| KisError::Internal("청산할 포지션 없음".into()))?;
+        drop(state);
+
+        let order_side = match pos.side {
             PositionSide::Long => OrderSide::Sell,
             PositionSide::Short => OrderSide::Buy,
         };
@@ -257,25 +476,18 @@ impl LiveRunner {
             "CANO": self.client.account_no(),
             "ACNT_PRDT_CD": self.client.account_product_code(),
             "PDNO": self.stock_code.as_str(),
-            "ORD_DVSN": "01", // 시장가
-            "ORD_QTY": position.quantity.to_string(),
+            "ORD_DVSN": "01",
+            "ORD_QTY": pos.quantity.to_string(),
             "ORD_UNPR": "0",
         });
 
-        let tr_id = match side {
+        let tr_id = match order_side {
             OrderSide::Buy => TransactionId::OrderCashBuy,
             OrderSide::Sell => TransactionId::OrderCashSell,
         };
 
-        let resp: KisResponse<serde_json::Value> = self
-            .client
-            .execute(
-                HttpMethod::Post,
-                "/uapi/domestic-stock/v1/trading/order-cash",
-                &tr_id,
-                None,
-                Some(&body),
-            )
+        let resp: KisResponse<serde_json::Value> = self.client
+            .execute(HttpMethod::Post, "/uapi/domestic-stock/v1/trading/order-cash", &tr_id, None, Some(&body))
             .await?;
 
         if resp.rt_cd != "0" {
@@ -284,26 +496,70 @@ impl LiveRunner {
 
         let price = self.fetch_current_price().await?;
         let exit_price = price.stck_prpr;
+        let exit_time = Local::now().time();
 
-        info!("청산 완료: {:?} {}주 @ {}", side, position.quantity, exit_price);
+        info!("{}: {:?} 청산 — {} @ {} ({:?})", self.stock_name, pos.side, self.quantity, exit_price, reason);
 
-        Ok(TradeResult {
-            side: position.side,
-            entry_price: position.entry_price,
+        let result = TradeResult {
+            side: pos.side,
+            entry_price: pos.entry_price,
             exit_price,
-            stop_loss: position.stop_loss,
-            take_profit: position.take_profit,
-            entry_time: position.entry_time,
-            exit_time: Local::now().time(),
+            stop_loss: pos.stop_loss,
+            take_profit: pos.take_profit,
+            entry_time: pos.entry_time,
+            exit_time,
             exit_reason: reason,
-        })
+        };
+
+        let mut state = self.state.write().await;
+        state.current_position = None;
+        state.phase = "신호 탐색".to_string();
+
+        Ok(result)
     }
 
-    /// 당일 1분봉 전체 조회
+    // ── 헬퍼 메서드 ──
+
+    async fn update_phase(&self, phase: &str) {
+        self.state.write().await.phase = phase.to_string();
+    }
+
+    async fn update_pnl(&self, trades: &[TradeResult]) {
+        let mut state = self.state.write().await;
+        state.today_trades = trades.to_vec();
+        state.today_pnl = trades.iter().map(|t| t.pnl_pct()).sum();
+    }
+
+    fn is_stopped(&self) -> bool {
+        self.stop_flag.load(Ordering::Relaxed)
+    }
+
+    async fn wait_until(&self, target: NaiveTime) {
+        loop {
+            if self.is_stopped() { return; }
+            let now = Local::now().time();
+            if now >= target { return; }
+            let diff = (target - now).num_seconds().max(1) as u64;
+            let sleep_secs = diff.min(10);
+            tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)).await;
+        }
+    }
+
+    async fn fetch_current_price(&self) -> Result<InquirePrice, KisError> {
+        let query = [
+            ("FID_COND_MRKT_DIV_CODE", "J"),
+            ("FID_INPUT_ISCD", self.stock_code.as_str()),
+        ];
+        let resp: KisResponse<InquirePrice> = self.client
+            .execute(HttpMethod::Get, "/uapi/domestic-stock/v1/quotations/inquire-price",
+                &TransactionId::InquirePrice, Some(&query), None)
+            .await?;
+        resp.into_result()
+    }
+
     async fn fetch_today_minute_candles(&self) -> Result<Vec<MinuteCandle>, KisError> {
         let market_open = NaiveTime::from_hms_opt(9, 0, 0).unwrap();
         let market_close = NaiveTime::from_hms_opt(15, 30, 0).unwrap();
-
         let mut all_items = Vec::new();
         let mut fid_input_hour = "153000".to_string();
 
@@ -316,15 +572,10 @@ impl LiveRunner {
                 ("FID_PW_DATA_INCU_YN", "N"),
             ];
 
-            let resp: KisResponse<Vec<MinutePriceItem>> = self
-                .client
-                .execute(
-                    HttpMethod::Get,
+            let resp: KisResponse<Vec<MinutePriceItem>> = self.client
+                .execute(HttpMethod::Get,
                     "/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice",
-                    &TransactionId::InquireTimePrice,
-                    Some(&query),
-                    None,
-                )
+                    &TransactionId::InquireTimePrice, Some(&query), None)
                 .await?;
 
             if resp.rt_cd != "0" {
@@ -336,77 +587,28 @@ impl LiveRunner {
 
             let has_next = resp.has_next();
             let items = resp.output.unwrap_or_default();
-            if items.is_empty() {
-                break;
-            }
+            if items.is_empty() { break; }
 
             if let Some(last) = items.last() {
                 fid_input_hour = last.stck_cntg_hour.clone();
             }
             all_items.extend(items);
 
-            if !has_next {
-                break;
-            }
+            if !has_next { break; }
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
 
-        let mut candles: Vec<MinuteCandle> = all_items
-            .iter()
+        let mut candles: Vec<MinuteCandle> = all_items.iter()
             .filter_map(|item| {
                 let d = chrono::NaiveDate::parse_from_str(&item.stck_bsop_date, "%Y%m%d").ok()?;
                 let t = NaiveTime::parse_from_str(&item.stck_cntg_hour, "%H%M%S").ok()?;
-                if t < market_open || t > market_close {
-                    return None;
-                }
-                Some(MinuteCandle {
-                    date: d,
-                    time: t,
-                    open: item.stck_oprc,
-                    high: item.stck_hgpr,
-                    low: item.stck_lwpr,
-                    close: item.stck_prpr,
-                    volume: item.cntg_vol as u64,
-                })
+                if t < market_open || t > market_close { return None; }
+                Some(MinuteCandle { date: d, time: t, open: item.stck_oprc, high: item.stck_hgpr,
+                    low: item.stck_lwpr, close: item.stck_prpr, volume: item.cntg_vol as u64 })
             })
             .collect();
 
         candles.sort_by_key(|c| c.time);
         Ok(candles)
-    }
-
-    /// 현재가 조회
-    async fn fetch_current_price(&self) -> Result<InquirePrice, KisError> {
-        let query = [
-            ("FID_COND_MRKT_DIV_CODE", "J"),
-            ("FID_INPUT_ISCD", self.stock_code.as_str()),
-        ];
-
-        let resp: KisResponse<InquirePrice> = self
-            .client
-            .execute(
-                HttpMethod::Get,
-                "/uapi/domestic-stock/v1/quotations/inquire-price",
-                &TransactionId::InquirePrice,
-                Some(&query),
-                None,
-            )
-            .await?;
-
-        resp.into_result()
-    }
-
-    /// 특정 시각까지 대기
-    async fn wait_until(&self, target: NaiveTime) {
-        loop {
-            let now = Local::now().time();
-            if now >= target {
-                return;
-            }
-            let diff = (target - now).num_seconds().max(1) as u64;
-            let sleep_secs = diff.min(30); // 최대 30초씩 체크
-            info!("{}까지 대기 중... ({}초 남음)", target.format("%H:%M:%S"), diff);
-            tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)).await;
-        }
     }
 }

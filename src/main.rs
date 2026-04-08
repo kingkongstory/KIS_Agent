@@ -177,18 +177,15 @@ async fn run_trade(config: &AppConfig, stock_code: &str, rr: f64, qty: u64) {
     };
 
     let client = create_kis_client(config);
-    let runner = LiveRunner::new(client, code, rr, qty);
+    let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let runner = LiveRunner::new(client, code, stock_code.to_string(), qty, stop_flag);
 
     match runner.run().await {
-        Ok(Some(result)) => {
-            info!(
-                "거래 완료: {:?} 손익={:.2}% RR={:.2}",
-                result.side,
-                result.pnl_pct(),
-                result.realized_rr()
-            );
+        Ok(trades) if !trades.is_empty() => {
+            let pnl: f64 = trades.iter().map(|t| t.pnl_pct()).sum();
+            info!("거래 완료: {}건, 총 손익={:.2}%", trades.len(), pnl);
         }
-        Ok(None) => {
+        Ok(_) => {
             info!("오늘 거래 신호 없음");
         }
         Err(e) => {
@@ -441,7 +438,11 @@ async fn run_server(config: AppConfig) {
         trading: trading_service,
         account: account_service,
         realtime_tx,
-        strategy_manager: kis_agent::presentation::routes::strategy::StrategyManager::new(),
+        strategy_manager: {
+            let mgr = kis_agent::presentation::routes::strategy::StrategyManager::new();
+            mgr.set_client(Arc::clone(&http_client));
+            mgr
+        },
     };
 
     // CORS 미들웨어
