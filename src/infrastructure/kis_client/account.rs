@@ -36,8 +36,9 @@ impl AccountPort for KisAccountAdapter {
             ("CTX_AREA_NK100", ""),
         ];
 
-        // output1: 보유 종목 목록
-        let resp_positions: KisResponse<Vec<PositionItem>> = self
+        // 한 번 호출로 output1(종목) + output2(합계) 모두 가져옴
+        // output1 = Vec<PositionItem>, output2 = Vec<AccountSummary>
+        let resp: KisResponse<Vec<PositionItem>> = self
             .client
             .execute(
                 HttpMethod::Get,
@@ -48,20 +49,16 @@ impl AccountPort for KisAccountAdapter {
             )
             .await?;
 
-        if resp_positions.rt_cd != "0" {
-            return Err(KisError::classify(
-                resp_positions.rt_cd,
-                resp_positions.msg_cd,
-                resp_positions.msg1,
-            ));
+        if resp.rt_cd != "0" {
+            return Err(KisError::classify(resp.rt_cd, resp.msg_cd, resp.msg1));
         }
 
-        let positions = resp_positions.output.unwrap_or_default();
+        // output 또는 output1에 종목 목록
+        let positions = resp.output.or(resp.output1).unwrap_or_default();
 
-        // output2: 계좌 합계 — 별도 호출로 가져오거나 같은 응답에서 추출
-        // KIS API는 동일 응답에 output1(종목)과 output2(합계)를 함께 반환
-        // 여기서는 합계를 별도로 파싱하기 위해 raw JSON 재요청
-        let resp_summary: KisResponse<AccountSummary> = self
+        // output2는 Vec<AccountSummary>로 파싱될 수 없음 (타입이 다름)
+        // → 별도 호출로 output2를 Vec<AccountSummary>로 가져옴
+        let resp2: KisResponse<Vec<AccountSummary>> = self
             .client
             .execute(
                 HttpMethod::Get,
@@ -72,12 +69,14 @@ impl AccountPort for KisAccountAdapter {
             )
             .await?;
 
-        let summary = resp_summary.into_result2().unwrap_or(AccountSummary {
-            dnca_tot_amt: 0,
-            tot_evlu_amt: 0,
-            evlu_pfls_smtl_amt: 0,
-            pchs_amt_smtl_amt: 0,
-        });
+        let summary = resp2.output2
+            .and_then(|v| v.into_iter().next())
+            .unwrap_or(AccountSummary {
+                dnca_tot_amt: 0,
+                tot_evlu_amt: 0,
+                evlu_pfls_smtl_amt: 0,
+                pchs_amt_smtl_amt: 0,
+            });
 
         Ok((positions, summary))
     }
