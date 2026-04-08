@@ -1,6 +1,7 @@
 pub mod account;
 pub mod health;
 pub mod market_data;
+pub mod strategy;
 pub mod trading;
 
 use axum::Router;
@@ -14,6 +15,7 @@ pub fn create_router(state: AppState) -> Router {
         .merge(market_data::routes())
         .merge(trading::routes())
         .merge(account::routes())
+        .merge(strategy::routes())
         .merge(super::ws::routes())
         .with_state(state)
 }

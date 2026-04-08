@@ -3,7 +3,6 @@ import { cn } from '../../utils/cn';
 
 const NAV_ITEMS = [
   { path: '/', icon: '📊', label: '대시보드' },
-  { path: '/portfolio', icon: '💼', label: '포트폴리오' },
   { path: '/trade', icon: '📝', label: '주문' },
 ];
 

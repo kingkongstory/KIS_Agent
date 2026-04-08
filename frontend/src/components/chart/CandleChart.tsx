@@ -1,15 +1,21 @@
 import { useEffect, useRef } from 'react';
-import { createChart, type IChartApi, type ISeriesApi, type CandlestickData, type Time } from 'lightweight-charts';
-import { useStockStore } from '../../stores/stockStore';
+import { createChart, CandlestickSeries, HistogramSeries, type IChartApi, type CandlestickData, type Time } from 'lightweight-charts';
+import { useStockStore, STOCK_CODES } from '../../stores/stockStore';
 
-export function CandleChart() {
+interface Props {
+  index: number;
+}
+
+export function CandleChart({ index }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
-  const candleSeriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
-  const volumeSeriesRef = useRef<ISeriesApi<'Histogram'> | null>(null);
-  const { candles, indicators } = useStockStore();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const candleSeriesRef = useRef<any>(null);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const volumeSeriesRef = useRef<any>(null);
+  const stock = useStockStore((s) => s.stocks[index]);
+  const meta = STOCK_CODES[index];
 
-  // 차트 초기화
   useEffect(() => {
     if (!containerRef.current) return;
 
@@ -22,19 +28,12 @@ export function CandleChart() {
         vertLines: { color: '#2A2A2A' },
         horzLines: { color: '#2A2A2A' },
       },
-      crosshair: {
-        mode: 0,
-      },
-      rightPriceScale: {
-        borderColor: '#2A2A2A',
-      },
-      timeScale: {
-        borderColor: '#2A2A2A',
-        timeVisible: false,
-      },
+      crosshair: { mode: 1 }, // Magnet 모드 (Normal보다 가벼움)
+      rightPriceScale: { borderColor: '#2A2A2A' },
+      timeScale: { borderColor: '#2A2A2A', timeVisible: false },
     });
 
-    const candleSeries = chart.addCandlestickSeries({
+    const candleSeries = chart.addSeries(CandlestickSeries, {
       upColor: '#00D084',
       downColor: '#FF6B35',
       borderUpColor: '#00D084',
@@ -43,7 +42,7 @@ export function CandleChart() {
       wickDownColor: '#FF6B35',
     });
 
-    const volumeSeries = chart.addHistogramSeries({
+    const volumeSeries = chart.addSeries(HistogramSeries, {
       priceFormat: { type: 'volume' },
       priceScaleId: 'volume',
     });
@@ -74,11 +73,10 @@ export function CandleChart() {
     };
   }, []);
 
-  // 데이터 업데이트
   useEffect(() => {
     if (!candleSeriesRef.current || !volumeSeriesRef.current) return;
 
-    const candleData: CandlestickData<Time>[] = candles.map((c) => ({
+    const candleData: CandlestickData<Time>[] = stock.candles.map((c) => ({
       time: c.date as Time,
       open: c.open,
       high: c.high,
@@ -86,7 +84,7 @@ export function CandleChart() {
       close: c.close,
     }));
 
-    const volumeData = candles.map((c) => ({
+    const volumeData = stock.candles.map((c) => ({
       time: c.date as Time,
       value: c.volume,
       color: c.close >= c.open ? 'rgba(0, 208, 132, 0.3)' : 'rgba(255, 107, 53, 0.3)',
@@ -95,27 +93,17 @@ export function CandleChart() {
     candleSeriesRef.current.setData(candleData);
     volumeSeriesRef.current.setData(volumeData);
 
-    if (candles.length > 0) {
+    if (stock.candles.length > 0) {
       chartRef.current?.timeScale().fitContent();
     }
-  }, [candles]);
-
-  // 지표 오버레이 (라인 시리즈)
-  useEffect(() => {
-    if (!chartRef.current) return;
-
-    // 간단한 구현: 지표 데이터를 로그로 출력 (실제로는 라인 시리즈 추가)
-    // 지표별 라인 시리즈 관리는 별도 리팩토링이 필요
-    indicators.forEach((ind) => {
-      if (ind.values.length > 0) {
-        console.log(`지표 ${ind.name}: ${ind.values.length}개 데이터 포인트`);
-      }
-    });
-  }, [indicators]);
+  }, [stock.candles]);
 
   return (
-    <div className="bg-chart-bg rounded-lg border border-border overflow-hidden">
-      <div ref={containerRef} className="w-full h-[500px]" />
+    <div className="bg-chart-bg rounded-lg border border-border overflow-hidden flex flex-col">
+      <div className="px-3 py-2 text-xs text-text-muted border-b border-border">
+        {meta.name} ({meta.code}) 일봉
+      </div>
+      <div ref={containerRef} className="w-full flex-1 min-h-[300px]" />
     </div>
   );
 }

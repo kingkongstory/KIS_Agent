@@ -2,3 +2,4 @@
 .env
 *.db
 kis_cache.db*
+node_modules

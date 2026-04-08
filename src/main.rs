@@ -441,6 +441,7 @@ async fn run_server(config: AppConfig) {
         trading: trading_service,
         account: account_service,
         realtime_tx,
+        strategy_manager: kis_agent::presentation::routes::strategy::StrategyManager::new(),
     };
 
     // CORS 미들웨어

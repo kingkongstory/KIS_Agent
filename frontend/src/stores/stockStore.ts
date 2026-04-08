@@ -1,48 +1,82 @@
 import { create } from 'zustand';
 import type { CandleData, IndicatorResult, PriceData } from '../types/stock';
 
-interface StockState {
-  /** 현재 선택된 종목코드 */
-  selectedCode: string;
-  /** 현재가 데이터 */
+/** 개별 종목 상태 */
+interface StockData {
+  code: string;
+  name: string;
   priceData: PriceData | null;
-  /** 캔들 데이터 */
   candles: CandleData[];
-  /** 지표 데이터 */
   indicators: IndicatorResult[];
-  /** 활성 지표 목록 */
+}
+
+interface StockState {
+  /** 두 종목 데이터 */
+  stocks: [StockData, StockData];
+  /** 활성 지표 */
   activeIndicators: string[];
   /** 차트 기간 */
   chartPeriod: string;
   /** 로딩 상태 */
   loading: boolean;
-  /** 에러 메시지 */
+  /** 에러 */
   error: string | null;
 
-  setSelectedCode: (code: string) => void;
-  setPriceData: (data: PriceData) => void;
-  setCandles: (candles: CandleData[]) => void;
-  setIndicators: (indicators: IndicatorResult[]) => void;
+  /** 하위 호환: 첫 번째 종목 코드 */
+  selectedCode: string;
+  priceData: PriceData | null;
+  candles: CandleData[];
+  indicators: IndicatorResult[];
+
+  setPriceData: (idx: number, data: PriceData) => void;
+  setCandles: (idx: number, candles: CandleData[]) => void;
+  setIndicators: (idx: number, indicators: IndicatorResult[]) => void;
   toggleIndicator: (name: string) => void;
   setChartPeriod: (period: string) => void;
   setLoading: (loading: boolean) => void;
   setError: (error: string | null) => void;
+  setSelectedCode: (code: string) => void;
 }
 
+export const STOCK_CODES = [
+  { code: '122630', name: 'KODEX 레버리지' },
+  { code: '114800', name: 'KODEX 인버스' },
+] as const;
+
 export const useStockStore = create<StockState>((set) => ({
-  selectedCode: '005930',
-  priceData: null,
-  candles: [],
-  indicators: [],
+  stocks: [
+    { code: '122630', name: 'KODEX 레버리지', priceData: null, candles: [], indicators: [] },
+    { code: '114800', name: 'KODEX 인버스', priceData: null, candles: [], indicators: [] },
+  ],
   activeIndicators: ['sma_20'],
   chartPeriod: 'D',
   loading: false,
   error: null,
 
-  setSelectedCode: (code) => set({ selectedCode: code, error: null }),
-  setPriceData: (data) => set({ priceData: data }),
-  setCandles: (candles) => set({ candles }),
-  setIndicators: (indicators) => set({ indicators }),
+  // 하위 호환
+  selectedCode: '122630',
+  priceData: null,
+  candles: [],
+  indicators: [],
+
+  setPriceData: (idx, data) =>
+    set((state) => {
+      const stocks = [...state.stocks] as [StockData, StockData];
+      stocks[idx] = { ...stocks[idx], priceData: data };
+      return { stocks };
+    }),
+  setCandles: (idx, candles) =>
+    set((state) => {
+      const stocks = [...state.stocks] as [StockData, StockData];
+      stocks[idx] = { ...stocks[idx], candles };
+      return { stocks };
+    }),
+  setIndicators: (idx, indicators) =>
+    set((state) => {
+      const stocks = [...state.stocks] as [StockData, StockData];
+      stocks[idx] = { ...stocks[idx], indicators };
+      return { stocks };
+    }),
   toggleIndicator: (name) =>
     set((state) => {
       const active = state.activeIndicators.includes(name)
@@ -53,4 +87,5 @@ export const useStockStore = create<StockState>((set) => ({
   setChartPeriod: (period) => set({ chartPeriod: period }),
   setLoading: (loading) => set({ loading }),
   setError: (error) => set({ error }),
+  setSelectedCode: () => {},
 }));

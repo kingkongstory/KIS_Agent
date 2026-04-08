@@ -9,7 +9,7 @@ use crate::domain::error::KisError;
 use crate::domain::types::{Environment, TransactionId};
 
 /// KIS API 공통 응답 래퍼
-#[derive(Debug, Deserialize)]
+#[derive(Debug)]
 pub struct KisResponse<T> {
     /// 응답코드 ("0" = 성공)
     pub rt_cd: String,
@@ -25,6 +25,39 @@ pub struct KisResponse<T> {
     pub output2: Option<T>,
     /// 연속조회 키
     pub tr_cont: Option<String>,
+}
+
+/// 내부 Raw 응답 (모든 output을 Value로 받음)
+#[derive(Deserialize)]
+struct RawKisResponse {
+    rt_cd: String,
+    #[serde(default)]
+    msg_cd: String,
+    #[serde(default)]
+    msg1: String,
+    #[serde(default)]
+    output: Option<serde_json::Value>,
+    #[serde(default)]
+    output1: Option<serde_json::Value>,
+    #[serde(default)]
+    output2: Option<serde_json::Value>,
+    #[serde(default)]
+    tr_cont: Option<String>,
+}
+
+impl RawKisResponse {
+    /// Raw 응답을 타입 T로 변환 (타입 불일치 시 None)
+    fn into_typed<T: DeserializeOwned>(self) -> KisResponse<T> {
+        KisResponse {
+            rt_cd: self.rt_cd,
+            msg_cd: self.msg_cd,
+            msg1: self.msg1,
+            output: self.output.and_then(|v| serde_json::from_value(v).ok()),
+            output1: self.output1.and_then(|v| serde_json::from_value(v).ok()),
+            output2: self.output2.and_then(|v| serde_json::from_value(v).ok()),
+            tr_cont: self.tr_cont,
+        }
+    }
 }
 
 impl<T> KisResponse<T> {
@@ -167,9 +200,10 @@ impl KisHttpClient {
             return Err(KisError::HttpError(format!("HTTP {status}: {text}")));
         }
 
-        serde_json::from_str(&text).map_err(|e| {
+        let raw: RawKisResponse = serde_json::from_str(&text).map_err(|e| {
             KisError::ParseError(format!("JSON 파싱 실패: {e}, 응답: {text}"))
-        })
+        })?;
+        Ok(raw.into_typed())
     }
 
     pub fn account_no(&self) -> &str {
