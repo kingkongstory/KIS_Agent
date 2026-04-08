@@ -17,6 +17,8 @@ pub struct AppConfig {
     pub server_host: String,
     /// 서버 포트
     pub server_port: u16,
+    /// PostgreSQL 접속 URL
+    pub database_url: String,
 }
 
 impl AppConfig {
@@ -43,6 +45,8 @@ impl AppConfig {
                 .ok()
                 .and_then(|p| p.parse().ok())
                 .unwrap_or(3000),
+            database_url: std::env::var("DATABASE_URL")
+                .unwrap_or_else(|_| "postgres://postgres@localhost:5433/kis_agent".to_string()),
         })
     }
 }

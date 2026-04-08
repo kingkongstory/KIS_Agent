@@ -58,6 +58,8 @@ pub enum TransactionId {
     InquireDailyExecution,
     /// 매수 가능 조회
     InquireBuyable,
+    /// 주식 당일 분봉 조회
+    InquireTimePrice,
     /// 종목 검색 (조건검색)
     SearchStock,
 }
@@ -79,6 +81,7 @@ impl TransactionId {
             (Self::InquirePrice, _) => "FHKST01010100",
             (Self::InquireAskingPrice, _) => "FHKST01010200",
             (Self::InquireDailyPrice, _) => "FHKST03010100",
+            (Self::InquireTimePrice, _) => "FHKST03010200",
             // 계좌
             (Self::InquireBalance, Environment::Real) => "TTTC8434R",
             (Self::InquireBalance, Environment::Paper) => "VTTC8434R",
