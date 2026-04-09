@@ -81,6 +81,9 @@ enum Commands {
         /// Multi-Stage ORB: 5분/15분/30분 OR 동시 추적
         #[arg(long, default_value = "false")]
         multi_stage: bool,
+        /// 두 종목 통합 (position_lock 시뮬레이션, 122630+114800)
+        #[arg(long, default_value = "false")]
+        dual_locked: bool,
     },
     /// 네이버 금융 일봉 수집
     CollectDaily,
@@ -154,8 +157,8 @@ async fn main() {
         Some(Commands::Trade { stock_code, rr, qty }) => {
             run_trade(&config, &stock_code, rr, qty).await;
         }
-        Some(Commands::Backtest { stock_code, days, rr, trail, tstop, be_r, fvg_exp, min2nd, dynamic_lookback, session_reset, multi_stage }) => {
-            run_backtest(&config, &stock_code, days, rr, trail, tstop, be_r, fvg_exp, min2nd, dynamic_lookback, session_reset, multi_stage).await;
+        Some(Commands::Backtest { stock_code, days, rr, trail, tstop, be_r, fvg_exp, min2nd, dynamic_lookback, session_reset, multi_stage, dual_locked }) => {
+            run_backtest(&config, &stock_code, days, rr, trail, tstop, be_r, fvg_exp, min2nd, dynamic_lookback, session_reset, multi_stage, dual_locked).await;
         }
         Some(Commands::CollectDaily) => {
             run_collect_daily(&config).await;
@@ -208,7 +211,7 @@ async fn run_trade(config: &AppConfig, stock_code: &str, rr: f64, qty: u64) {
 async fn run_backtest(
     config: &AppConfig, stock_code: &str, days: usize, rr: f64,
     trail: f64, tstop: usize, be_r: f64, fvg_exp: usize, min2nd: f64,
-    dynamic_lookback: usize, session_reset: bool, multi_stage: bool,
+    dynamic_lookback: usize, session_reset: bool, multi_stage: bool, dual_locked: bool,
 ) {
     use kis_agent::strategy::orb_fvg::OrbFvgConfig;
 
@@ -229,7 +232,24 @@ async fn run_backtest(
     let source_interval = 5_i16;
     let engine = BacktestEngine::with_config(store, strategy_config, source_interval);
 
-    if multi_stage {
+    if dual_locked {
+        info!("=== 두 종목 통합 백테스트 (position_lock) 시작 ===");
+        info!("122630 + 114800, 기간: {days}일, Multi-Stage: {multi_stage}");
+        match engine.run_dual_locked("122630", "114800", days, multi_stage).await {
+            Ok((report_a, report_b)) => {
+                println!("{report_a}");
+                println!("{report_b}");
+                let total_pnl = report_a.total_pnl_pct + report_b.total_pnl_pct;
+                let total_trades = report_a.total_trades + report_b.total_trades;
+                let total_wins = report_a.wins + report_b.wins;
+                println!("\n=== 합산 ===");
+                println!("  총 거래: {}회 (승리 {}회)", total_trades, total_wins);
+                println!("  총 손익: {:.2}%", total_pnl);
+                println!("  일평균: {:.2}%", total_pnl / days as f64);
+            }
+            Err(e) => { eprintln!("백테스트 에러: {e}"); std::process::exit(1); }
+        }
+    } else if multi_stage {
         info!("=== Multi-Stage ORB 백테스트 시작 ===");
         info!("종목: {stock_code}, 기간: {days}일 (5분/15분/30분 OR 동시 추적)");
         match engine.run_multi_stage(stock_code, days).await {

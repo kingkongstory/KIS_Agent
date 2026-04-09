@@ -93,6 +93,145 @@ impl BacktestEngine {
         self.run_impl(stock_code, days, false).await
     }
 
+    /// 두 종목 통합 백테스트: position_lock 시뮬레이션 (선착순 전액 투입)
+    /// 같은 날 두 종목 모두 신호 → 먼저 진입한 쪽만 거래, 청산 후 다른 쪽 진입 가능
+    pub async fn run_dual_locked(
+        &self,
+        code_a: &str,
+        code_b: &str,
+        days: usize,
+        multi_stage: bool,
+    ) -> Result<(BacktestReport, BacktestReport), KisError> {
+        // 두 종목의 날짜 교집합
+        let dates_a = self.fetch_available_dates(code_a, days).await?;
+        let dates_b = self.fetch_available_dates(code_b, days).await?;
+        let dates_set: std::collections::HashSet<NaiveDate> = dates_b.iter().cloned().collect();
+        let common_dates: Vec<NaiveDate> = dates_a.iter()
+            .filter(|d| dates_set.contains(d))
+            .cloned()
+            .collect();
+
+        info!("통합 백테스트 (position_lock): {} + {}, {}일", code_a, code_b, common_dates.len());
+
+        let stages = [
+            ("5m",  NaiveTime::from_hms_opt(9, 0, 0).unwrap(), NaiveTime::from_hms_opt(9, 5, 0).unwrap()),
+            ("15m", NaiveTime::from_hms_opt(9, 0, 0).unwrap(), NaiveTime::from_hms_opt(9, 15, 0).unwrap()),
+            ("30m", NaiveTime::from_hms_opt(9, 0, 0).unwrap(), NaiveTime::from_hms_opt(9, 30, 0).unwrap()),
+        ];
+
+        let mut trades_a: Vec<(NaiveDate, TradeResult)> = Vec::new();
+        let mut trades_b: Vec<(NaiveDate, TradeResult)> = Vec::new();
+
+        for date in &common_dates {
+            let candles_a = self.fetch_day_candles(code_a, *date).await?;
+            let candles_b = self.fetch_day_candles(code_b, *date).await?;
+
+            // 각 종목의 Multi-Stage 결과를 먼저 계산
+            let results_a = if multi_stage {
+                self.run_day_multi_stage(&candles_a, &stages)
+            } else {
+                self.strategy.run_day(&candles_a)
+            };
+            let results_b = if multi_stage {
+                self.run_day_multi_stage(&candles_b, &stages)
+            } else {
+                self.strategy.run_day(&candles_b)
+            };
+
+            // 선착순: 첫 진입 시각 비교
+            let first_a = results_a.first().map(|r| r.entry_time);
+            let first_b = results_b.first().map(|r| r.entry_time);
+
+            match (first_a, first_b) {
+                (Some(ta), Some(tb)) => {
+                    if ta <= tb {
+                        // A가 먼저 → A 거래 실행, B는 A 청산 후 가능한 거래만
+                        let a_last_exit = results_a.last().map(|r| r.exit_time);
+                        for r in &results_a {
+                            trades_a.push((*date, r.clone()));
+                        }
+                        // B에서 A 청산 이후 거래만 포함
+                        if let Some(a_exit) = a_last_exit {
+                            for r in &results_b {
+                                if r.entry_time > a_exit {
+                                    trades_b.push((*date, r.clone()));
+                                }
+                            }
+                        }
+                    } else {
+                        // B가 먼저
+                        let b_last_exit = results_b.last().map(|r| r.exit_time);
+                        for r in &results_b {
+                            trades_b.push((*date, r.clone()));
+                        }
+                        if let Some(b_exit) = b_last_exit {
+                            for r in &results_a {
+                                if r.entry_time > b_exit {
+                                    trades_a.push((*date, r.clone()));
+                                }
+                            }
+                        }
+                    }
+                }
+                (Some(_), None) => {
+                    for r in results_a { trades_a.push((*date, r)); }
+                }
+                (None, Some(_)) => {
+                    for r in results_b { trades_b.push((*date, r)); }
+                }
+                (None, None) => {}
+            }
+        }
+
+        let report_a = Self::build_report(code_a, common_dates.len(), trades_a);
+        let report_b = Self::build_report(code_b, common_dates.len(), trades_b);
+        Ok((report_a, report_b))
+    }
+
+    /// 단일 날짜 Multi-Stage 실행 (선착순)
+    fn run_day_multi_stage(
+        &self,
+        candles: &[MinuteCandle],
+        stages: &[(&str, NaiveTime, NaiveTime)],
+    ) -> Vec<TradeResult> {
+        if candles.is_empty() { return Vec::new(); }
+
+        let mut earliest_results: Vec<TradeResult> = Vec::new();
+        let mut earliest_entry = NaiveTime::from_hms_opt(23, 59, 59).unwrap();
+
+        for (_, or_start, or_end) in stages {
+            let mut cfg = self.strategy.config.clone();
+            cfg.or_start = *or_start;
+            cfg.or_end = *or_end;
+            let strat = OrbFvgStrategy { config: cfg };
+            let results = strat.run_day(candles);
+            if let Some(first) = results.first() {
+                if first.entry_time < earliest_entry {
+                    earliest_entry = first.entry_time;
+                    earliest_results = results;
+                }
+            }
+        }
+        earliest_results
+    }
+
+    fn build_report(stock_code: &str, days: usize, trades: Vec<(NaiveDate, TradeResult)>) -> BacktestReport {
+        let total = trades.len();
+        let wins = trades.iter().filter(|(_, t)| t.is_win()).count();
+        let losses = total - wins;
+        let total_pnl: f64 = trades.iter().map(|(_, t)| t.pnl_pct()).sum();
+        let avg_rr = if total > 0 {
+            trades.iter().map(|(_, t)| t.realized_rr()).sum::<f64>() / total as f64
+        } else { 0.0 };
+        BacktestReport {
+            stock_code: stock_code.to_string(),
+            days_tested: days,
+            trades, total_trades: total, wins, losses,
+            win_rate: if total > 0 { wins as f64 / total as f64 * 100.0 } else { 0.0 },
+            total_pnl_pct: total_pnl, avg_rr,
+        }
+    }
+
     /// Multi-Stage ORB 백테스트: 5분/15분/30분 OR을 동시 추적 (선착순)
     /// 각 OR 단계별 전략을 실행하되, 가장 먼저 진입하는 단계를 채택
     /// 실전에서도 동일하게 구현 가능 (사후 선택 없음)
