@@ -658,9 +658,11 @@ impl LiveRunner {
                 let l = or_candles.iter().map(|c| c.low).min().unwrap();
                 // DB에 저장
                 if let Some(ref store) = self.db_store {
-                    let _ = store.save_or_range_stage(
+                    if let Err(e) = store.save_or_range_stage(
                         self.stock_code.as_str(), today, h, l, "candle", stage_name
-                    ).await;
+                    ).await {
+                        warn!("{}: OR DB 저장 실패 (stage={}): {e}", self.stock_name, stage_name);
+                    }
                 }
                 (h, l)
             } else {
@@ -670,7 +672,10 @@ impl LiveRunner {
                         self.stock_code.as_str(), today, stage_name
                     ).await {
                         (h, l)
-                    } else { continue; }
+                    } else {
+                        debug!("{}: OR {} 캔들 부족+DB 미저장 — 단계 스킵", self.stock_name, stage_name);
+                        continue;
+                    }
                 } else { continue; }
             };
 
@@ -786,11 +791,19 @@ impl LiveRunner {
             info!("{}: [{}] {:?} 진입 신호 — entry={}, SL={}, TP={}",
                 self.stock_name, stage_name, side, entry_price, stop_loss, take_profit);
 
+            // 주문 실행 (실패 시 1초 후 1회 재시도)
             match self.execute_entry(side, entry_price, stop_loss, take_profit).await {
                 Ok(_) => return Ok(true),
                 Err(e) => {
-                    error!("{}: 주문 실패: {e}", self.stock_name);
-                    return Ok(false);
+                    warn!("{}: 주문 실패, 1초 후 재시도: {e}", self.stock_name);
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    match self.execute_entry(side, entry_price, stop_loss, take_profit).await {
+                        Ok(_) => return Ok(true),
+                        Err(e2) => {
+                            error!("{}: 재시도 실패: {e2}", self.stock_name);
+                            return Ok(false);
+                        }
+                    }
                 }
             }
         }
