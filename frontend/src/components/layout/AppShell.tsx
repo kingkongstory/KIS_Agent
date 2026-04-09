@@ -2,12 +2,15 @@ import type { ReactNode } from 'react';
 import { Sidebar } from './Sidebar';
 import { Header } from './Header';
 import { StatusBar } from './StatusBar';
+import { useWebSocket } from '../../hooks/useWebSocket';
 
 interface Props {
   children: ReactNode;
 }
 
 export function AppShell({ children }: Props) {
+  useWebSocket();
+
   return (
     <div className="flex h-screen overflow-hidden">
       <Sidebar />

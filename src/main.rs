@@ -178,7 +178,7 @@ async fn run_trade(config: &AppConfig, stock_code: &str, rr: f64, qty: u64) {
 
     let client = create_kis_client(config);
     let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let runner = LiveRunner::new(client, code, stock_code.to_string(), qty, stop_flag);
+    let mut runner = LiveRunner::new(client, code, stock_code.to_string(), qty, stop_flag);
 
     match runner.run().await {
         Ok(trades) if !trades.is_empty() => {
@@ -410,6 +410,18 @@ async fn run_server(config: AppConfig) {
         config.account_product_code.clone(),
     ));
 
+    // PostgreSQL 저장소 (분봉 + 거래 기록 영속화)
+    let pg_store = match PostgresStore::new(&config.database_url).await {
+        Ok(store) => {
+            info!("PostgreSQL 연결 완료 (실시간 데이터 저장 활성)");
+            Some(Arc::new(store))
+        }
+        Err(e) => {
+            tracing::warn!("PostgreSQL 연결 실패 (메모리만 사용): {e}");
+            None
+        }
+    };
+
     // SQLite 캐시 (기존 호환)
     let sqlite_cache = match SqliteCache::new("sqlite:kis_cache.db?mode=rwc").await {
         Ok(cache) => Some(Arc::new(cache)),
@@ -430,7 +442,80 @@ async fn run_server(config: AppConfig) {
     let account_service = Arc::new(AccountService::new(account_adapter));
 
     // 실시간 데이터 채널
-    let (realtime_tx, _) = broadcast::channel::<RealtimeData>(256);
+    let (realtime_tx, _) = broadcast::channel::<RealtimeData>(1024);
+
+    // KIS WebSocket 실시간 스트리밍 (체결 + 호가)
+    {
+        use kis_agent::infrastructure::websocket::connection::KisWebSocketClient;
+
+        let ws_client = Arc::new(KisWebSocketClient::new(
+            Arc::clone(&token_manager),
+            config.environment,
+            realtime_tx.clone(),
+        ));
+
+        // 대상 종목 구독 등록 (연결 시 자동 전송)
+        let sub_mgr = ws_client.subscription_manager();
+        let stock_codes = ["122630", "114800"];
+        for code in &stock_codes {
+            sub_mgr.add("H0STCNT0", code).await; // 체결
+            sub_mgr.add("H0STASP0", code).await; // 호가
+        }
+
+        // 백그라운드 실행
+        tokio::spawn(async move { ws_client.run().await });
+        info!("KIS WebSocket 실시간 스트리밍 시작");
+    }
+
+    // 틱 → 분봉 실시간 집계기
+    let ws_candles = {
+        use kis_agent::infrastructure::websocket::candle_aggregator::CandleAggregator;
+
+        let mut agg = CandleAggregator::new();
+        if let Some(ref store) = pg_store {
+            agg = agg.with_store(Arc::clone(store));
+        }
+        let aggregator = Arc::new(agg);
+        // DB에서 당일 분봉 프리로딩 (장중 재시작 복구)
+        aggregator.preload_from_db(&["122630", "114800"]).await;
+        // OR 데이터 없으면 네이버 금융에서 자동 보충
+        aggregator.backfill_from_naver(&["122630", "114800"]).await;
+
+        let candles = aggregator.completed_candles();
+        let rx = realtime_tx.subscribe();
+        Arc::clone(&aggregator).spawn(rx, realtime_tx.clone());
+        info!("분봉 실시간 집계기 시작");
+        candles
+    };
+
+    // 전략 관리자 (스케줄러와 AppState 공유)
+    let strategy_manager = {
+        let mut mgr = kis_agent::presentation::routes::strategy::StrategyManager::new();
+        mgr.set_client(Arc::clone(&http_client));
+        mgr.set_realtime_tx(realtime_tx.clone());
+        mgr.set_ws_candles(ws_candles);
+        if let Some(ref store) = pg_store {
+            mgr.set_db_store(Arc::clone(store));
+        }
+        mgr
+    };
+
+    // 시세/잔고 스케줄러 — REST fallback (장외 시간, WS 끊김 시)
+    kis_agent::presentation::scheduler::spawn_market_scheduler(
+        Arc::clone(&market_data_service),
+        Arc::clone(&account_service),
+        realtime_tx.clone(),
+        strategy_manager.clone(),
+    );
+
+    // 자동매매 자동 시작 (KIS 클라이언트 초기화 대기 후)
+    {
+        let mgr = strategy_manager.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            mgr.auto_start_all().await;
+        });
+    }
 
     // 앱 상태
     let state = AppState {
@@ -438,11 +523,8 @@ async fn run_server(config: AppConfig) {
         trading: trading_service,
         account: account_service,
         realtime_tx,
-        strategy_manager: {
-            let mgr = kis_agent::presentation::routes::strategy::StrategyManager::new();
-            mgr.set_client(Arc::clone(&http_client));
-            mgr
-        },
+        strategy_manager,
+        db_pool: pg_store.as_ref().map(|s| s.pool().clone()),
     };
 
     // CORS 미들웨어

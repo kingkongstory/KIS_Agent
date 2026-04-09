@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio::time::{Duration, sleep};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::parser::{WsMessage, parse_data_message, parse_ws_message};
 use super::subscription::SubscriptionManager;
@@ -82,11 +82,74 @@ impl KisWebSocketClient {
 
         // 기존 구독 복원
         let restore_msgs = self.subscription_manager.restore_messages(&approval_key);
+        let expected_subs = restore_msgs.len();
         for msg in restore_msgs {
             write
                 .send(Message::Text(msg.into()))
                 .await
                 .map_err(|e| KisError::WebSocketError(e.to_string()))?;
+        }
+
+        // 구독 응답 확인 (최대 5초 대기)
+        if expected_subs > 0 {
+            let mut confirmed = 0usize;
+            let mut failed = 0usize;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+
+            while confirmed + failed < expected_subs {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+
+                match tokio::time::timeout(remaining, read.next()).await {
+                    Ok(Some(Ok(Message::Text(text)))) => {
+                        if text.contains("PINGPONG") {
+                            continue;
+                        }
+                        match parse_ws_message(&text) {
+                            Some(WsMessage::Control(ctrl)) => {
+                                if ctrl.body.rt_cd == "0" {
+                                    confirmed += 1;
+                                    info!(
+                                        "구독 확인 ({confirmed}/{expected_subs}): {} {}",
+                                        ctrl.header.tr_id, ctrl.header.tr_key
+                                    );
+                                } else {
+                                    failed += 1;
+                                    warn!(
+                                        "구독 실패: {} {} — {}",
+                                        ctrl.header.tr_id, ctrl.header.tr_key, ctrl.body.msg1
+                                    );
+                                }
+                            }
+                            Some(WsMessage::Data(data)) => {
+                                // 확인 대기 중 수신된 데이터는 정상 처리
+                                if let Some(realtime) = parse_data_message(&data) {
+                                    let _ = self.data_tx.send(realtime);
+                                }
+                            }
+                            None => {}
+                        }
+                    }
+                    Ok(Some(Ok(Message::Ping(data)))) => {
+                        let _ = write.send(Message::Pong(data)).await;
+                    }
+                    Ok(Some(Err(e))) => {
+                        return Err(KisError::WebSocketError(format!("구독 확인 중 오류: {e}")));
+                    }
+                    Ok(None) => break,
+                    _ => break, // 타임아웃
+                }
+            }
+
+            if failed > 0 {
+                warn!("구독 결과: {confirmed}건 성공, {failed}건 실패 (총 {expected_subs}건)");
+            } else if confirmed < expected_subs {
+                warn!("구독 확인 타임아웃: {confirmed}/{expected_subs}건만 확인");
+            } else {
+                info!("전체 구독 확인 완료: {confirmed}건");
+            }
         }
 
         // 메시지 수신 루프
@@ -113,6 +176,12 @@ impl KisWebSocketClient {
     }
 
     fn handle_message(&self, text: &str) {
+        // PINGPONG 메시지는 무시 (KIS 서버 헬스체크)
+        if text.contains("PINGPONG") {
+            debug!("KIS PINGPONG 수신");
+            return;
+        }
+
         match parse_ws_message(text) {
             Some(WsMessage::Control(ctrl)) => {
                 if ctrl.body.rt_cd == "0" {

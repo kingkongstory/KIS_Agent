@@ -10,6 +10,8 @@ interface StrategyStatus {
   today_trades: number;
   today_pnl: number;
   message: string;
+  or_high: number | null;
+  or_low: number | null;
 }
 
 export function StrategyPanel() {
@@ -95,6 +97,11 @@ export function StrategyPanel() {
               )}
             </div>
             <div className="text-xs text-text-muted mt-1">{s.message}</div>
+            {s.or_high && s.or_low && (
+              <div className="text-xs text-text-muted mt-1">
+                OR {s.or_low.toLocaleString()} ~ {s.or_high.toLocaleString()}
+              </div>
+            )}
           </div>
         ))}
       </div>

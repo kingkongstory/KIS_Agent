@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use sqlx::postgres::PgPool;
 use tokio::sync::broadcast;
 
 use crate::application::services::account_service::AccountService;
@@ -15,4 +16,5 @@ pub struct AppState {
     pub account: Arc<AccountService>,
     pub realtime_tx: broadcast::Sender<RealtimeData>,
     pub strategy_manager: StrategyManager,
+    pub db_pool: Option<PgPool>,
 }

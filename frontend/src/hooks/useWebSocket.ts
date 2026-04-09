@@ -6,7 +6,7 @@ import type { RealtimeMessage } from '../types/websocket';
 export function useWebSocket() {
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<number | null>(null);
-  const { setConnected, addExecution, updateOrderBook } = useWsStore();
+  const { setConnected, addExecution, updateOrderBook, updateCandle, updatePrice, updateBalance, triggerBalanceRefresh } = useWsStore();
 
   const connect = useCallback(() => {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -27,6 +27,14 @@ export function useWebSocket() {
           addExecution(data);
         } else if (data.type === 'OrderBook') {
           updateOrderBook(data);
+        } else if (data.type === 'CandleUpdate') {
+          updateCandle(data);
+        } else if (data.type === 'TradeNotification') {
+          triggerBalanceRefresh();
+        } else if (data.type === 'PriceSnapshot') {
+          updatePrice(data);
+        } else if (data.type === 'BalanceSnapshot') {
+          updateBalance(data);
         }
       } catch {
         // 파싱 실패 무시
@@ -42,7 +50,7 @@ export function useWebSocket() {
     ws.onerror = () => {
       ws.close();
     };
-  }, [setConnected, addExecution, updateOrderBook]);
+  }, [setConnected, addExecution, updateOrderBook, updateCandle, updatePrice, updateBalance, triggerBalanceRefresh]);
 
   useEffect(() => {
     connect();

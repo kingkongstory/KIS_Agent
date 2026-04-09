@@ -26,7 +26,7 @@ impl KisRateLimiter {
     pub fn new(env: Environment) -> Self {
         let per_second = match env {
             Environment::Real => 15,
-            Environment::Paper => 10,
+            Environment::Paper => 1, // 모의투자: 서버 실제 제한이 공식(3/s)보다 엄격
         };
 
         let quota = Quota::per_second(NonZeroU32::new(per_second).unwrap());

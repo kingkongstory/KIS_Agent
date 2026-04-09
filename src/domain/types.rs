@@ -46,6 +46,8 @@ pub enum TransactionId {
     OrderModify,
     /// 주문 취소
     OrderCancel,
+    /// 정정/취소 가능 주문 조회
+    InquirePsblOrder,
     /// 주식 현재가 조회
     InquirePrice,
     /// 주식 호가 조회
@@ -89,6 +91,8 @@ impl TransactionId {
             (Self::InquireDailyExecution, Environment::Paper) => "VTTC8001R",
             (Self::InquireBuyable, Environment::Real) => "TTTC8908R",
             (Self::InquireBuyable, Environment::Paper) => "VTTC8908R",
+            (Self::InquirePsblOrder, Environment::Real) => "TTTC8036R",
+            (Self::InquirePsblOrder, Environment::Paper) => "VTTC8036R",
             // 검색
             (Self::SearchStock, _) => "CTPF1002R",
         }

@@ -1,42 +1,35 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useRef } from 'react';
 import { get } from '../../api/client';
+import { useWsStore } from '../../stores/wsStore';
 import { formatKRW } from '../../utils/format';
+import type { BalanceSnapshot } from '../../types/websocket';
 
-interface BalanceData {
-  positions: Array<{
-    code: string;
-    name: string;
-    qty: number;
-    avg_price: number;
-    current_price: number;
-    pnl: number;
-    pnl_rate: number;
-  }>;
-  summary: {
-    cash: number;
-    total_eval: number;
-    total_profit_loss: number;
-    total_purchase: number;
-  };
-}
+const STOCKS = [
+  { code: '122630', name: 'KODEX 레버리지' },
+  { code: '114800', name: 'KODEX 인버스' },
+];
 
 export function AccountSummary() {
-  const [balance, setBalance] = useState<BalanceData | null>(null);
+  const balance = useWsStore((s) => s.balance);
+  const balanceVersion = useWsStore((s) => s.balanceVersion);
+  const updateBalance = useWsStore((s) => s.updateBalance);
+  const prevVersion = useRef(balanceVersion);
 
-  const fetchBalance = useCallback(async () => {
-    try {
-      const data = await get<BalanceData>('/account/balance');
-      setBalance(data);
-    } catch {
-      // 무시
-    }
-  }, []);
-
+  // 주문 체결 시 즉시 잔고 갱신 (1회성 REST fetch, 폴링 아님)
   useEffect(() => {
-    fetchBalance();
-    const interval = setInterval(fetchBalance, 30000); // 30초
-    return () => clearInterval(interval);
-  }, [fetchBalance]);
+    if (balanceVersion !== prevVersion.current) {
+      prevVersion.current = balanceVersion;
+      const timer = setTimeout(async () => {
+        try {
+          const data = await get<BalanceSnapshot>('/account/balance');
+          updateBalance({ ...data, type: 'BalanceSnapshot' });
+        } catch {
+          // 무시 — 다음 스케줄러 push에서 갱신됨
+        }
+      }, 1000);
+      return () => clearTimeout(timer);
+    }
+  }, [balanceVersion, updateBalance]);
 
   if (!balance) {
     return (
@@ -47,8 +40,11 @@ export function AccountSummary() {
   }
 
   const s = balance.summary;
-  const totalAsset = s.cash + s.total_eval;
+  const totalAsset = s.total_eval; // tot_evlu_amt = 예수금 + 유가평가액 (이미 합산된 값)
   const halfAlloc = Math.floor(totalAsset / 2);
+
+  // 종목별 보유 현황
+  const posMap = new Map(balance.positions.map((p) => [p.stock_code, p]));
 
   return (
     <div className="bg-card rounded-lg border border-border p-3">
@@ -76,18 +72,37 @@ export function AccountSummary() {
           </div>
         </div>
       </div>
-      {balance.positions.length > 0 && (
-        <div className="mt-2 pt-2 border-t border-border">
-          {balance.positions.map((p) => (
-            <div key={p.code} className="flex justify-between text-xs py-0.5">
-              <span>{p.name} {p.qty}주</span>
-              <span className={p.pnl >= 0 ? 'text-rise' : 'text-fall'}>
-                {p.pnl >= 0 ? '+' : ''}{formatKRW(p.pnl)} ({p.pnl_rate.toFixed(2)}%)
-              </span>
+      {/* 종목별 배분 현황 */}
+      <div className="mt-2 pt-2 border-t border-border grid grid-cols-2 gap-2">
+        {STOCKS.map(({ code, name }) => {
+          const pos = posMap.get(code);
+          const invested = pos ? pos.eval_amount : 0;
+          const remaining = halfAlloc - invested;
+          return (
+            <div key={code} className="text-xs">
+              <div className="flex items-center justify-between">
+                <span className="text-text-muted">{name}</span>
+                <span className="font-medium">{formatKRW(halfAlloc)}</span>
+              </div>
+              {pos ? (
+                <div className="flex items-center justify-between mt-0.5">
+                  <span className="text-text-muted">
+                    {pos.quantity}주 보유
+                  </span>
+                  <span className={pos.profit_loss >= 0 ? 'text-rise' : 'text-fall'}>
+                    {pos.profit_loss >= 0 ? '+' : ''}{formatKRW(pos.profit_loss)}
+                    ({pos.profit_loss_rate.toFixed(2)}%)
+                  </span>
+                </div>
+              ) : (
+                <div className="text-text-muted mt-0.5">
+                  대기 ({formatKRW(remaining)} 가용)
+                </div>
+              )}
             </div>
-          ))}
-        </div>
-      )}
+          );
+        })}
+      </div>
     </div>
   );
 }

@@ -18,18 +18,22 @@ pub struct OrbFvgConfig {
     pub entry_cutoff: NaiveTime,
     /// 강제 청산 시각
     pub force_exit: NaiveTime,
-    /// 시간 스탑: 진입 후 N캔들 내 1R 미달 시 청산 (기본 6 = 30분)
+    /// 시간 스탑: 진입 후 N캔들 내 1R 미달 시 청산 (기본 6캔들 = 30분)
     pub time_stop_candles: usize,
-    /// 트레일링 스탑 간격 (R 배수, 기본 0.5R)
+    /// 트레일링 스탑 간격 (R 배수, 기본 0.5R — best_price에서 이 거리만큼 SL 추적)
     pub trailing_r: f64,
-    /// 본전 스탑 활성화 기준 (R 배수, 기본 1.0R)
+    /// 본전 스탑 활성화 기준 (R 배수, 기본 1.0R — 이 수익 도달 시 SL→진입가)
     pub breakeven_r: f64,
     /// ATR 기반 최소 손절 배수 (기본 1.5 × ATR)
     pub atr_sl_multiplier: f64,
-    /// FVG 유효시간 (캔들 수, 기본 4 = 20분)
+    /// FVG 유효시간 (캔들 수, 기본 4캔들 = 20분)
     pub fvg_expiry_candles: usize,
-    /// 2차 진입 허용 최소 1차 수익률 (%, 기본 0.5)
+    /// 2차 진입 허용 최소 1차 수익률 (%, 기본 0.5%)
     pub min_first_pnl_for_second: f64,
+    /// 일일 최대 누적 손실 한도 (%, 기본 -1.5%)
+    pub max_daily_loss_pct: f64,
+    /// 일일 최대 거래 횟수 (기본 5회)
+    pub max_daily_trades: usize,
 }
 
 impl Default for OrbFvgConfig {
@@ -40,12 +44,14 @@ impl Default for OrbFvgConfig {
             or_end: NaiveTime::from_hms_opt(9, 15, 0).unwrap(),
             entry_cutoff: NaiveTime::from_hms_opt(15, 20, 0).unwrap(),
             force_exit: NaiveTime::from_hms_opt(15, 25, 0).unwrap(),
-            time_stop_candles: 3,
-            trailing_r: 0.1,
-            breakeven_r: 0.3,
+            time_stop_candles: 6,
+            trailing_r: 0.5,
+            breakeven_r: 1.0,
             atr_sl_multiplier: 1.5,
-            fvg_expiry_candles: 6,
-            min_first_pnl_for_second: 0.0,
+            fvg_expiry_candles: 4,
+            min_first_pnl_for_second: 0.5,
+            max_daily_loss_pct: -1.5,
+            max_daily_trades: 999,
         }
     }
 }
@@ -187,8 +193,11 @@ impl OrbFvgStrategy {
                 let b = &candles_5m[idx - 1];
                 let c = c5;
 
+                // B캔들 몸통이 A캔들 범위의 30% 이상이어야 유효 (노이즈 필터)
+                let a_range = a.range().max(1);
+
                 // Bullish FVG
-                if b.is_bullish() && a.high < c.low {
+                if b.is_bullish() && a.high < c.low && b.body_size() * 100 >= a_range * 30 {
                     let or_ok = !require_or_breakout || b.close > or_high;
                     if or_ok {
                         let label = if require_or_breakout { "OR HIGH 돌파 + " } else { "2차 " };
@@ -211,7 +220,7 @@ impl OrbFvgStrategy {
                 }
 
                 // Bearish FVG
-                if b.is_bearish() && a.low > c.high {
+                if b.is_bearish() && a.low > c.high && b.body_size() * 100 >= a_range * 30 {
                     let or_ok = !require_or_breakout || b.close < or_low;
                     if or_ok {
                         let label = if require_or_breakout { "OR LOW 돌파 + " } else { "2차 " };
@@ -484,8 +493,9 @@ impl OrbFvgStrategy {
                 let a = &candles_5m[idx - 2];
                 let b = &candles_5m[idx - 1];
                 let c = c5;
+                let a_range = a.range().max(1);
 
-                if b.is_bullish() && b.close > or_high && a.high < c.low {
+                if b.is_bullish() && b.close > or_high && a.high < c.low && b.body_size() * 100 >= a_range * 30 {
                     pending_fvg = Some(FairValueGap {
                         direction: FvgDirection::Bullish,
                         top: c.low,
@@ -497,7 +507,7 @@ impl OrbFvgStrategy {
                     continue;
                 }
 
-                if b.is_bearish() && b.close < or_low && a.low > c.high {
+                if b.is_bearish() && b.close < or_low && a.low > c.high && b.body_size() * 100 >= a_range * 30 {
                     pending_fvg = Some(FairValueGap {
                         direction: FvgDirection::Bearish,
                         top: a.low,

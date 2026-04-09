@@ -26,6 +26,12 @@ pub struct Position {
     pub take_profit: i64,
     pub entry_time: NaiveTime,
     pub quantity: u64,
+    /// TP 지정가 주문번호 (None이면 시장가 fallback)
+    pub tp_order_no: Option<String>,
+    /// TP KRX 조직번호 (취소/정정용)
+    pub tp_krx_orgno: Option<String>,
+    /// 현재 걸려있는 TP 지정가
+    pub tp_limit_price: Option<i64>,
 }
 
 /// 청산 사유

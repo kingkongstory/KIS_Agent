@@ -6,12 +6,16 @@ use axum::extract::State;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
-use tracing::{error, info};
+use tokio::sync::{RwLock, broadcast};
+use tracing::{error, info, warn};
 
 use super::super::app_state::AppState;
-use crate::domain::types::StockCode;
-use crate::infrastructure::kis_client::http_client::KisHttpClient;
+use crate::domain::models::price::InquirePrice;
+use crate::domain::ports::realtime::RealtimeData;
+use crate::domain::types::{StockCode, TransactionId};
+use crate::infrastructure::cache::postgres_store::PostgresStore;
+use crate::infrastructure::kis_client::http_client::{HttpMethod, KisHttpClient, KisResponse};
+use crate::infrastructure::websocket::candle_aggregator::CompletedCandle;
 use crate::strategy::live_runner::LiveRunner;
 
 /// 종목별 전략 실행 상태
@@ -24,11 +28,14 @@ pub struct StrategyStatus {
     pub today_trades: i32,
     pub today_pnl: f64,
     pub message: String,
+    pub or_high: Option<i64>,
+    pub or_low: Option<i64>,
 }
 
 /// 종목별 러너 핸들
 struct RunnerHandle {
     stop_flag: Arc<AtomicBool>,
+    stop_notify: Arc<tokio::sync::Notify>,
     runner_state: Arc<RwLock<crate::strategy::live_runner::RunnerState>>,
 }
 
@@ -38,6 +45,9 @@ pub struct StrategyManager {
     pub statuses: Arc<RwLock<HashMap<String, StrategyStatus>>>,
     runners: Arc<RwLock<HashMap<String, RunnerHandle>>>,
     client: Arc<RwLock<Option<Arc<KisHttpClient>>>>,
+    realtime_tx: Option<broadcast::Sender<RealtimeData>>,
+    db_store: Option<Arc<PostgresStore>>,
+    ws_candles: Option<Arc<RwLock<std::collections::HashMap<String, Vec<CompletedCandle>>>>>,
 }
 
 impl StrategyManager {
@@ -52,13 +62,24 @@ impl StrategyManager {
                 today_trades: 0,
                 today_pnl: 0.0,
                 message: "자동매매 비활성".to_string(),
+                or_high: None,
+                or_low: None,
             });
         }
         Self {
             statuses: Arc::new(RwLock::new(map)),
             runners: Arc::new(RwLock::new(HashMap::new())),
             client: Arc::new(RwLock::new(None)),
+            realtime_tx: None,
+            db_store: None,
+            ws_candles: None,
         }
+    }
+
+    /// 활성 자동매매 러너가 있는지 확인
+    pub async fn has_active_runners(&self) -> bool {
+        let statuses = self.statuses.read().await;
+        statuses.values().any(|s| s.active)
     }
 
     pub fn set_client(&self, client: Arc<KisHttpClient>) {
@@ -68,7 +89,113 @@ impl StrategyManager {
         });
     }
 
+    pub fn set_realtime_tx(&mut self, tx: broadcast::Sender<RealtimeData>) {
+        self.realtime_tx = Some(tx);
+    }
+
+    pub fn set_db_store(&mut self, store: Arc<PostgresStore>) {
+        self.db_store = Some(store);
+    }
+
+    pub fn set_ws_candles(&mut self, candles: Arc<RwLock<std::collections::HashMap<String, Vec<CompletedCandle>>>>) {
+        self.ws_candles = Some(candles);
+    }
+
+    /// 서버 시작 시 모든 종목 자동매매 활성화 + 잔존 포지션 복구
+    pub async fn auto_start_all(&self) {
+        // 잔고 조회하여 보유 종목 확인
+        let held_positions: std::collections::HashMap<String, (i64, u64)> = {
+            let client_guard = self.client.read().await;
+            if let Some(client) = client_guard.as_ref() {
+                match self.fetch_balance(client).await {
+                    Ok(positions) => positions,
+                    Err(e) => {
+                        warn!("잔고 조회 실패 (포지션 복구 불가): {e}");
+                        std::collections::HashMap::new()
+                    }
+                }
+            } else {
+                std::collections::HashMap::new()
+            }
+        };
+
+        let codes: Vec<(String, String)> = {
+            let s = self.statuses.read().await;
+            s.values().map(|v| (v.code.clone(), v.name.clone())).collect()
+        };
+
+        for (code, name) in &codes {
+            match self.start_runner(code, name).await {
+                Ok(()) => {
+                    let mut s = self.statuses.write().await;
+                    if let Some(status) = s.get_mut(code) {
+                        status.active = true;
+                        status.state = "시작됨".to_string();
+                        status.message = "자동매매 시작됨".to_string();
+                    }
+                    info!("{}: 자동매매 자동 시작", name);
+
+                    // 보유 포지션이 있으면 LiveRunner에 전달하여 복구
+                    // (LiveRunner가 run() 시작 시 자동 감지)
+                }
+                Err(e) => {
+                    error!("{}: 자동매매 자동 시작 실패: {e}", name);
+                }
+            }
+        }
+    }
+
+    /// 잔고 조회 → 보유 종목별 (평균가, 수량) 반환
+    async fn fetch_balance(&self, client: &KisHttpClient) -> Result<std::collections::HashMap<String, (i64, u64)>, String> {
+        let query = [
+            ("CANO", client.account_no()),
+            ("ACNT_PRDT_CD", client.account_product_code()),
+            ("AFHR_FLPR_YN", "N"),
+            ("OFL_YN", ""),
+            ("INQR_DVSN", "02"),
+            ("UNPR_DVSN", "01"),
+            ("FUND_STTL_ICLD_YN", "N"),
+            ("FNCG_AMT_AUTO_RDPT_YN", "N"),
+            ("PRCS_DVSN", "00"),
+            ("CTX_AREA_FK100", ""),
+            ("CTX_AREA_NK100", ""),
+        ];
+
+        let resp: Result<KisResponse<Vec<serde_json::Value>>, _> = client
+            .execute(HttpMethod::Get,
+                "/uapi/domestic-stock/v1/trading/inquire-balance",
+                &crate::domain::types::TransactionId::InquireBalance,
+                Some(&query), None)
+            .await;
+
+        match resp {
+            Ok(r) if r.rt_cd == "0" => {
+                let mut map = std::collections::HashMap::new();
+                if let Some(items) = r.output {
+                    for item in &items {
+                        let code = item.get("pdno").and_then(|v| v.as_str()).unwrap_or("");
+                        let qty_str = item.get("hldg_qty").and_then(|v| v.as_str()).unwrap_or("0");
+                        let avg_str = item.get("pchs_avg_pric").and_then(|v| v.as_str()).unwrap_or("0");
+                        let qty: u64 = qty_str.parse().unwrap_or(0);
+                        let avg: f64 = avg_str.parse().unwrap_or(0.0);
+                        if qty > 0 && !code.is_empty() {
+                            map.insert(code.to_string(), (avg as i64, qty));
+                        }
+                    }
+                }
+                Ok(map)
+            }
+            Ok(r) => Err(format!("잔고 조회 실패: {}", r.msg1)),
+            Err(e) => Err(format!("잔고 조회 에러: {e}")),
+        }
+    }
+
     async fn start_runner(&self, code: &str, name: &str) -> Result<(), String> {
+        // 이미 실행 중인 러너가 있으면 거부 (좀비 태스크 방지)
+        if self.runners.read().await.contains_key(code) {
+            return Err("이미 실행 중입니다".to_string());
+        }
+
         let client_guard = self.client.read().await;
         let client = client_guard.as_ref()
             .ok_or("KIS 클라이언트가 초기화되지 않았습니다")?
@@ -77,30 +204,65 @@ impl StrategyManager {
         let stock_code = StockCode::new(code).map_err(|e| e.to_string())?;
         let stop_flag = Arc::new(AtomicBool::new(false));
 
-        // 매수 수량 계산 (현재가 기준, 잔고 조회 후 5:5 배분 — 추후 구현)
-        // 일단 1주로 시작
-        let quantity = 1u64;
+        // 종목별 500만원 기준 수량 계산 (5:5 배분)
+        const ALLOC_PER_STOCK: i64 = 5_000_000;
+        let quantity = {
+            let query = [
+                ("FID_COND_MRKT_DIV_CODE", "J"),
+                ("FID_INPUT_ISCD", code),
+            ];
+            let resp: KisResponse<InquirePrice> = client
+                .execute(HttpMethod::Get, "/uapi/domestic-stock/v1/quotations/inquire-price",
+                    &TransactionId::InquirePrice, Some(&query), None)
+                .await
+                .map_err(|e| format!("현재가 조회 실패: {e}"))?;
+            let price_data = resp.into_result().map_err(|e| format!("현재가 파싱 실패: {e}"))?;
+            let price = price_data.stck_prpr;
+            if price <= 0 {
+                return Err("현재가가 0 이하입니다".to_string());
+            }
+            let qty = (ALLOC_PER_STOCK / price) as u64;
+            if qty == 0 {
+                return Err(format!("현재가 {}원 — 500만원으로 1주도 매수 불가", price));
+            }
+            info!("{}: 현재가 {}원, 매수수량 {}주 (배정 {}만원)", name, price, qty, ALLOC_PER_STOCK / 10_000);
+            qty
+        };
 
-        let runner = LiveRunner::new(
+        let mut runner = LiveRunner::new(
             client,
             stock_code,
             name.to_string(),
             quantity,
             stop_flag.clone(),
         );
+        if let Some(ref tx) = self.realtime_tx {
+            runner = runner.with_trade_tx(tx.clone());
+        }
+        if let Some(ref store) = self.db_store {
+            runner = runner.with_db_store(Arc::clone(store));
+        }
+        if let Some(ref candles) = self.ws_candles {
+            runner = runner.with_ws_candles(Arc::clone(candles));
+        }
 
+        let stop_notify = runner.stop_notify();
         let runner_state = runner.state.clone();
         let code_str = code.to_string();
         let statuses = self.statuses.clone();
+        let runners_cleanup = self.runners.clone();
 
         // 러너 핸들 저장
         self.runners.write().await.insert(code.to_string(), RunnerHandle {
             stop_flag: stop_flag.clone(),
+            stop_notify,
             runner_state: runner_state.clone(),
         });
 
         // 백그라운드 태스크로 러너 실행
+        let code_cleanup = code.to_string();
         tokio::spawn(async move {
+            let mut runner = runner;
             match runner.run().await {
                 Ok(trades) => {
                     let pnl: f64 = trades.iter().map(|t| t.pnl_pct()).sum();
@@ -124,6 +286,8 @@ impl StrategyManager {
                     }
                 }
             }
+            // 러너 종료 후 핸들 제거 (재시작 허용)
+            runners_cleanup.write().await.remove(&code_cleanup);
         });
 
         // 상태 업데이트 태스크 (3초마다 러너 상태 → 웹 상태 동기화)
@@ -140,6 +304,8 @@ impl StrategyManager {
                     status.state = rs.phase.clone();
                     status.today_trades = rs.today_trades.len() as i32;
                     status.today_pnl = rs.today_pnl;
+                    status.or_high = rs.or_high;
+                    status.or_low = rs.or_low;
                     if let Some(ref pos) = rs.current_position {
                         status.message = format!("{:?} {}주 @ {}", pos.side, pos.quantity, pos.entry_price);
                     } else {
@@ -156,6 +322,7 @@ impl StrategyManager {
         let runners = self.runners.read().await;
         if let Some(handle) = runners.get(code) {
             handle.stop_flag.store(true, Ordering::Relaxed);
+            handle.stop_notify.notify_waiters(); // sleep 즉시 깨움
         }
     }
 }
@@ -169,7 +336,7 @@ pub struct ToggleRequest {
 async fn get_status(State(state): State<AppState>) -> Json<Vec<StrategyStatus>> {
     let mgr = state.strategy_manager.statuses.read().await;
     let mut list: Vec<StrategyStatus> = mgr.values().cloned().collect();
-    list.sort_by(|a, b| a.code.cmp(&b.code));
+    list.sort_by(|a, b| b.code.cmp(&a.code));
     Json(list)
 }
 
@@ -206,6 +373,7 @@ async fn start_strategy(
         code: req.code, name: String::new(), active: false,
         state: "오류".to_string(), today_trades: 0, today_pnl: 0.0,
         message: "종목 없음".to_string(),
+        or_high: None, or_low: None,
     })
 }
 
@@ -227,8 +395,44 @@ async fn stop_strategy(
             code: req.code, name: String::new(), active: false,
             state: "오류".to_string(), today_trades: 0, today_pnl: 0.0,
             message: "종목 없음".to_string(),
+            or_high: None, or_low: None,
         })
     }
+}
+
+/// 거래 기록 응답
+#[derive(Debug, Serialize, sqlx::FromRow)]
+struct TradeRow {
+    id: i64,
+    stock_code: String,
+    stock_name: String,
+    side: String,
+    quantity: i64,
+    entry_price: i64,
+    exit_price: i64,
+    exit_reason: String,
+    pnl_pct: f64,
+    entry_time: chrono::NaiveDateTime,
+    exit_time: chrono::NaiveDateTime,
+}
+
+/// GET /api/v1/strategy/trades — 당일 거래 내역
+async fn get_trades(State(state): State<AppState>) -> Json<Vec<TradeRow>> {
+    let Some(ref pool) = state.db_pool else {
+        return Json(Vec::new());
+    };
+
+    let rows: Vec<TradeRow> = sqlx::query_as(
+        "SELECT id, stock_code, stock_name, side, quantity, entry_price, exit_price,
+         exit_reason, pnl_pct, entry_time, exit_time
+         FROM trades WHERE entry_time::date = CURRENT_DATE
+         ORDER BY id DESC LIMIT 50"
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    Json(rows)
 }
 
 pub fn routes() -> Router<AppState> {
@@ -236,4 +440,5 @@ pub fn routes() -> Router<AppState> {
         .route("/api/v1/strategy/status", get(get_status))
         .route("/api/v1/strategy/start", post(start_strategy))
         .route("/api/v1/strategy/stop", post(stop_strategy))
+        .route("/api/v1/strategy/trades", get(get_trades))
 }

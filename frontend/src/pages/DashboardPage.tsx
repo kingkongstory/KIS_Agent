@@ -1,67 +1,64 @@
-import { useEffect, useCallback } from 'react';
-import { CandleChart } from '../components/chart/CandleChart';
+import { useEffect } from 'react';
+import { MinuteCandleChart } from '../components/chart/MinuteCandleChart';
 import { StockPriceCard } from '../components/stock/StockPriceCard';
 import { StrategyPanel } from '../components/strategy/StrategyPanel';
+import { TradeLog } from '../components/strategy/TradeLog';
 import { AccountSummary } from '../components/account/AccountSummary';
 import { useStockStore, STOCK_CODES } from '../stores/stockStore';
-import { getPrice, getCandles } from '../api/quotations';
+import { useWsStore } from '../stores/wsStore';
+import type { PriceData } from '../types/stock';
 
 export function DashboardPage() {
-  const { setPriceData, setCandles, chartPeriod, setError } = useStockStore();
+  const { setPriceData } = useStockStore();
+  const prices = useWsStore((s) => s.prices);
 
-  const fetchAll = useCallback(async () => {
+  // WebSocket PriceSnapshot → stockStore 동기화 (가격 카드에서 사용)
+  useEffect(() => {
     for (let i = 0; i < STOCK_CODES.length; i++) {
-      const { code } = STOCK_CODES[i];
-      try {
-        const price = await getPrice(code);
-        setPriceData(i, price);
-      } catch (e) {
-        setError(e instanceof Error ? e.message : '조회 실패');
+      const snapshot = prices.get(STOCK_CODES[i].code);
+      if (snapshot) {
+        const priceData: PriceData = {
+          price: snapshot.price,
+          change: snapshot.change,
+          change_sign: snapshot.change_sign,
+          change_rate: snapshot.change_rate,
+          open: snapshot.open,
+          high: snapshot.high,
+          low: snapshot.low,
+          volume: snapshot.volume,
+          amount: snapshot.amount,
+          name: snapshot.name,
+        };
+        setPriceData(i, priceData);
       }
     }
-  }, [setPriceData, setError]);
-
-  const fetchCandles = useCallback(async () => {
-    const end = new Date().toISOString().slice(0, 10).replace(/-/g, '');
-    const start = new Date(Date.now() - 90 * 86400000).toISOString().slice(0, 10).replace(/-/g, '');
-    for (let i = 0; i < STOCK_CODES.length; i++) {
-      try {
-        const candles = await getCandles(STOCK_CODES[i].code, start, end, chartPeriod);
-        setCandles(i, candles);
-      } catch {
-        // 캔들 로드 실패 무시
-      }
-    }
-  }, [setCandles, chartPeriod]);
-
-  useEffect(() => {
-    fetchAll();
-    const interval = setInterval(fetchAll, 5000);
-    return () => clearInterval(interval);
-  }, [fetchAll]);
-
-  useEffect(() => {
-    fetchCandles();
-  }, [fetchCandles]);
+  }, [prices, setPriceData]);
 
   return (
     <div className="flex flex-col gap-4 h-full">
-      {/* 계좌 + 자동매매 컨트롤 */}
+      {/* 계좌 + 자동매매 컨트롤 + 거래 내역 */}
       <div className="grid grid-cols-3 gap-4">
         <AccountSummary />
-        <div className="col-span-2">
-          <StrategyPanel />
-        </div>
+        <StrategyPanel />
+        <TradeLog />
       </div>
       {/* 두 종목 가격 카드 */}
       <div className="grid grid-cols-2 gap-4">
         <StockPriceCard index={0} />
         <StockPriceCard index={1} />
       </div>
-      {/* 두 종목 차트 */}
-      <div className="grid grid-cols-2 gap-4 flex-1 min-h-0">
-        <CandleChart index={0} />
-        <CandleChart index={1} />
+      {/* 실시간 분봉 차트: 1분 / 5분 / 15분 × 2종목 */}
+      <div className="grid grid-cols-2 gap-3">
+        <MinuteCandleChart index={0} timeframe={1} />
+        <MinuteCandleChart index={1} timeframe={1} />
+      </div>
+      <div className="grid grid-cols-2 gap-3">
+        <MinuteCandleChart index={0} timeframe={5} />
+        <MinuteCandleChart index={1} timeframe={5} />
+      </div>
+      <div className="grid grid-cols-2 gap-3">
+        <MinuteCandleChart index={0} timeframe={15} />
+        <MinuteCandleChart index={1} timeframe={15} />
       </div>
     </div>
   );

@@ -92,7 +92,71 @@ impl PostgresStore {
         .await
         .map_err(|e| KisError::Internal(format!("마이그레이션 실패: {e}")))?;
 
+        // 거래 기록 테이블
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS trades (
+                id BIGSERIAL PRIMARY KEY,
+                stock_code VARCHAR(10) NOT NULL,
+                stock_name VARCHAR(50) NOT NULL DEFAULT '',
+                side VARCHAR(5) NOT NULL,
+                quantity BIGINT NOT NULL DEFAULT 0,
+                entry_price BIGINT NOT NULL,
+                exit_price BIGINT NOT NULL,
+                stop_loss BIGINT NOT NULL DEFAULT 0,
+                take_profit BIGINT NOT NULL DEFAULT 0,
+                entry_time TIMESTAMP NOT NULL,
+                exit_time TIMESTAMP NOT NULL,
+                exit_reason VARCHAR(20) NOT NULL,
+                pnl_pct DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+                strategy VARCHAR(30) NOT NULL DEFAULT 'orb_fvg',
+                environment VARCHAR(10) NOT NULL DEFAULT 'paper',
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            )",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| KisError::Internal(format!("마이그레이션 실패: {e}")))?;
+
+        // 일별 OR 범위 (서버 재시작 시 복구용)
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS daily_or_range (
+                stock_code VARCHAR(10) NOT NULL,
+                date DATE NOT NULL,
+                or_high BIGINT NOT NULL,
+                or_low BIGINT NOT NULL,
+                source VARCHAR(10) NOT NULL DEFAULT 'ws',
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                PRIMARY KEY (stock_code, date)
+            )",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| KisError::Internal(format!("마이그레이션 실패: {e}")))?;
+
+        // 활성 포지션 테이블 (서버 재시작 시 복구용)
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS active_positions (
+                stock_code VARCHAR(10) PRIMARY KEY,
+                side VARCHAR(5) NOT NULL,
+                entry_price BIGINT NOT NULL,
+                stop_loss BIGINT NOT NULL,
+                take_profit BIGINT NOT NULL,
+                quantity BIGINT NOT NULL,
+                tp_order_no VARCHAR(20) DEFAULT '',
+                tp_krx_orgno VARCHAR(20) DEFAULT '',
+                entry_time TIMESTAMP NOT NULL,
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            )",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| KisError::Internal(format!("마이그레이션 실패: {e}")))?;
+
         // 인덱스
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_trades_code_date ON trades (stock_code, entry_time)")
+            .execute(&self.pool)
+            .await
+            .ok();
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_daily_ohlcv_date ON daily_ohlcv (date)")
             .execute(&self.pool)
             .await
@@ -347,12 +411,179 @@ impl PostgresStore {
             .collect())
     }
 
+    // ── 거래 기록 ──
+
+    /// 거래 결과 저장
+    pub async fn save_trade(&self, trade: &TradeRecord) -> Result<(), KisError> {
+        sqlx::query(
+            "INSERT INTO trades (stock_code, stock_name, side, quantity, entry_price, exit_price,
+             stop_loss, take_profit, entry_time, exit_time, exit_reason, pnl_pct, strategy, environment)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+        )
+        .bind(&trade.stock_code)
+        .bind(&trade.stock_name)
+        .bind(&trade.side)
+        .bind(trade.quantity)
+        .bind(trade.entry_price)
+        .bind(trade.exit_price)
+        .bind(trade.stop_loss)
+        .bind(trade.take_profit)
+        .bind(trade.entry_time)
+        .bind(trade.exit_time)
+        .bind(&trade.exit_reason)
+        .bind(trade.pnl_pct)
+        .bind(&trade.strategy)
+        .bind(&trade.environment)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| KisError::Internal(format!("거래 저장 실패: {e}")))?;
+        Ok(())
+    }
+
+    // ── 일별 OR 범위 ──
+
+    /// OR 범위 저장
+    pub async fn save_or_range(&self, stock_code: &str, date: NaiveDate, or_high: i64, or_low: i64, source: &str) -> Result<(), KisError> {
+        sqlx::query(
+            "INSERT INTO daily_or_range (stock_code, date, or_high, or_low, source)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (stock_code, date) DO UPDATE SET or_high=$3, or_low=$4, source=$5",
+        )
+        .bind(stock_code)
+        .bind(date)
+        .bind(or_high)
+        .bind(or_low)
+        .bind(source)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| KisError::Internal(format!("OR 저장 실패: {e}")))?;
+        Ok(())
+    }
+
+    /// OR 범위 조회
+    pub async fn get_or_range(&self, stock_code: &str, date: NaiveDate) -> Result<Option<(i64, i64)>, KisError> {
+        let row: Option<(i64, i64)> = sqlx::query_as(
+            "SELECT or_high, or_low FROM daily_or_range WHERE stock_code = $1 AND date = $2",
+        )
+        .bind(stock_code)
+        .bind(date)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| KisError::Internal(format!("OR 조회 실패: {e}")))?;
+        Ok(row)
+    }
+
+    // ── 활성 포지션 (서버 재시작 복구용) ──
+
+    /// 활성 포지션 저장/갱신
+    pub async fn save_active_position(&self, pos: &ActivePosition) -> Result<(), KisError> {
+        sqlx::query(
+            "INSERT INTO active_positions (stock_code, side, entry_price, stop_loss, take_profit, quantity, tp_order_no, tp_krx_orgno, entry_time)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+             ON CONFLICT (stock_code) DO UPDATE
+             SET side=$2, entry_price=$3, stop_loss=$4, take_profit=$5, quantity=$6, tp_order_no=$7, tp_krx_orgno=$8, entry_time=$9, updated_at=NOW()",
+        )
+        .bind(&pos.stock_code)
+        .bind(&pos.side)
+        .bind(pos.entry_price)
+        .bind(pos.stop_loss)
+        .bind(pos.take_profit)
+        .bind(pos.quantity)
+        .bind(&pos.tp_order_no)
+        .bind(&pos.tp_krx_orgno)
+        .bind(pos.entry_time)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| KisError::Internal(format!("활성 포지션 저장 실패: {e}")))?;
+        Ok(())
+    }
+
+    /// 활성 포지션 조회
+    pub async fn get_active_position(&self, stock_code: &str) -> Result<Option<ActivePosition>, KisError> {
+        let row: Option<ActivePositionRow> = sqlx::query_as(
+            "SELECT stock_code, side, entry_price, stop_loss, take_profit, quantity, tp_order_no, tp_krx_orgno, entry_time
+             FROM active_positions WHERE stock_code = $1",
+        )
+        .bind(stock_code)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| KisError::Internal(format!("활성 포지션 조회 실패: {e}")))?;
+
+        Ok(row.map(|r| ActivePosition {
+            stock_code: r.stock_code,
+            side: r.side,
+            entry_price: r.entry_price,
+            stop_loss: r.stop_loss,
+            take_profit: r.take_profit,
+            quantity: r.quantity,
+            tp_order_no: r.tp_order_no,
+            tp_krx_orgno: r.tp_krx_orgno,
+            entry_time: r.entry_time,
+        }))
+    }
+
+    /// 활성 포지션 삭제 (청산 완료 시)
+    pub async fn delete_active_position(&self, stock_code: &str) -> Result<(), KisError> {
+        sqlx::query("DELETE FROM active_positions WHERE stock_code = $1")
+            .bind(stock_code)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| KisError::Internal(format!("활성 포지션 삭제 실패: {e}")))?;
+        Ok(())
+    }
+
     pub fn pool(&self) -> &PgPool {
         &self.pool
     }
 }
 
 // ── 데이터 구조체 ──
+
+/// 활성 포지션 (서버 재시작 복구용)
+#[derive(Debug, Clone)]
+pub struct ActivePosition {
+    pub stock_code: String,
+    pub side: String,
+    pub entry_price: i64,
+    pub stop_loss: i64,
+    pub take_profit: i64,
+    pub quantity: i64,
+    pub tp_order_no: String,
+    pub tp_krx_orgno: String,
+    pub entry_time: NaiveDateTime,
+}
+
+#[derive(sqlx::FromRow)]
+struct ActivePositionRow {
+    stock_code: String,
+    side: String,
+    entry_price: i64,
+    stop_loss: i64,
+    take_profit: i64,
+    quantity: i64,
+    tp_order_no: String,
+    tp_krx_orgno: String,
+    entry_time: NaiveDateTime,
+}
+
+/// 거래 기록
+#[derive(Debug, Clone)]
+pub struct TradeRecord {
+    pub stock_code: String,
+    pub stock_name: String,
+    pub side: String,
+    pub quantity: i64,
+    pub entry_price: i64,
+    pub exit_price: i64,
+    pub stop_loss: i64,
+    pub take_profit: i64,
+    pub entry_time: NaiveDateTime,
+    pub exit_time: NaiveDateTime,
+    pub exit_reason: String,
+    pub pnl_pct: f64,
+    pub strategy: String,
+    pub environment: String,
+}
 
 /// 분봉 캔들
 #[derive(Debug, Clone)]

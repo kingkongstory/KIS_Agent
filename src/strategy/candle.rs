@@ -22,6 +22,16 @@ impl MinuteCandle {
     pub fn is_bearish(&self) -> bool {
         self.close < self.open
     }
+
+    /// 캔들 범위 (high - low)
+    pub fn range(&self) -> i64 {
+        self.high - self.low
+    }
+
+    /// 몸통 크기 (|close - open|)
+    pub fn body_size(&self) -> i64 {
+        (self.close - self.open).abs()
+    }
 }
 
 /// 1분봉을 N분봉으로 집계

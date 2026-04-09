@@ -89,7 +89,7 @@ impl KisError {
         match msg_cd.as_str() {
             "EGW00123" => KisError::TokenExpired(msg),
             "EGW00121" | "EGW00122" => KisError::AuthenticationFailed(msg),
-            "EGW00201" => KisError::TokenRateLimited,
+            "EGW00201" => KisError::RateLimited, // 초당 거래건수 초과
             "EGW00200" => KisError::RateLimited,
             "APBK0919" => KisError::InsufficientBalance(msg),
             "APBK1001" => KisError::MarketClosed,

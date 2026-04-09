@@ -27,6 +27,20 @@ pub struct KisResponse<T> {
     pub tr_cont: Option<String>,
 }
 
+/// KIS API 에러 응답 (HTTP 500 등)
+#[derive(Deserialize)]
+struct KisErrorBody {
+    #[serde(default)]
+    rt_cd: String,
+    #[serde(default)]
+    msg_cd: String,
+    #[serde(default)]
+    msg1: String,
+    /// 에러 응답에서 msg_cd 대신 사용되는 필드
+    #[serde(default)]
+    message: String,
+}
+
 /// 내부 Raw 응답 (모든 output을 Value로 받음)
 #[derive(Deserialize)]
 struct RawKisResponse {
@@ -140,7 +154,9 @@ impl KisHttpClient {
             match self.do_request(method, path, tr_id, query, body).await {
                 Ok(resp) => return Ok(resp),
                 Err(e) if e.is_retryable() && attempt < max_retries - 1 => {
-                    let delay = e.retry_delay_ms();
+                    // 지수 백오프: base_delay * 2^attempt (서버 과부하 시 연쇄 실패 방지)
+                    let base = e.retry_delay_ms();
+                    let delay = base * (1u64 << attempt);
                     warn!(
                         "API 요청 실패 (시도 {}/{}): {e}, {delay}ms 후 재시도",
                         attempt + 1,
@@ -197,6 +213,14 @@ impl KisHttpClient {
         let text = response.text().await.map_err(|e| KisError::HttpError(e.to_string()))?;
 
         if !status.is_success() {
+            // KIS API는 HTTP 500이어도 JSON body에 에러 코드를 포함 — 파싱하여 분류
+            // 에러 응답은 msg_cd 대신 message 필드를 사용하는 경우가 있음
+            if let Ok(err) = serde_json::from_str::<KisErrorBody>(&text) {
+                let msg_cd = if err.msg_cd.is_empty() { err.message } else { err.msg_cd };
+                if !msg_cd.is_empty() {
+                    return Err(KisError::classify(err.rt_cd, msg_cd, err.msg1));
+                }
+            }
             return Err(KisError::HttpError(format!("HTTP {status}: {text}")));
         }
 

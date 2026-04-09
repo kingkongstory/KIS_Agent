@@ -20,6 +20,7 @@ export function CandleChart({ index }: Props) {
     if (!containerRef.current) return;
 
     const chart = createChart(containerRef.current, {
+      autoSize: true,
       layout: {
         background: { color: '#1A1A1A' },
         textColor: '#A0A0A0',
@@ -55,20 +56,7 @@ export function CandleChart({ index }: Props) {
     candleSeriesRef.current = candleSeries;
     volumeSeriesRef.current = volumeSeries;
 
-    const handleResize = () => {
-      if (containerRef.current) {
-        chart.applyOptions({
-          width: containerRef.current.clientWidth,
-          height: containerRef.current.clientHeight,
-        });
-      }
-    };
-
-    window.addEventListener('resize', handleResize);
-    handleResize();
-
     return () => {
-      window.removeEventListener('resize', handleResize);
       chart.remove();
     };
   }, []);
