@@ -90,6 +90,201 @@ impl BacktestEngine {
         stock_code: &str,
         days: usize,
     ) -> Result<BacktestReport, KisError> {
+        self.run_impl(stock_code, days, false).await
+    }
+
+    /// Multi-Stage ORB 백테스트: 5분/15분/30분 OR을 동시 추적 (선착순)
+    /// 각 OR 단계별 전략을 실행하되, 가장 먼저 진입하는 단계를 채택
+    /// 실전에서도 동일하게 구현 가능 (사후 선택 없음)
+    pub async fn run_multi_stage(
+        &self,
+        stock_code: &str,
+        days: usize,
+    ) -> Result<BacktestReport, KisError> {
+        let dates = self.fetch_available_dates(stock_code, days).await?;
+        if dates.is_empty() {
+            return Err(KisError::Internal(format!(
+                "{stock_code}: DB에 분봉 데이터가 없습니다."
+            )));
+        }
+
+        info!(
+            "Multi-Stage ORB (선착순) 백테스트: {}일 ({} ~ {})",
+            dates.len(), dates.first().unwrap(), dates.last().unwrap(),
+        );
+
+        // 3개 OR 단계: 5분(09:00~09:05), 15분(09:00~09:15), 30분(09:00~09:30)
+        let stages = [
+            ("5분OR", NaiveTime::from_hms_opt(9, 0, 0).unwrap(), NaiveTime::from_hms_opt(9, 5, 0).unwrap()),
+            ("15분OR", NaiveTime::from_hms_opt(9, 0, 0).unwrap(), NaiveTime::from_hms_opt(9, 15, 0).unwrap()),
+            ("30분OR", NaiveTime::from_hms_opt(9, 0, 0).unwrap(), NaiveTime::from_hms_opt(9, 30, 0).unwrap()),
+        ];
+
+        let mut trades = Vec::new();
+
+        for date in &dates {
+            let candles = self.fetch_day_candles(stock_code, *date).await?;
+            if candles.is_empty() {
+                continue;
+            }
+
+            // 각 OR 단계 실행 → 첫 진입 시각이 가장 빠른 단계 채택
+            let mut earliest_stage = "";
+            let mut earliest_results: Vec<TradeResult> = Vec::new();
+            let mut earliest_entry = NaiveTime::from_hms_opt(23, 59, 59).unwrap();
+
+            for (name, or_start, or_end) in &stages {
+                let mut stage_config = self.strategy.config.clone();
+                stage_config.or_start = *or_start;
+                stage_config.or_end = *or_end;
+                let stage_strategy = OrbFvgStrategy { config: stage_config };
+
+                let results = stage_strategy.run_day(&candles);
+                if let Some(first) = results.first() {
+                    if first.entry_time < earliest_entry {
+                        earliest_entry = first.entry_time;
+                        earliest_results = results;
+                        earliest_stage = name;
+                    }
+                }
+            }
+
+            if !earliest_results.is_empty() {
+                let pnl: f64 = earliest_results.iter().map(|t| t.pnl_pct()).sum();
+                info!("{date}: 선착순 {} (진입 {}) — {}건, {:.2}%",
+                    earliest_stage, earliest_entry, earliest_results.len(), pnl);
+                for r in earliest_results {
+                    trades.push((*date, r));
+                }
+            }
+        }
+
+        let total = trades.len();
+        let wins = trades.iter().filter(|(_, t)| t.is_win()).count();
+        let losses = total - wins;
+        let total_pnl: f64 = trades.iter().map(|(_, t)| t.pnl_pct()).sum();
+        let avg_rr = if total > 0 {
+            trades.iter().map(|(_, t)| t.realized_rr()).sum::<f64>() / total as f64
+        } else {
+            0.0
+        };
+
+        Ok(BacktestReport {
+            stock_code: stock_code.to_string(),
+            days_tested: dates.len(),
+            trades,
+            total_trades: total,
+            wins,
+            losses,
+            win_rate: if total > 0 { wins as f64 / total as f64 * 100.0 } else { 0.0 },
+            total_pnl_pct: total_pnl,
+            avg_rr,
+        })
+    }
+
+    /// Session-Based Reset 백테스트: 오전/오후 세션 각각 독립 OR 생성
+    pub async fn run_session_reset(
+        &self,
+        stock_code: &str,
+        days: usize,
+    ) -> Result<BacktestReport, KisError> {
+        let dates = self.fetch_available_dates(stock_code, days).await?;
+        if dates.is_empty() {
+            return Err(KisError::Internal(format!(
+                "{stock_code}: DB에 분봉 데이터가 없습니다."
+            )));
+        }
+
+        info!(
+            "Session Reset 백테스트: {}일 ({} ~ {})",
+            dates.len(), dates.first().unwrap(), dates.last().unwrap(),
+        );
+
+        let mut trades = Vec::new();
+
+        for date in &dates {
+            let candles = self.fetch_day_candles(stock_code, *date).await?;
+            if candles.is_empty() {
+                continue;
+            }
+
+            // 오전 세션: OR 09:00~09:15, 거래 09:15~12:30
+            let am_cutoff = NaiveTime::from_hms_opt(12, 30, 0).unwrap();
+            let am_candles: Vec<_> = candles.iter()
+                .filter(|c| c.time < am_cutoff)
+                .cloned()
+                .collect();
+
+            if !am_candles.is_empty() {
+                let am_results = self.strategy.run_day(&am_candles);
+                info!("{date} 오전: {}개 캔들, {}건 거래", am_candles.len(), am_results.len());
+                for r in am_results {
+                    trades.push((*date, r));
+                }
+            }
+
+            // 오후 세션: OR 13:00~13:15, 거래 13:15~15:20
+            let pm_or_start = NaiveTime::from_hms_opt(13, 0, 0).unwrap();
+            let pm_or_end = NaiveTime::from_hms_opt(13, 15, 0).unwrap();
+            let pm_candles: Vec<MinuteCandle> = candles.iter()
+                .filter(|c| c.time >= pm_or_start)
+                .cloned()
+                .collect();
+
+            if !pm_candles.is_empty() {
+                // 오후 세션 전용 config: OR 시간만 변경
+                let mut pm_config = self.strategy.config.clone();
+                pm_config.or_start = pm_or_start;
+                pm_config.or_end = pm_or_end;
+                let pm_strategy = OrbFvgStrategy { config: pm_config };
+
+                let pm_results = pm_strategy.run_day(&pm_candles);
+                info!("{date} 오후: {}개 캔들, {}건 거래", pm_candles.len(), pm_results.len());
+                for r in pm_results {
+                    trades.push((*date, r));
+                }
+            }
+        }
+
+        let total = trades.len();
+        let wins = trades.iter().filter(|(_, t)| t.is_win()).count();
+        let losses = total - wins;
+        let total_pnl: f64 = trades.iter().map(|(_, t)| t.pnl_pct()).sum();
+        let avg_rr = if total > 0 {
+            trades.iter().map(|(_, t)| t.realized_rr()).sum::<f64>() / total as f64
+        } else {
+            0.0
+        };
+
+        Ok(BacktestReport {
+            stock_code: stock_code.to_string(),
+            days_tested: dates.len(),
+            trades,
+            total_trades: total,
+            wins,
+            losses,
+            win_rate: if total > 0 { wins as f64 / total as f64 * 100.0 } else { 0.0 },
+            total_pnl_pct: total_pnl,
+            avg_rr,
+        })
+    }
+
+    /// Dynamic Target 백테스트: 과거 N일 OR 돌파 확장폭 평균으로 TP 동적 설정
+    pub async fn run_dynamic_target(
+        &self,
+        stock_code: &str,
+        days: usize,
+        lookback: usize,
+    ) -> Result<BacktestReport, KisError> {
+        self.run_impl_dynamic(stock_code, days, lookback).await
+    }
+
+    async fn run_impl(
+        &self,
+        stock_code: &str,
+        days: usize,
+        _dynamic: bool,
+    ) -> Result<BacktestReport, KisError> {
         // 1) DB에서 보유한 날짜 목록 획득
         let dates = self.fetch_available_dates(stock_code, days).await?;
         if dates.is_empty() {
@@ -144,6 +339,112 @@ impl BacktestEngine {
             } else {
                 0.0
             },
+            total_pnl_pct: total_pnl,
+            avg_rr,
+        })
+    }
+
+    /// Dynamic Target 백테스트 구현
+    /// 각 날의 OR 돌파 후 최대 확장폭을 기록하고, 과거 N일 평균을 다음 날 RR로 사용
+    async fn run_impl_dynamic(
+        &self,
+        stock_code: &str,
+        days: usize,
+        lookback: usize,
+    ) -> Result<BacktestReport, KisError> {
+        let dates = self.fetch_available_dates(stock_code, days + lookback).await?;
+        if dates.is_empty() {
+            return Err(KisError::Internal(format!(
+                "{stock_code}: DB에 분봉 데이터가 없습니다."
+            )));
+        }
+
+        info!(
+            "Dynamic Target 백테스트: {}일 (lookback={}일, {} ~ {})",
+            dates.len(), lookback, dates.first().unwrap(), dates.last().unwrap(),
+        );
+
+        // 1단계: 각 날의 OR 돌파 후 최대 확장폭(R 배수) 기록
+        let mut daily_extensions: Vec<f64> = Vec::new();
+        let mut trades = Vec::new();
+
+        for (day_idx, date) in dates.iter().enumerate() {
+            let candles = self.fetch_day_candles(stock_code, *date).await?;
+            if candles.is_empty() {
+                daily_extensions.push(0.0);
+                continue;
+            }
+
+            // OR 범위 계산
+            let cfg = &self.strategy.config;
+            let or_candles: Vec<_> = candles.iter()
+                .filter(|c| c.time >= cfg.or_start && c.time < cfg.or_end)
+                .collect();
+            if or_candles.is_empty() {
+                daily_extensions.push(0.0);
+                continue;
+            }
+
+            let or_high = or_candles.iter().map(|c| c.high).max().unwrap();
+            let or_low = or_candles.iter().map(|c| c.low).min().unwrap();
+            let or_range = (or_high - or_low).max(1) as f64;
+
+            // OR 돌파 후 최대 확장폭 (OR 범위 대비 R 배수)
+            let max_extension = candles.iter()
+                .filter(|c| c.time >= cfg.or_end)
+                .map(|c| {
+                    let bull_ext = (c.high - or_high).max(0) as f64 / or_range;
+                    let bear_ext = (or_low - c.low).max(0) as f64 / or_range;
+                    bull_ext.max(bear_ext)
+                })
+                .fold(0.0f64, |a, b| a.max(b));
+
+            daily_extensions.push(max_extension);
+
+            // lookback 기간이 차면 dynamic RR로 거래 실행
+            if day_idx >= lookback {
+                let recent = &daily_extensions[day_idx.saturating_sub(lookback)..day_idx];
+                let valid: Vec<f64> = recent.iter().filter(|&&x| x > 0.0).cloned().collect();
+                let dynamic_rr = if valid.is_empty() {
+                    self.strategy.config.rr_ratio // fallback
+                } else {
+                    let avg = valid.iter().sum::<f64>() / valid.len() as f64;
+                    avg.max(1.0).min(5.0) // 최소 1R, 최대 5R 클램프
+                };
+
+                // 해당 날의 RR을 동적으로 설정하여 전략 실행
+                let mut day_strategy = OrbFvgStrategy { config: self.strategy.config.clone() };
+                day_strategy.config.rr_ratio = dynamic_rr;
+
+                info!("{date}: {}개 캔들, dynamic RR={:.2} (과거 {}일 평균 확장={:.2}R)",
+                    candles.len(), dynamic_rr, valid.len(), dynamic_rr);
+
+                let day_results = day_strategy.run_day(&candles);
+                for result in day_results {
+                    trades.push((*date, result));
+                }
+            }
+        }
+
+        // 결과 집계
+        let total = trades.len();
+        let wins = trades.iter().filter(|(_, t)| t.is_win()).count();
+        let losses = total - wins;
+        let total_pnl: f64 = trades.iter().map(|(_, t)| t.pnl_pct()).sum();
+        let avg_rr = if total > 0 {
+            trades.iter().map(|(_, t)| t.realized_rr()).sum::<f64>() / total as f64
+        } else {
+            0.0
+        };
+
+        Ok(BacktestReport {
+            stock_code: stock_code.to_string(),
+            days_tested: dates.len().saturating_sub(lookback),
+            trades,
+            total_trades: total,
+            wins,
+            losses,
+            win_rate: if total > 0 { wins as f64 / total as f64 * 100.0 } else { 0.0 },
             total_pnl_pct: total_pnl,
             avg_rr,
         })

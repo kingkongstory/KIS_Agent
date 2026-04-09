@@ -72,6 +72,15 @@ enum Commands {
         /// 2차진입 최소 1차수익률 % (기본: 0.0)
         #[arg(long, default_value = "0.0")]
         min2nd: f64,
+        /// Dynamic Target: 과거 N일 OR 돌파 확장폭 평균으로 RR 설정 (0=비활성)
+        #[arg(long, default_value = "0")]
+        dynamic_lookback: usize,
+        /// Session Reset: 오전/오후 세션 독립 OR 생성
+        #[arg(long, default_value = "false")]
+        session_reset: bool,
+        /// Multi-Stage ORB: 5분/15분/30분 OR 동시 추적
+        #[arg(long, default_value = "false")]
+        multi_stage: bool,
     },
     /// 네이버 금융 일봉 수집
     CollectDaily,
@@ -145,8 +154,8 @@ async fn main() {
         Some(Commands::Trade { stock_code, rr, qty }) => {
             run_trade(&config, &stock_code, rr, qty).await;
         }
-        Some(Commands::Backtest { stock_code, days, rr, trail, tstop, be_r, fvg_exp, min2nd }) => {
-            run_backtest(&config, &stock_code, days, rr, trail, tstop, be_r, fvg_exp, min2nd).await;
+        Some(Commands::Backtest { stock_code, days, rr, trail, tstop, be_r, fvg_exp, min2nd, dynamic_lookback, session_reset, multi_stage }) => {
+            run_backtest(&config, &stock_code, days, rr, trail, tstop, be_r, fvg_exp, min2nd, dynamic_lookback, session_reset, multi_stage).await;
         }
         Some(Commands::CollectDaily) => {
             run_collect_daily(&config).await;
@@ -199,6 +208,7 @@ async fn run_trade(config: &AppConfig, stock_code: &str, rr: f64, qty: u64) {
 async fn run_backtest(
     config: &AppConfig, stock_code: &str, days: usize, rr: f64,
     trail: f64, tstop: usize, be_r: f64, fvg_exp: usize, min2nd: f64,
+    dynamic_lookback: usize, session_reset: bool, multi_stage: bool,
 ) {
     use kis_agent::strategy::orb_fvg::OrbFvgConfig;
 
@@ -219,16 +229,33 @@ async fn run_backtest(
     let source_interval = 5_i16;
     let engine = BacktestEngine::with_config(store, strategy_config, source_interval);
 
-    info!("=== ORB+FVG 백테스트 시작 ===");
-    info!("종목: {stock_code}, 기간: {days}일, RR: 1:{rr:.1}");
-
-    match engine.run(stock_code, days).await {
-        Ok(report) => {
-            println!("{report}");
+    if multi_stage {
+        info!("=== Multi-Stage ORB 백테스트 시작 ===");
+        info!("종목: {stock_code}, 기간: {days}일 (5분/15분/30분 OR 동시 추적)");
+        match engine.run_multi_stage(stock_code, days).await {
+            Ok(report) => println!("{report}"),
+            Err(e) => { eprintln!("백테스트 에러: {e}"); std::process::exit(1); }
         }
-        Err(e) => {
-            eprintln!("백테스트 에러: {e}");
-            std::process::exit(1);
+    } else if session_reset {
+        info!("=== Session Reset 백테스트 시작 ===");
+        info!("종목: {stock_code}, 기간: {days}일 (오전+오후 독립 세션)");
+        match engine.run_session_reset(stock_code, days).await {
+            Ok(report) => println!("{report}"),
+            Err(e) => { eprintln!("백테스트 에러: {e}"); std::process::exit(1); }
+        }
+    } else if dynamic_lookback > 0 {
+        info!("=== Dynamic Target 백테스트 시작 ===");
+        info!("종목: {stock_code}, 기간: {days}일, lookback: {dynamic_lookback}일");
+        match engine.run_dynamic_target(stock_code, days, dynamic_lookback).await {
+            Ok(report) => println!("{report}"),
+            Err(e) => { eprintln!("백테스트 에러: {e}"); std::process::exit(1); }
+        }
+    } else {
+        info!("=== ORB+FVG 백테스트 시작 ===");
+        info!("종목: {stock_code}, 기간: {days}일, RR: 1:{rr:.1}");
+        match engine.run(stock_code, days).await {
+            Ok(report) => println!("{report}"),
+            Err(e) => { eprintln!("백테스트 에러: {e}"); std::process::exit(1); }
         }
     }
 }
