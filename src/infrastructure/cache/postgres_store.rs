@@ -125,8 +125,9 @@ impl PostgresStore {
                 or_high BIGINT NOT NULL,
                 or_low BIGINT NOT NULL,
                 source VARCHAR(10) NOT NULL DEFAULT 'ws',
+                or_stage VARCHAR(5) NOT NULL DEFAULT '15m',
                 created_at TIMESTAMPTZ DEFAULT NOW(),
-                PRIMARY KEY (stock_code, date)
+                PRIMARY KEY (stock_code, date, or_stage)
             )",
         )
         .execute(&self.pool)
@@ -443,35 +444,60 @@ impl PostgresStore {
 
     // ── 일별 OR 범위 ──
 
-    /// OR 범위 저장
+    /// OR 범위 저장 (단계별)
     pub async fn save_or_range(&self, stock_code: &str, date: NaiveDate, or_high: i64, or_low: i64, source: &str) -> Result<(), KisError> {
+        self.save_or_range_stage(stock_code, date, or_high, or_low, source, "15m").await
+    }
+
+    /// OR 범위 저장 (단계 지정)
+    pub async fn save_or_range_stage(&self, stock_code: &str, date: NaiveDate, or_high: i64, or_low: i64, source: &str, stage: &str) -> Result<(), KisError> {
         sqlx::query(
-            "INSERT INTO daily_or_range (stock_code, date, or_high, or_low, source)
-             VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT (stock_code, date) DO UPDATE SET or_high=$3, or_low=$4, source=$5",
+            "INSERT INTO daily_or_range (stock_code, date, or_high, or_low, source, or_stage)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (stock_code, date, or_stage) DO UPDATE SET or_high=$3, or_low=$4, source=$5",
         )
         .bind(stock_code)
         .bind(date)
         .bind(or_high)
         .bind(or_low)
         .bind(source)
+        .bind(stage)
         .execute(&self.pool)
         .await
         .map_err(|e| KisError::Internal(format!("OR 저장 실패: {e}")))?;
         Ok(())
     }
 
-    /// OR 범위 조회
+    /// OR 범위 조회 (기본 15m)
     pub async fn get_or_range(&self, stock_code: &str, date: NaiveDate) -> Result<Option<(i64, i64)>, KisError> {
+        self.get_or_range_stage(stock_code, date, "15m").await
+    }
+
+    /// OR 범위 조회 (단계 지정)
+    pub async fn get_or_range_stage(&self, stock_code: &str, date: NaiveDate, stage: &str) -> Result<Option<(i64, i64)>, KisError> {
         let row: Option<(i64, i64)> = sqlx::query_as(
-            "SELECT or_high, or_low FROM daily_or_range WHERE stock_code = $1 AND date = $2",
+            "SELECT or_high, or_low FROM daily_or_range WHERE stock_code = $1 AND date = $2 AND or_stage = $3",
         )
         .bind(stock_code)
         .bind(date)
+        .bind(stage)
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| KisError::Internal(format!("OR 조회 실패: {e}")))?;
         Ok(row)
+    }
+
+    /// 모든 OR 단계 조회
+    pub async fn get_all_or_stages(&self, stock_code: &str, date: NaiveDate) -> Result<Vec<(String, i64, i64)>, KisError> {
+        let rows: Vec<(String, i64, i64)> = sqlx::query_as(
+            "SELECT or_stage, or_high, or_low FROM daily_or_range WHERE stock_code = $1 AND date = $2 ORDER BY or_stage",
+        )
+        .bind(stock_code)
+        .bind(date)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| KisError::Internal(format!("OR 전체 조회 실패: {e}")))?;
+        Ok(rows)
     }
 
     // ── 활성 포지션 (서버 재시작 복구용) ──

@@ -45,9 +45,11 @@ pub struct RunnerState {
     pub today_trades: Vec<TradeResult>,
     pub today_pnl: f64,
     pub current_position: Option<Position>,
-    /// OR(Opening Range) 고가/저가
+    /// OR(Opening Range) 고가/저가 (기본 15분 — 호환용)
     pub or_high: Option<i64>,
     pub or_low: Option<i64>,
+    /// Multi-Stage OR: (단계명, high, low) — "5m", "15m", "30m"
+    pub or_stages: Vec<(String, i64, i64)>,
     /// 장 중단 여부 (VI 발동 또는 거래정지)
     pub market_halted: bool,
 }
@@ -101,6 +103,7 @@ impl LiveRunner {
                 current_position: None,
                 or_high: None,
                 or_low: None,
+                or_stages: Vec::new(),
                 market_halted: false,
             })),
             trade_tx: None,
@@ -250,12 +253,15 @@ impl LiveRunner {
                 });
                 state.phase = "포지션 보유 (복구)".to_string();
 
-                // DB에서 OR 값도 복구
+                // DB에서 모든 OR 단계 복구
                 let today = Local::now().date_naive();
-                if let Ok(Some((h, l))) = store.get_or_range(self.stock_code.as_str(), today).await {
-                    state.or_high = Some(h);
-                    state.or_low = Some(l);
-                    info!("{}: OR 범위 DB 복구 — H={} L={}", self.stock_name, h, l);
+                if let Ok(stages) = store.get_all_or_stages(self.stock_code.as_str(), today).await {
+                    if !stages.is_empty() {
+                        state.or_high = Some(stages[0].1);
+                        state.or_low = Some(stages[0].2);
+                        state.or_stages = stages.clone();
+                        info!("{}: OR 범위 DB 복구 — {}단계", self.stock_name, stages.len());
+                    }
                 }
 
                 // DB에 새 TP 주문번호 갱신
@@ -473,8 +479,13 @@ impl LiveRunner {
         self.wait_until(cfg.or_start).await;
         if self.is_stopped() { return Ok(Vec::new()); }
 
-        self.update_phase("OR 수집 중").await;
-        self.wait_until(cfg.or_end).await;
+        // Multi-Stage OR: 5분 OR(09:05)부터 시작, 15분(09:15), 30분(09:30) 점진 추가
+        let or_5m_end = NaiveTime::from_hms_opt(9, 5, 0).unwrap();
+        let or_15m_end = NaiveTime::from_hms_opt(9, 15, 0).unwrap();
+        let or_30m_end = NaiveTime::from_hms_opt(9, 30, 0).unwrap();
+
+        self.update_phase("OR 수집 중 (5분)").await;
+        self.wait_until(or_5m_end).await;
         if self.is_stopped() { return Ok(Vec::new()); }
 
         // 메인 루프: 분봉 폴링 → 전략 평가 → 주문 실행
@@ -609,7 +620,7 @@ impl LiveRunner {
         Ok(all_trades)
     }
 
-    /// 분봉 폴링 → 전략 평가 → 진입
+    /// Multi-Stage ORB: 분봉 폴링 → 각 OR 단계별 FVG 탐색 → 선착순 진입
     async fn poll_and_enter(
         &self,
         require_or_breakout: bool,
@@ -621,162 +632,165 @@ impl LiveRunner {
             return Ok(false);
         }
 
-        // OR 범위 — 캔들 데이터 → DB → 네이버 순으로 시도
         let cfg = &self.strategy.config;
+        let now = Local::now().time();
         let today = Local::now().date_naive();
 
-        let (or_high, or_low) = {
-            // 1차: 캔들 데이터에서 OR 계산
+        // Multi-Stage OR 계산: 현재 시각에 따라 가용 단계 결정
+        let or_stages_def = [
+            ("5m",  cfg.or_start, NaiveTime::from_hms_opt(9, 5, 0).unwrap()),
+            ("15m", cfg.or_start, NaiveTime::from_hms_opt(9, 15, 0).unwrap()),
+            ("30m", cfg.or_start, NaiveTime::from_hms_opt(9, 30, 0).unwrap()),
+        ];
+
+        let mut available_stages: Vec<(&str, i64, i64, NaiveTime)> = Vec::new();
+
+        for (stage_name, or_start, or_end) in &or_stages_def {
+            if now < *or_end { continue; } // 아직 OR 수집 미완료
+
+            // 캔들에서 OR 계산
             let or_candles: Vec<_> = all_candles.iter()
-                .filter(|c| c.time >= cfg.or_start && c.time < cfg.or_end)
+                .filter(|c| c.time >= *or_start && c.time < *or_end)
                 .collect();
 
-            if !or_candles.is_empty() {
+            let (h, l) = if !or_candles.is_empty() {
                 let h = or_candles.iter().map(|c| c.high).max().unwrap();
                 let l = or_candles.iter().map(|c| c.low).min().unwrap();
-
-                // DB에 저장 (최초 계산 시)
+                // DB에 저장
                 if let Some(ref store) = self.db_store {
-                    let _ = store.save_or_range(self.stock_code.as_str(), today, h, l, "candle").await;
+                    let _ = store.save_or_range_stage(
+                        self.stock_code.as_str(), today, h, l, "candle", stage_name
+                    ).await;
                 }
                 (h, l)
             } else {
-                // 2차: DB에서 오늘 OR 로드
-                let from_db = if let Some(ref store) = self.db_store {
-                    store.get_or_range(self.stock_code.as_str(), today).await.ok().flatten()
-                } else {
-                    None
-                };
+                // DB에서 로드
+                if let Some(ref store) = self.db_store {
+                    if let Ok(Some((h, l))) = store.get_or_range_stage(
+                        self.stock_code.as_str(), today, stage_name
+                    ).await {
+                        (h, l)
+                    } else { continue; }
+                } else { continue; }
+            };
 
-                if let Some((h, l)) = from_db {
-                    debug!("{}: DB에서 OR 로드 — H={} L={}", self.stock_name, h, l);
-                    (h, l)
-                } else {
-                    // 3차: 외부 소스에서 OR 수집 (KIS API → 네이버)
-                    info!("{}: OR 데이터 없음 — 외부 소스에서 수집 시도", self.stock_name);
-                    match self.fetch_or_from_external(cfg.or_start, cfg.or_end).await {
-                        Some((h, l)) => {
-                            info!("{}: 외부 OR 수집 성공 — H={} L={}", self.stock_name, h, l);
-                            if let Some(ref store) = self.db_store {
-                                let _ = store.save_or_range(self.stock_code.as_str(), today, h, l, "external").await;
-                            }
-                            (h, l)
-                        }
-                        None => {
-                            warn!("{}: OR 데이터 없음 (캔들 {}봉, DB 없음, 외부 수집 실패)", self.stock_name, all_candles.len());
-                            return Ok(false);
-                        }
-                    }
-                }
-            }
-        };
-
-        // OR 범위를 상태에 저장 (웹 표시용)
-        {
-            let mut state = self.state.write().await;
-            state.or_high = Some(or_high);
-            state.or_low = Some(or_low);
+            available_stages.push((stage_name, h, l, *or_end));
         }
 
-        // FVG 탐색 — 실시간 OHLCV 데이터만 사용 (백필 종가 데이터 제외)
-        let scan: Vec<_> = realtime_candles.iter()
-            .filter(|c| c.time >= cfg.or_end)
-            .cloned()
-            .collect();
-        let candles_5m = candle::aggregate(&scan, 5);
+        if available_stages.is_empty() {
+            warn!("{}: 가용 OR 단계 없음", self.stock_name);
+            return Ok(false);
+        }
 
-        info!("{}: OR H={} L={}, 전체 {}봉, 실시간 {}봉, 5분봉 {}개 (첫={:?} 끝={:?})",
-            self.stock_name, or_high, or_low, all_candles.len(), realtime_candles.len(), candles_5m.len(),
-            realtime_candles.first().map(|c| c.time),
-            realtime_candles.last().map(|c| c.time));
+        // 상태에 OR 정보 저장 (웹 표시용 — 첫 단계를 기본으로)
+        {
+            let mut state = self.state.write().await;
+            state.or_high = Some(available_stages[0].1);
+            state.or_low = Some(available_stages[0].2);
+            state.or_stages = available_stages.iter()
+                .map(|(name, h, l, _)| (name.to_string(), *h, *l))
+                .collect();
+        }
 
-        // FVG 탐색
-        let mut pending_fvg: Option<FairValueGap> = None;
-        let mut fvg_side: Option<PositionSide> = None;
-        let mut fvg_formed_idx: usize = 0;
+        // 각 OR 단계별 FVG 탐색 → 선착순 (가장 빠른 진입 시각)
+        let mut best_signal: Option<(PositionSide, i64, i64, i64, &str)> = None; // (side, entry, sl, tp, stage)
 
-        for (idx, c5) in candles_5m.iter().enumerate() {
-            if c5.time >= cfg.entry_cutoff { break; }
+        for (stage_name, or_high, or_low, or_end) in &available_stages {
+            let scan: Vec<_> = realtime_candles.iter()
+                .filter(|c| c.time >= *or_end)
+                .cloned()
+                .collect();
+            let candles_5m = candle::aggregate(&scan, 5);
+            if candles_5m.len() < 3 { continue; }
 
-            // FVG 유효시간 체크
-            if pending_fvg.is_some() && idx - fvg_formed_idx > cfg.fvg_expiry_candles {
-                pending_fvg = None;
-                fvg_side = None;
-            }
+            // FVG 탐색 (백테스트 scan_and_trade 동일 로직)
+            let mut pending_fvg: Option<FairValueGap> = None;
+            let mut fvg_side: Option<PositionSide> = None;
+            let mut fvg_formed_idx: usize = 0;
 
-            // FVG 감지
-            if pending_fvg.is_none() && idx >= 2 {
-                let a = &candles_5m[idx - 2];
-                let b = &candles_5m[idx - 1];
-                let c = c5;
+            for (idx, c5) in candles_5m.iter().enumerate() {
+                if c5.time >= cfg.entry_cutoff { break; }
 
-                // B캔들 몸통이 A캔들 범위의 30% 이상이어야 유효 (노이즈 필터)
-                let a_range = a.range().max(1);
+                if pending_fvg.is_some() && idx - fvg_formed_idx > cfg.fvg_expiry_candles {
+                    pending_fvg = None;
+                    fvg_side = None;
+                }
 
-                if b.is_bullish() && a.high < c.low && b.body_size() * 100 >= a_range * 30 {
-                    let or_ok = !require_or_breakout || b.close > or_high;
-                    let side_ok = confirmed_side.map_or(true, |s| s == PositionSide::Long);
-                    if or_ok && side_ok {
-                        pending_fvg = Some(FairValueGap {
-                            direction: FvgDirection::Bullish,
-                            top: c.low, bottom: a.high,
-                            candle_b_idx: idx - 1, stop_loss: a.low,
-                        });
-                        fvg_side = Some(PositionSide::Long);
-                        fvg_formed_idx = idx;
+                if pending_fvg.is_none() && idx >= 2 {
+                    let a = &candles_5m[idx - 2];
+                    let b = &candles_5m[idx - 1];
+                    let c = c5;
+                    let a_range = a.range().max(1);
+
+                    if b.is_bullish() && a.high < c.low && b.body_size() * 100 >= a_range * 30 {
+                        let or_ok = !require_or_breakout || b.close > *or_high;
+                        let side_ok = confirmed_side.map_or(true, |s| s == PositionSide::Long);
+                        if or_ok && side_ok {
+                            pending_fvg = Some(FairValueGap {
+                                direction: FvgDirection::Bullish,
+                                top: c.low, bottom: a.high,
+                                candle_b_idx: idx - 1, stop_loss: a.low,
+                            });
+                            fvg_side = Some(PositionSide::Long);
+                            fvg_formed_idx = idx;
+                        }
                     }
                 }
 
-                // Bearish FVG → Short 신호는 무시 (모의투자 공매도 불가, 반대 ETF가 Long 담당)
-                // if pending_fvg.is_none() && b.is_bearish() ... { Short }
-            }
-
-            // 리트레이스 진입 확인
-            if let Some(ref gap) = pending_fvg {
-                let side = fvg_side.unwrap();
-                let retrace = match side {
-                    PositionSide::Long => c5.low,
-                    PositionSide::Short => c5.high,
-                };
-
-                if gap.contains_price(retrace) {
-                    let entry_price = gap.mid_price();
-                    let stop_loss = gap.stop_loss;
-                    let risk = (entry_price - stop_loss).abs();
-                    let take_profit = match side {
-                        PositionSide::Long => entry_price + (risk as f64 * cfg.rr_ratio) as i64,
-                        PositionSide::Short => entry_price - (risk as f64 * cfg.rr_ratio) as i64,
+                // 리트레이스 진입 확인
+                if let Some(ref gap) = pending_fvg {
+                    let side = fvg_side.unwrap();
+                    let retrace = match side {
+                        PositionSide::Long => c5.low,
+                        PositionSide::Short => c5.high,
                     };
 
-                    // 공유 포지션 잠금: 다른 종목이 포지션 보유 중이면 진입 차단
-                    if let Some(ref lock) = self.position_lock {
-                        let holder = lock.read().await;
-                        if let Some(ref holding_code) = *holder {
-                            if holding_code != self.stock_code.as_str() {
-                                debug!("{}: 진입 차단 — {}가 포지션 보유 중", self.stock_name, holding_code);
-                                return Ok(false);
-                            }
-                        }
-                    }
+                    if gap.contains_price(retrace) {
+                        let entry_price = gap.mid_price();
+                        let stop_loss = gap.stop_loss;
+                        let risk = (entry_price - stop_loss).abs();
+                        let take_profit = match side {
+                            PositionSide::Long => entry_price + (risk as f64 * cfg.rr_ratio) as i64,
+                            PositionSide::Short => entry_price - (risk as f64 * cfg.rr_ratio) as i64,
+                        };
 
-                    // VI 발동 중이면 진입 차단
-                    if self.state.read().await.market_halted {
-                        warn!("{}: VI 발동 중 — 진입 보류", self.stock_name);
+                        // 선착순: 이미 다른 단계가 신호를 냈으면 스킵
+                        if best_signal.is_none() {
+                            best_signal = Some((side, entry_price, stop_loss, take_profit, stage_name));
+                        }
+                        break; // 이 단계에서 첫 신호 찾으면 종료
+                    }
+                }
+            }
+        }
+
+        // 선착순으로 선택된 신호로 진입
+        if let Some((side, entry_price, stop_loss, take_profit, stage_name)) = best_signal {
+            // 공유 포지션 잠금
+            if let Some(ref lock) = self.position_lock {
+                let holder = lock.read().await;
+                if let Some(ref holding_code) = *holder {
+                    if holding_code != self.stock_code.as_str() {
+                        debug!("{}: 진입 차단 — {}가 포지션 보유 중", self.stock_name, holding_code);
                         return Ok(false);
                     }
+                }
+            }
 
-                    info!(
-                        "{}: {:?} 진입 신호 — entry={}, SL={}, TP={}",
-                        self.stock_name, side, entry_price, stop_loss, take_profit
-                    );
+            // VI 발동 중이면 진입 차단
+            if self.state.read().await.market_halted {
+                warn!("{}: VI 발동 중 — 진입 보류", self.stock_name);
+                return Ok(false);
+            }
 
-                    match self.execute_entry(side, entry_price, stop_loss, take_profit).await {
-                        Ok(_) => return Ok(true),
-                        Err(e) => {
-                            error!("{}: 주문 실패: {e}", self.stock_name);
-                            return Ok(false);
-                        }
-                    }
+            info!("{}: [{}] {:?} 진입 신호 — entry={}, SL={}, TP={}",
+                self.stock_name, stage_name, side, entry_price, stop_loss, take_profit);
+
+            match self.execute_entry(side, entry_price, stop_loss, take_profit).await {
+                Ok(_) => return Ok(true),
+                Err(e) => {
+                    error!("{}: 주문 실패: {e}", self.stock_name);
+                    return Ok(false);
                 }
             }
         }
