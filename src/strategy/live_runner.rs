@@ -771,27 +771,33 @@ impl LiveRunner {
 
         // 선착순으로 선택된 신호로 진입
         if let Some((side, entry_price, stop_loss, take_profit, stage_name)) = best_signal {
-            // 공유 포지션 잠금
+            // 공유 포지션 잠금 (CAS: 원자적 체크+설정, race condition 방지)
             if let Some(ref lock) = self.position_lock {
-                let holder = lock.read().await;
-                if let Some(ref holding_code) = *holder {
+                let mut guard = lock.write().await;
+                if let Some(ref holding_code) = *guard {
                     if holding_code != self.stock_code.as_str() {
                         debug!("{}: 진입 차단 — {}가 포지션 보유 중", self.stock_name, holding_code);
                         return Ok(false);
                     }
                 }
+                // 즉시 잠금 선점 (execute_entry 전에 설정)
+                *guard = Some(self.stock_code.as_str().to_string());
+                drop(guard);
             }
 
-            // VI 발동 중이면 진입 차단
+            // VI 발동 중이면 진입 차단 (잠금 해제 필요)
             if self.state.read().await.market_halted {
                 warn!("{}: VI 발동 중 — 진입 보류", self.stock_name);
+                if let Some(ref lock) = self.position_lock {
+                    *lock.write().await = None;
+                }
                 return Ok(false);
             }
 
             info!("{}: [{}] {:?} 진입 신호 — entry={}, SL={}, TP={}",
                 self.stock_name, stage_name, side, entry_price, stop_loss, take_profit);
 
-            // 주문 실행 (실패 시 1초 후 1회 재시도)
+            // 주문 실행 (실패 시 잠금 해제 + 1초 후 재시도)
             match self.execute_entry(side, entry_price, stop_loss, take_profit).await {
                 Ok(_) => return Ok(true),
                 Err(e) => {
@@ -800,7 +806,10 @@ impl LiveRunner {
                     match self.execute_entry(side, entry_price, stop_loss, take_profit).await {
                         Ok(_) => return Ok(true),
                         Err(e2) => {
-                            error!("{}: 재시도 실패: {e2}", self.stock_name);
+                            error!("{}: 재시도 실패 — 잠금 해제: {e2}", self.stock_name);
+                            if let Some(ref lock) = self.position_lock {
+                                *lock.write().await = None;
+                            }
                             return Ok(false);
                         }
                     }
@@ -1090,15 +1099,13 @@ impl LiveRunner {
                     original_sl: pos.original_sl,
                 };
                 drop(state_r);
-                let _ = store.save_active_position(&ap).await;
+                if let Err(e) = store.save_active_position(&ap).await {
+                    error!("{}: 활성 포지션 DB 저장 실패 — 재시작 시 복구 불가: {e}", self.stock_name);
+                }
             }
         }
 
-        // 공유 포지션 잠금 설정
-        if let Some(ref lock) = self.position_lock {
-            *lock.write().await = Some(self.stock_code.as_str().to_string());
-            info!("{}: 포지션 잠금 설정 (다른 종목 진입 차단)", self.stock_name);
-        }
+        // 포지션 잠금은 poll_and_enter에서 CAS로 이미 설정됨
 
         Ok(())
     }
