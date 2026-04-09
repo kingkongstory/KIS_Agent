@@ -1,11 +1,12 @@
 use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, RwLock};
 use tokio::time::{Duration, sleep};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
 
-use super::parser::{WsMessage, parse_data_message, parse_ws_message};
+use super::crypto::aes_cbc_base64_decrypt;
+use super::parser::{self, DataMessage, WsMessage, parse_data_message, parse_ws_message};
 use super::subscription::SubscriptionManager;
 use crate::domain::error::KisError;
 use crate::domain::ports::realtime::RealtimeData;
@@ -18,6 +19,10 @@ pub struct KisWebSocketClient {
     environment: Environment,
     subscription_manager: Arc<SubscriptionManager>,
     data_tx: broadcast::Sender<RealtimeData>,
+    /// 체결통보 AES 복호화 키 (구독 응답에서 수신)
+    aes_key: Arc<RwLock<Option<String>>>,
+    /// 체결통보 AES 복호화 IV (구독 응답에서 수신)
+    aes_iv: Arc<RwLock<Option<String>>>,
 }
 
 impl KisWebSocketClient {
@@ -31,6 +36,8 @@ impl KisWebSocketClient {
             environment,
             subscription_manager: Arc::new(SubscriptionManager::new()),
             data_tx,
+            aes_key: Arc::new(RwLock::new(None)),
+            aes_iv: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -136,7 +143,8 @@ impl KisWebSocketClient {
                         let _ = write.send(Message::Pong(data)).await;
                     }
                     Ok(Some(Err(e))) => {
-                        return Err(KisError::WebSocketError(format!("구독 확인 중 오류: {e}")));
+                        warn!("구독 확인 중 WebSocket 오류 (무시): {e}");
+                        break;
                     }
                     Ok(None) => break,
                     _ => break, // 타임아웃
@@ -186,9 +194,25 @@ impl KisWebSocketClient {
             Some(WsMessage::Control(ctrl)) => {
                 if ctrl.body.rt_cd == "0" {
                     info!(
-                        "구독 {} — {} ({})",
+                        "구독 확인 — {} {} ({})",
                         ctrl.header.tr_id, ctrl.header.tr_key, ctrl.body.msg1
                     );
+                    // 체결통보 구독 응답에서 AES key/iv 추출
+                    if ctrl.header.tr_id == "H0STCNI9" || ctrl.header.tr_id == "H0STCNI0" {
+                        if let Some(output) = &ctrl.body.output {
+                            let key = output.get("key").and_then(|v| v.as_str()).map(String::from);
+                            let iv = output.get("iv").and_then(|v| v.as_str()).map(String::from);
+                            if key.is_some() && iv.is_some() {
+                                let aes_key = Arc::clone(&self.aes_key);
+                                let aes_iv = Arc::clone(&self.aes_iv);
+                                tokio::spawn(async move {
+                                    *aes_key.write().await = key;
+                                    *aes_iv.write().await = iv;
+                                });
+                                info!("체결통보 AES key/iv 수신 완료");
+                            }
+                        }
+                    }
                 } else {
                     warn!(
                         "구독 실패: {} — {} ({})",
@@ -197,7 +221,36 @@ impl KisWebSocketClient {
                 }
             }
             Some(WsMessage::Data(data)) => {
-                if let Some(realtime) = parse_data_message(&data) {
+                // 체결통보: 암호화 데이터 → 복호화 후 파싱
+                if data.encrypted && (data.tr_id == "H0STCNI9" || data.tr_id == "H0STCNI0") {
+                    let aes_key = Arc::clone(&self.aes_key);
+                    let aes_iv = Arc::clone(&self.aes_iv);
+                    let tx = self.data_tx.clone();
+                    let raw = data.data_parts.join("^"); // 원본 복원
+                    tokio::spawn(async move {
+                        let key_guard = aes_key.read().await;
+                        let iv_guard = aes_iv.read().await;
+                        if let (Some(key), Some(iv)) = (key_guard.as_ref(), iv_guard.as_ref()) {
+                            match aes_cbc_base64_decrypt(key, iv, &raw) {
+                                Ok(decrypted) => {
+                                    let parts: Vec<String> = decrypted.split('^').map(String::from).collect();
+                                    let dec_data = DataMessage {
+                                        encrypted: false,
+                                        tr_id: "H0STCNI9".to_string(),
+                                        count: 1,
+                                        data_parts: parts,
+                                    };
+                                    if let Some(realtime) = parser::parse_execution_notice(&dec_data) {
+                                        let _ = tx.send(realtime);
+                                    }
+                                }
+                                Err(e) => warn!("체결통보 복호화 실패: {e}"),
+                            }
+                        } else {
+                            warn!("체결통보 수신했으나 AES key/iv 미설정");
+                        }
+                    });
+                } else if let Some(realtime) = parse_data_message(&data) {
                     let _ = self.data_tx.send(realtime);
                 }
             }

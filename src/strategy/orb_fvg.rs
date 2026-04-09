@@ -2,7 +2,7 @@ use chrono::NaiveTime;
 use tracing::{debug, info};
 
 use super::candle::{self, MinuteCandle};
-use super::fvg::{self, FairValueGap, FvgDirection};
+use super::fvg::{FairValueGap, FvgDirection};
 use super::types::*;
 
 /// ORB+FVG 전략 설정
@@ -34,24 +34,27 @@ pub struct OrbFvgConfig {
     pub max_daily_loss_pct: f64,
     /// 일일 최대 거래 횟수 (기본 5회)
     pub max_daily_trades: usize,
+    /// Long 전용 모드 (true: Bearish FVG 무시, 실전 동일)
+    pub long_only: bool,
 }
 
 impl Default for OrbFvgConfig {
     fn default() -> Self {
         Self {
-            rr_ratio: 2.0,
+            rr_ratio: 2.5,
             or_start: NaiveTime::from_hms_opt(9, 0, 0).unwrap(),
             or_end: NaiveTime::from_hms_opt(9, 15, 0).unwrap(),
             entry_cutoff: NaiveTime::from_hms_opt(15, 20, 0).unwrap(),
             force_exit: NaiveTime::from_hms_opt(15, 25, 0).unwrap(),
-            time_stop_candles: 6,
-            trailing_r: 0.5,
-            breakeven_r: 1.0,
+            time_stop_candles: 3,
+            trailing_r: 0.05,
+            breakeven_r: 0.15,
             atr_sl_multiplier: 1.5,
-            fvg_expiry_candles: 4,
-            min_first_pnl_for_second: 0.5,
+            fvg_expiry_candles: 6,
+            min_first_pnl_for_second: 0.0,
             max_daily_loss_pct: -1.5,
-            max_daily_trades: 999,
+            max_daily_trades: 5,
+            long_only: true,
         }
     }
 }
@@ -119,39 +122,64 @@ impl OrbFvgStrategy {
             return results;
         }
 
-        // 3) 1차 진입: OR 돌파 + FVG
-        let (first_result, exit_idx, confirmed_side) =
-            self.scan_and_trade(&candles_5m, or_high, or_low, true);
+        // 3) 실전 동일 루프: 거래 횟수 제한 + 누적 손실 한도 + 방향 관리
+        let mut trade_count = 0usize;
+        let mut cumulative_pnl = 0.0f64;
+        let mut confirmed_side: Option<PositionSide> = None;
+        let mut search_from = 0usize; // 다음 탐색 시작 인덱스
 
-        match first_result {
-            Some(trade) if trade.is_win() => {
-                let side = confirmed_side.unwrap();
-                let pnl = trade.pnl_pct();
-                results.push(trade);
+        loop {
+            // 거래 횟수 한도
+            if trade_count >= self.config.max_daily_trades {
+                info!("최대 거래 횟수 도달 ({}회)", self.config.max_daily_trades);
+                break;
+            }
 
-                // 4) 2차 진입: 1차 수익 0.5% 이상일 때만 허용
-                //    약한 1차 수익 후 2차 진입은 고점 추격이 될 위험
-                if pnl < self.config.min_first_pnl_for_second {
-                    info!("1차 거래 수익 ({:?} +{:.2}%) — 수익 부족, 2차 진입 안 함", side, pnl);
-                } else if exit_idx < candles_5m.len() {
-                    info!("1차 거래 수익 ({:?} +{:.2}%) — 같은 방향 2차 진입 탐색", side, pnl);
-                    let remaining = &candles_5m[exit_idx..];
-                    if let (Some(second), _, _) =
-                        self.scan_and_trade(remaining, or_high, or_low, false)
-                    {
-                        // 방향 일치 확인
-                        if second.side == side {
-                            info!("2차 거래: {:?} {:.2}%", second.side, second.pnl_pct());
-                            results.push(second);
+            // 누적 손실 한도
+            if cumulative_pnl <= self.config.max_daily_loss_pct {
+                info!("일일 손실 한도 도달 ({:.2}%)", cumulative_pnl);
+                break;
+            }
+
+            // 남은 캔들에서 신호 탐색
+            if search_from >= candles_5m.len() {
+                break;
+            }
+            let scan_slice = &candles_5m[search_from..];
+
+            // 1차는 OR 돌파 필수, 이후는 FVG만
+            let require_or = trade_count == 0;
+            let (trade_result, exit_idx_rel, new_side) =
+                self.scan_and_trade(scan_slice, or_high, or_low, require_or);
+
+            match trade_result {
+                Some(trade) => {
+                    // 방향 확인 (confirmed_side가 있으면 같은 방향만 허용)
+                    if let Some(cs) = confirmed_side {
+                        if trade.side != cs {
+                            // 방향 불일치 → 이 거래는 무시하고 탐색 계속
+                            search_from += exit_idx_rel.max(1);
+                            continue;
                         }
                     }
+
+                    let pnl = trade.pnl_pct();
+                    trade_count += 1;
+                    cumulative_pnl += pnl;
+
+                    info!(
+                        "{}차 거래: {:?} {:.2}% (누적 {:.2}%)",
+                        trade_count, trade.side, pnl, cumulative_pnl
+                    );
+
+                    // 방향 관리: 수익이면 같은 방향 유지, 손실이면 리셋
+                    confirmed_side = if pnl > 0.0 { Some(trade.side) } else { None };
+
+                    results.push(trade);
+                    search_from += exit_idx_rel;
                 }
+                None => break, // 더 이상 신호 없음
             }
-            Some(trade) => {
-                info!("1차 거래 손실 ({:.2}%) — 하루 종료", trade.pnl_pct());
-                results.push(trade);
-            }
-            None => {}
         }
 
         results
@@ -193,7 +221,6 @@ impl OrbFvgStrategy {
                 let b = &candles_5m[idx - 1];
                 let c = c5;
 
-                // B캔들 몸통이 A캔들 범위의 30% 이상이어야 유효 (노이즈 필터)
                 let a_range = a.range().max(1);
 
                 // Bullish FVG
@@ -203,15 +230,11 @@ impl OrbFvgStrategy {
                         let label = if require_or_breakout { "OR HIGH 돌파 + " } else { "2차 " };
                         let gap = FairValueGap {
                             direction: FvgDirection::Bullish,
-                            top: c.low,
-                            bottom: a.high,
-                            candle_b_idx: idx - 1,
-                            stop_loss: a.low,
+                            top: c.low, bottom: a.high,
+                            candle_b_idx: idx - 1, stop_loss: a.low,
                         };
-                        info!(
-                            "{}: {label}Bullish FVG — 갭 [{}, {}], SL={}",
-                            b.time, gap.bottom, gap.top, gap.stop_loss
-                        );
+                        info!("{}: {label}Bullish FVG — 갭 [{}, {}], SL={}",
+                            b.time, gap.bottom, gap.top, gap.stop_loss);
                         pending_fvg = Some(gap);
                         breakout_side = Some(PositionSide::Long);
                         fvg_formed_idx = idx;
@@ -219,22 +242,20 @@ impl OrbFvgStrategy {
                     }
                 }
 
-                // Bearish FVG
-                if b.is_bearish() && a.low > c.high && b.body_size() * 100 >= a_range * 30 {
+                // Bearish FVG (long_only=true면 무시 — 실전 동일: 공매도 불가)
+                if !self.config.long_only
+                    && b.is_bearish() && a.low > c.high && b.body_size() * 100 >= a_range * 30
+                {
                     let or_ok = !require_or_breakout || b.close < or_low;
                     if or_ok {
                         let label = if require_or_breakout { "OR LOW 돌파 + " } else { "2차 " };
                         let gap = FairValueGap {
                             direction: FvgDirection::Bearish,
-                            top: a.low,
-                            bottom: c.high,
-                            candle_b_idx: idx - 1,
-                            stop_loss: a.high,
+                            top: a.low, bottom: c.high,
+                            candle_b_idx: idx - 1, stop_loss: a.high,
                         };
-                        info!(
-                            "{}: {label}Bearish FVG — 갭 [{}, {}], SL={}",
-                            b.time, gap.bottom, gap.top, gap.stop_loss
-                        );
+                        info!("{}: {label}Bearish FVG — 갭 [{}, {}], SL={}",
+                            b.time, gap.bottom, gap.top, gap.stop_loss);
                         pending_fvg = Some(gap);
                         breakout_side = Some(PositionSide::Short);
                         fvg_formed_idx = idx;
@@ -260,21 +281,14 @@ impl OrbFvgStrategy {
                         PositionSide::Short => entry_price - (risk as f64 * self.config.rr_ratio) as i64,
                     };
 
-                    info!(
-                        "{}: {:?} 진입 — entry={}, SL={}, TP={} (RR=1:{:.1})",
-                        c5.time, side, entry_price, stop_loss, take_profit, self.config.rr_ratio
-                    );
+                    info!("{}: {:?} 진입 — entry={}, SL={}, TP={} (RR=1:{:.1})",
+                        c5.time, side, entry_price, stop_loss, take_profit, self.config.rr_ratio);
 
                     let result = self.simulate_exit(
-                        side,
-                        entry_price,
-                        stop_loss,
-                        take_profit,
-                        c5.time,
-                        &candles_5m[idx + 1..],
+                        side, entry_price, stop_loss, take_profit,
+                        c5.time, &candles_5m[idx + 1..],
                     );
 
-                    // 청산 시점의 캔들 인덱스 계산
                     let exit_candle_idx = if let Some(ref r) = result {
                         candles_5m.iter().position(|c| c.time >= r.exit_time)
                             .unwrap_or(candles_5m.len())
@@ -290,13 +304,17 @@ impl OrbFvgStrategy {
         (None, candles_5m.len(), None)
     }
 
-    /// 진입 후 청산 시뮬레이션
+    /// 진입 후 청산 시뮬레이션 (TP 지정가 우선)
     ///
-    /// 청산 우선순위 (매 캔들마다):
-    /// 1. 원래 SL 또는 트레일링 SL 터치 → 손절/트레일링/본전 청산
-    /// 2. TP 도달 → 익절
-    /// 3. 시간 스탑: N캔들 경과 후 1R 미달 → 현재가 청산
-    /// 4. 장마감 → 강제 청산
+    /// TP 지정가는 KRX에 걸려있어 가격 도달 즉시 체결 (레이턴시 0)
+    /// SL/트레일링은 서버 3초 폴링 (레이턴시 있음)
+    ///
+    /// 캔들별 청산 판정:
+    /// 1. 시가가 이미 SL 돌파 → 갭 손절 (TP 체크 불필요)
+    /// 2. TP 도달 → 지정가 체결 (거래소 우선)
+    /// 3. best_price 갱신 + 1R 도달 + 트레일링 SL
+    /// 4. SL 도달 → 서버 측 시장가 청산
+    /// 5. 시간 스탑 / 장마감
     fn simulate_exit(
         &self,
         side: PositionSide,
@@ -309,21 +327,51 @@ impl OrbFvgStrategy {
         let risk = (entry_price - stop_loss).abs() as f64;
         let trailing_dist = (risk * self.config.trailing_r) as i64;
         let mut current_sl = stop_loss;
-        let mut best_price = entry_price; // 유리한 방향 최고/최저가 추적
+        let mut best_price = entry_price;
         let mut reached_1r = false;
 
         for (i, c) in remaining.iter().enumerate() {
-            // 유리한 방향 최적가 갱신
-            let favorable_price = match side {
+            // ── Step 0: 시가에서 이미 SL 돌파 (갭 손절) ──
+            let open_sl_breach = match side {
+                PositionSide::Long => c.open <= current_sl,
+                PositionSide::Short => c.open >= current_sl,
+            };
+            if open_sl_breach {
+                let reason = if reached_1r {
+                    ExitReason::TrailingStop
+                } else {
+                    ExitReason::StopLoss
+                };
+                info!("{}: 시가 갭 {:?} — open={}, SL={}", c.time, reason, c.open, current_sl);
+                return Some(TradeResult {
+                    side, entry_price, exit_price: c.open, stop_loss, take_profit,
+                    entry_time, exit_time: c.time, exit_reason: reason,
+                });
+            }
+
+            // ── Step 1: TP 지정가 체결 (거래소 우선) ──
+            let tp_hit = match side {
+                PositionSide::Long => c.high >= take_profit,
+                PositionSide::Short => c.low <= take_profit,
+            };
+            if tp_hit {
+                info!("{}: TP 지정가 체결 — TP={}", c.time, take_profit);
+                return Some(TradeResult {
+                    side, entry_price, exit_price: take_profit, stop_loss, take_profit,
+                    entry_time, exit_time: c.time, exit_reason: ExitReason::TakeProfit,
+                });
+            }
+
+            // ── Step 2: best_price 갱신 + 1R 도달 + 트레일링 ──
+            let favorable = match side {
                 PositionSide::Long => c.high,
                 PositionSide::Short => c.low,
             };
             best_price = match side {
-                PositionSide::Long => best_price.max(favorable_price),
-                PositionSide::Short => best_price.min(favorable_price),
+                PositionSide::Long => best_price.max(favorable),
+                PositionSide::Short => best_price.min(favorable),
             };
 
-            // 1R 도달 체크 → 본전 스탑 활성화
             let profit_from_entry = match side {
                 PositionSide::Long => best_price - entry_price,
                 PositionSide::Short => entry_price - best_price,
@@ -331,11 +379,10 @@ impl OrbFvgStrategy {
             let breakeven_dist = (risk * self.config.breakeven_r) as i64;
             if !reached_1r && profit_from_entry >= breakeven_dist {
                 reached_1r = true;
-                current_sl = entry_price; // 본전 스탑
+                current_sl = entry_price;
                 info!("{}: 1R 도달 — 본전 스탑 활성화 (SL → {})", c.time, current_sl);
             }
 
-            // 트레일링 스탑 갱신 (1R 도달 후)
             if reached_1r {
                 let new_sl = match side {
                     PositionSide::Long => best_price - trailing_dist,
@@ -351,7 +398,7 @@ impl OrbFvgStrategy {
                 }
             }
 
-            // SL 체크 (원래 SL 또는 트레일링/본전 SL)
+            // ── Step 3: SL 체크 ──
             let sl_hit = match side {
                 PositionSide::Long => c.low <= current_sl,
                 PositionSide::Short => c.high >= current_sl,
@@ -368,82 +415,34 @@ impl OrbFvgStrategy {
                 };
                 info!("{}: {:?} — SL={}", c.time, reason, current_sl);
                 return Some(TradeResult {
-                    side,
-                    entry_price,
-                    exit_price: current_sl,
-                    stop_loss,
-                    take_profit,
-                    entry_time,
-                    exit_time: c.time,
-                    exit_reason: reason,
+                    side, entry_price, exit_price: current_sl, stop_loss, take_profit,
+                    entry_time, exit_time: c.time, exit_reason: reason,
                 });
             }
 
-            // TP 체크
-            let tp_hit = match side {
-                PositionSide::Long => c.high >= take_profit,
-                PositionSide::Short => c.low <= take_profit,
-            };
-            if tp_hit {
-                info!("{}: 익절 — TP={}", c.time, take_profit);
-                return Some(TradeResult {
-                    side,
-                    entry_price,
-                    exit_price: take_profit,
-                    stop_loss,
-                    take_profit,
-                    entry_time,
-                    exit_time: c.time,
-                    exit_reason: ExitReason::TakeProfit,
-                });
-            }
-
-            // 시간 스탑: N캔들 경과 후 1R 미달 → 수익/손실 무관 현재가 청산
-            // 핵심: 모멘텀이 없으면 수익이든 손실이든 빠르게 정리
+            // ── Step 4: 시간 스탑 ──
             if !reached_1r && i + 1 >= self.config.time_stop_candles {
-                info!(
-                    "{}: 시간 스탑 — {}캔들 경과, 1R 미달, 청산 (close={})",
-                    c.time, self.config.time_stop_candles, c.close
-                );
+                info!("{}: 시간 스탑 — {}캔들 경과, 1R 미달 (close={})",
+                    c.time, self.config.time_stop_candles, c.close);
                 return Some(TradeResult {
-                    side,
-                    entry_price,
-                    exit_price: c.close,
-                    stop_loss,
-                    take_profit,
-                    entry_time,
-                    exit_time: c.time,
-                    exit_reason: ExitReason::TimeStop,
+                    side, entry_price, exit_price: c.close, stop_loss, take_profit,
+                    entry_time, exit_time: c.time, exit_reason: ExitReason::TimeStop,
                 });
             }
 
-            // 장마감 강제 청산
+            // ── Step 5: 장마감 강제 청산 ──
             if c.time >= self.config.force_exit {
                 info!("{}: 장마감 청산 — close={}", c.time, c.close);
                 return Some(TradeResult {
-                    side,
-                    entry_price,
-                    exit_price: c.close,
-                    stop_loss,
-                    take_profit,
-                    entry_time,
-                    exit_time: c.time,
-                    exit_reason: ExitReason::EndOfDay,
+                    side, entry_price, exit_price: c.close, stop_loss, take_profit,
+                    entry_time, exit_time: c.time, exit_reason: ExitReason::EndOfDay,
                 });
             }
         }
 
-        remaining.last().map(|last| {
-            TradeResult {
-                side,
-                entry_price,
-                exit_price: last.close,
-                stop_loss,
-                take_profit,
-                entry_time,
-                exit_time: last.time,
-                exit_reason: ExitReason::EndOfDay,
-            }
+        remaining.last().map(|last| TradeResult {
+            side, entry_price, exit_price: last.close, stop_loss, take_profit,
+            entry_time, exit_time: last.time, exit_reason: ExitReason::EndOfDay,
         })
     }
 
@@ -668,6 +667,12 @@ mod tests {
             take_profit: 10200,
             entry_time: NaiveTime::from_hms_opt(9, 30, 0).unwrap(),
             quantity: 1,
+            tp_order_no: None,
+            tp_krx_orgno: None,
+            tp_limit_price: None,
+            reached_1r: false,
+            best_price: 10000,
+            original_sl: 0,
         };
 
         assert_eq!(strategy.check_exit(&pos, 10100), None);
@@ -685,6 +690,12 @@ mod tests {
             take_profit: 9800,
             entry_time: NaiveTime::from_hms_opt(9, 30, 0).unwrap(),
             quantity: 1,
+            tp_order_no: None,
+            tp_krx_orgno: None,
+            tp_limit_price: None,
+            reached_1r: false,
+            best_price: 10000,
+            original_sl: 0,
         };
 
         assert_eq!(strategy.check_exit(&pos, 9900), None);

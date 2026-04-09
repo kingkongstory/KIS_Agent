@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useMemo } from 'react';
 import {
   createChart,
   CandlestickSeries,
@@ -85,8 +85,10 @@ export function MinuteCandleChart({ index, timeframe }: Props) {
   const volumeSeriesRef = useRef<any>(null);
   const meta = STOCK_CODES[index];
 
-  const candles = useWsStore((s) => s.candles.get(meta.code) ?? []);
-  const currentCandle = useWsStore((s) => s.currentCandle.get(meta.code));
+  const candlesMap = useWsStore((s) => s.candles);
+  const currentCandleMap = useWsStore((s) => s.currentCandle);
+  const candles = useMemo(() => candlesMap.get(meta.code) ?? [], [candlesMap, meta.code]);
+  const currentCandle = currentCandleMap.get(meta.code);
 
   // 차트 초기화
   useEffect(() => {

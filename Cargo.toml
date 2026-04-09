@@ -52,3 +52,8 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "postgres", "ch
 
 # UUID
 uuid = { version = "1", features = ["v4"] }
+
+# AES-256-CBC 복호화 (WebSocket 체결통보)
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+base64 = "0.22"

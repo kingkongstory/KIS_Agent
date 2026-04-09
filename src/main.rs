@@ -40,8 +40,8 @@ enum Commands {
     Trade {
         /// 종목코드 (6자리, 예: 005930)
         stock_code: String,
-        /// 손익비 (기본: 2.0)
-        #[arg(long, default_value = "2.0")]
+        /// 손익비 (기본: 2.5)
+        #[arg(long, default_value = "2.5")]
         rr: f64,
         /// 주문 수량 (기본: 1)
         #[arg(long, default_value = "1")]
@@ -54,22 +54,22 @@ enum Commands {
         /// 테스트 일수 (기본: 30)
         #[arg(long, default_value = "30")]
         days: usize,
-        /// 손익비 (기본: 2.0)
-        #[arg(long, default_value = "2.0")]
+        /// 손익비 (기본: 2.5)
+        #[arg(long, default_value = "2.5")]
         rr: f64,
-        /// 트레일링 간격 R배수 (기본: 0.1)
-        #[arg(long, default_value = "0.1")]
+        /// 트레일링 간격 R배수 (기본: 0.05)
+        #[arg(long, default_value = "0.05")]
         trail: f64,
         /// 시간스탑 캔들 수 (기본: 3 = 15분)
         #[arg(long, default_value = "3")]
         tstop: usize,
-        /// 본전스탑 활성화 R배수 (기본: 0.3)
-        #[arg(long, default_value = "0.3")]
+        /// 본전스탑 활성화 R배수 (기본: 0.15)
+        #[arg(long, default_value = "0.15")]
         be_r: f64,
         /// FVG 유효 캔들 수 (기본: 6 = 30분)
         #[arg(long, default_value = "6")]
         fvg_exp: usize,
-        /// 2차진입 최소 1차수익률 % (기본: 0.0 = 수익이면 무조건)
+        /// 2차진입 최소 1차수익률 % (기본: 0.0)
         #[arg(long, default_value = "0.0")]
         min2nd: f64,
     },
@@ -437,7 +437,12 @@ async fn run_server(config: AppConfig) {
     let account_adapter = Arc::new(KisAccountAdapter::new(Arc::clone(&http_client)));
 
     // 서비스 생성
-    let market_data_service = Arc::new(MarketDataService::new(market_data_adapter, sqlite_cache));
+    use kis_agent::infrastructure::cache::memory_cache::MemoryCache;
+    let price_cache = Arc::new(MemoryCache::new(std::time::Duration::from_secs(5)));
+    let orderbook_cache = Arc::new(MemoryCache::new(std::time::Duration::from_secs(3)));
+    let market_data_service = Arc::new(MarketDataService::new(
+        market_data_adapter, price_cache, orderbook_cache, sqlite_cache,
+    ));
     let trading_service = Arc::new(TradingService::new(trading_adapter));
     let account_service = Arc::new(AccountService::new(account_adapter));
 
@@ -460,6 +465,15 @@ async fn run_server(config: AppConfig) {
         for code in &stock_codes {
             sub_mgr.add("H0STCNT0", code).await; // 체결
             sub_mgr.add("H0STASP0", code).await; // 호가
+            sub_mgr.add("H0STMKO0", code).await; // 장운영정보
+        }
+        // 체결 통보 (HTS ID 필요, 모의투자)
+        let hts_id = std::env::var("KIS_HTS_ID").unwrap_or_default();
+        if !hts_id.is_empty() {
+            sub_mgr.add("H0STCNI9", &hts_id).await;
+            info!("체결통보 구독 등록 (HTS ID: {hts_id})");
+        } else {
+            info!("KIS_HTS_ID 미설정 — 체결통보 구독 생략 (REST fallback 사용)");
         }
 
         // 백그라운드 실행
@@ -527,9 +541,15 @@ async fn run_server(config: AppConfig) {
         db_pool: pg_store.as_ref().map(|s| s.pool().clone()),
     };
 
-    // CORS 미들웨어
+    // CORS 미들웨어 — localhost + 프론트엔드 dev 서버만 허용
+    let allowed_origins = [
+        "http://localhost:3000".parse().unwrap(),
+        "http://localhost:5173".parse().unwrap(),
+        "http://127.0.0.1:3000".parse().unwrap(),
+        "http://127.0.0.1:5173".parse().unwrap(),
+    ];
     let cors = CorsLayer::new()
-        .allow_origin(Any)
+        .allow_origin(allowed_origins)
         .allow_methods(Any)
         .allow_headers(Any);
 

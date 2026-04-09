@@ -65,6 +65,8 @@ impl SubscriptionManager {
         match sub_type {
             SubscriptionType::Execution => "H0STCNT0",
             SubscriptionType::OrderBook => "H0STASP0",
+            SubscriptionType::ExecutionNotice => "H0STCNI9", // 모의투자 (실전: H0STCNI0)
+            SubscriptionType::MarketOperation => "H0STMKO0",
         }
     }
 }

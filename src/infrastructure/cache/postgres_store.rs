@@ -1,4 +1,4 @@
-use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
+use chrono::{NaiveDate, NaiveDateTime};
 use sqlx::postgres::PgPool;
 use tracing::info;
 
@@ -145,6 +145,7 @@ impl PostgresStore {
                 tp_order_no VARCHAR(20) DEFAULT '',
                 tp_krx_orgno VARCHAR(20) DEFAULT '',
                 entry_time TIMESTAMP NOT NULL,
+                original_sl BIGINT DEFAULT 0,
                 updated_at TIMESTAMPTZ DEFAULT NOW()
             )",
         )
@@ -478,10 +479,10 @@ impl PostgresStore {
     /// 활성 포지션 저장/갱신
     pub async fn save_active_position(&self, pos: &ActivePosition) -> Result<(), KisError> {
         sqlx::query(
-            "INSERT INTO active_positions (stock_code, side, entry_price, stop_loss, take_profit, quantity, tp_order_no, tp_krx_orgno, entry_time)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            "INSERT INTO active_positions (stock_code, side, entry_price, stop_loss, take_profit, quantity, tp_order_no, tp_krx_orgno, entry_time, original_sl)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
              ON CONFLICT (stock_code) DO UPDATE
-             SET side=$2, entry_price=$3, stop_loss=$4, take_profit=$5, quantity=$6, tp_order_no=$7, tp_krx_orgno=$8, entry_time=$9, updated_at=NOW()",
+             SET side=$2, entry_price=$3, stop_loss=$4, take_profit=$5, quantity=$6, tp_order_no=$7, tp_krx_orgno=$8, entry_time=$9, original_sl=$10, updated_at=NOW()",
         )
         .bind(&pos.stock_code)
         .bind(&pos.side)
@@ -492,6 +493,7 @@ impl PostgresStore {
         .bind(&pos.tp_order_no)
         .bind(&pos.tp_krx_orgno)
         .bind(pos.entry_time)
+        .bind(pos.original_sl)
         .execute(&self.pool)
         .await
         .map_err(|e| KisError::Internal(format!("활성 포지션 저장 실패: {e}")))?;
@@ -501,7 +503,7 @@ impl PostgresStore {
     /// 활성 포지션 조회
     pub async fn get_active_position(&self, stock_code: &str) -> Result<Option<ActivePosition>, KisError> {
         let row: Option<ActivePositionRow> = sqlx::query_as(
-            "SELECT stock_code, side, entry_price, stop_loss, take_profit, quantity, tp_order_no, tp_krx_orgno, entry_time
+            "SELECT stock_code, side, entry_price, stop_loss, take_profit, quantity, tp_order_no, tp_krx_orgno, entry_time, original_sl
              FROM active_positions WHERE stock_code = $1",
         )
         .bind(stock_code)
@@ -509,16 +511,21 @@ impl PostgresStore {
         .await
         .map_err(|e| KisError::Internal(format!("활성 포지션 조회 실패: {e}")))?;
 
-        Ok(row.map(|r| ActivePosition {
-            stock_code: r.stock_code,
-            side: r.side,
-            entry_price: r.entry_price,
-            stop_loss: r.stop_loss,
-            take_profit: r.take_profit,
-            quantity: r.quantity,
-            tp_order_no: r.tp_order_no,
-            tp_krx_orgno: r.tp_krx_orgno,
-            entry_time: r.entry_time,
+        Ok(row.map(|r| {
+            // original_sl이 0이면 (기존 데이터) stop_loss를 사용
+            let orig_sl = r.original_sl.unwrap_or(0);
+            ActivePosition {
+                stock_code: r.stock_code,
+                side: r.side,
+                entry_price: r.entry_price,
+                stop_loss: r.stop_loss,
+                take_profit: r.take_profit,
+                quantity: r.quantity,
+                tp_order_no: r.tp_order_no,
+                tp_krx_orgno: r.tp_krx_orgno,
+                entry_time: r.entry_time,
+                original_sl: if orig_sl != 0 { orig_sl } else { r.stop_loss },
+            }
         }))
     }
 
@@ -551,6 +558,8 @@ pub struct ActivePosition {
     pub tp_order_no: String,
     pub tp_krx_orgno: String,
     pub entry_time: NaiveDateTime,
+    /// 원래 SL (트레일링 전 기준, risk 계산용)
+    pub original_sl: i64,
 }
 
 #[derive(sqlx::FromRow)]
@@ -564,6 +573,8 @@ struct ActivePositionRow {
     tp_order_no: String,
     tp_krx_orgno: String,
     entry_time: NaiveDateTime,
+    #[sqlx(default)]
+    original_sl: Option<i64>,
 }
 
 /// 거래 기록

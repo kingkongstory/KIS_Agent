@@ -79,10 +79,34 @@ export interface BalanceSnapshot {
   };
 }
 
+export interface ExecutionNotice {
+  type: 'ExecutionNotice';
+  order_no: string;
+  stock_code: string;
+  stock_name: string;
+  side: string; // "01"=매도, "02"=매수
+  filled_qty: number;
+  filled_price: number;
+  order_qty: number;
+  is_filled: boolean;
+  timestamp: string;
+}
+
+export interface MarketOperation {
+  type: 'MarketOperation';
+  stock_code: string;
+  is_trading_halt: boolean;
+  halt_reason: string;
+  market_operation_code: string;
+  vi_applied: string; // "0"=미적용, "1"=정적VI, "2"=동적VI, "3"=정적+동적
+}
+
 export type RealtimeMessage =
   | RealtimeExecution
   | RealtimeOrderBook
   | CandleUpdate
   | TradeNotification
   | PriceSnapshot
-  | BalanceSnapshot;
+  | BalanceSnapshot
+  | ExecutionNotice
+  | MarketOperation;

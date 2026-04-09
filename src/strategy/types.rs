@@ -32,6 +32,12 @@ pub struct Position {
     pub tp_krx_orgno: Option<String>,
     /// 현재 걸려있는 TP 지정가
     pub tp_limit_price: Option<i64>,
+    /// 1R 도달 여부 (트레일링/본전스탑 활성화 판별)
+    pub reached_1r: bool,
+    /// 유리한 방향 최고/최저가 (트레일링 SL 계산 기준)
+    pub best_price: i64,
+    /// 원래 SL (1R 이전 기준, ExitReason 판정용)
+    pub original_sl: i64,
 }
 
 /// 청산 사유

@@ -1,6 +1,8 @@
 use dashmap::DashMap;
 use std::time::{Duration, Instant};
 
+use crate::domain::ports::cache::CachePort;
+
 /// TTL 기반 메모리 캐시
 pub struct MemoryCache<V> {
     store: DashMap<String, CacheEntry<V>>,
@@ -63,6 +65,16 @@ impl<V: Clone> MemoryCache<V> {
     pub fn cleanup(&self) {
         let now = Instant::now();
         self.store.retain(|_, v| v.expires_at > now);
+    }
+}
+
+impl<V: Clone + Send + Sync> CachePort<V> for MemoryCache<V> {
+    fn get(&self, key: &str) -> Option<V> {
+        self.get(key)
+    }
+
+    fn set(&self, key: String, value: V) {
+        self.set(key, value);
     }
 }
 

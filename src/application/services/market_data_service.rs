@@ -1,31 +1,32 @@
 use std::sync::Arc;
-use std::time::Duration;
 
 use crate::application::dto::price_dto::{CandleDto, OrderBookDto, PriceDto};
 use crate::domain::error::KisError;
 use crate::domain::models::candle::Candle;
+use crate::domain::ports::cache::CachePort;
 use crate::domain::ports::market_data::{MarketDataPort, StockSearchResult};
 use crate::domain::types::{PeriodCode, StockCode};
-use crate::infrastructure::cache::memory_cache::MemoryCache;
 use crate::infrastructure::cache::sqlite_cache::SqliteCache;
 
 /// 시세 서비스 (캐시 + API fallback)
 pub struct MarketDataService {
     market_data: Arc<dyn MarketDataPort>,
-    price_cache: MemoryCache<PriceDto>,
-    orderbook_cache: MemoryCache<OrderBookDto>,
+    price_cache: Arc<dyn CachePort<PriceDto>>,
+    orderbook_cache: Arc<dyn CachePort<OrderBookDto>>,
     sqlite_cache: Option<Arc<SqliteCache>>,
 }
 
 impl MarketDataService {
     pub fn new(
         market_data: Arc<dyn MarketDataPort>,
+        price_cache: Arc<dyn CachePort<PriceDto>>,
+        orderbook_cache: Arc<dyn CachePort<OrderBookDto>>,
         sqlite_cache: Option<Arc<SqliteCache>>,
     ) -> Self {
         Self {
             market_data,
-            price_cache: MemoryCache::new(Duration::from_secs(5)),
-            orderbook_cache: MemoryCache::new(Duration::from_secs(3)),
+            price_cache,
+            orderbook_cache,
             sqlite_cache,
         }
     }

@@ -48,6 +48,8 @@ pub struct StrategyManager {
     realtime_tx: Option<broadcast::Sender<RealtimeData>>,
     db_store: Option<Arc<PostgresStore>>,
     ws_candles: Option<Arc<RwLock<std::collections::HashMap<String, Vec<CompletedCandle>>>>>,
+    /// 공유 포지션 잠금: 한 종목이 포지션 보유 중이면 다른 종목 진입 차단
+    active_position_lock: Arc<RwLock<Option<String>>>,
 }
 
 impl StrategyManager {
@@ -73,6 +75,7 @@ impl StrategyManager {
             realtime_tx: None,
             db_store: None,
             ws_candles: None,
+            active_position_lock: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -104,7 +107,7 @@ impl StrategyManager {
     /// 서버 시작 시 모든 종목 자동매매 활성화 + 잔존 포지션 복구
     pub async fn auto_start_all(&self) {
         // 잔고 조회하여 보유 종목 확인
-        let held_positions: std::collections::HashMap<String, (i64, u64)> = {
+        let _held_positions: std::collections::HashMap<String, (i64, u64)> = {
             let client_guard = self.client.read().await;
             if let Some(client) = client_guard.as_ref() {
                 match self.fetch_balance(client).await {
@@ -204,8 +207,8 @@ impl StrategyManager {
         let stock_code = StockCode::new(code).map_err(|e| e.to_string())?;
         let stop_flag = Arc::new(AtomicBool::new(false));
 
-        // 종목별 500만원 기준 수량 계산 (5:5 배분)
-        const ALLOC_PER_STOCK: i64 = 5_000_000;
+        // 전액 투입 (선착순 — 한쪽 포지션 보유 시 다른 쪽 진입 차단)
+        const ALLOC_PER_STOCK: i64 = 10_000_000;
         let quantity = {
             let query = [
                 ("FID_COND_MRKT_DIV_CODE", "J"),
@@ -223,7 +226,7 @@ impl StrategyManager {
             }
             let qty = (ALLOC_PER_STOCK / price) as u64;
             if qty == 0 {
-                return Err(format!("현재가 {}원 — 500만원으로 1주도 매수 불가", price));
+                return Err(format!("현재가 {}원 — 배정금액으로 1주도 매수 불가", price));
             }
             info!("{}: 현재가 {}원, 매수수량 {}주 (배정 {}만원)", name, price, qty, ALLOC_PER_STOCK / 10_000);
             qty
@@ -245,6 +248,7 @@ impl StrategyManager {
         if let Some(ref candles) = self.ws_candles {
             runner = runner.with_ws_candles(Arc::clone(candles));
         }
+        runner = runner.with_position_lock(Arc::clone(&self.active_position_lock));
 
         let stop_notify = runner.stop_notify();
         let runner_state = runner.state.clone();

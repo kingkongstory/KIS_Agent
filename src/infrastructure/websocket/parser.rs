@@ -1,6 +1,8 @@
 use serde::Deserialize;
 
-use crate::domain::ports::realtime::{RealtimeData, RealtimeExecution, RealtimeOrderBook};
+use crate::domain::ports::realtime::{
+    ExecutionNotice, MarketOperation, RealtimeData, RealtimeExecution, RealtimeOrderBook,
+};
 
 /// WebSocket 메시지 종류 (JSON 제어 vs 파이프 데이터)
 #[derive(Debug)]
@@ -130,11 +132,58 @@ pub fn parse_orderbook(data: &DataMessage) -> Option<RealtimeData> {
     }))
 }
 
+/// 체결 통보 (H0STCNI0/H0STCNI9) 파싱 — 복호화된 데이터 기준
+/// 필드: 고객ID[0]|계좌번호[1]|주문번호[2]|원주문번호[3]|매도매수구분[4]|
+///       정정구분[5]|주문종류[6]|주문조건[7]|종목코드[8]|체결수량[9]|
+///       체결단가[10]|체결시간[11]|거부여부[12]|체결여부[13]|접수여부[14]|
+///       지점번호[15]|주문수량[16]|계좌명[17]|...종목명[24]|주문가격[25]
+pub fn parse_execution_notice(data: &DataMessage) -> Option<RealtimeData> {
+    if data.data_parts.len() < 25 {
+        return None;
+    }
+
+    let parts = &data.data_parts;
+    let is_filled = parts.get(13).map_or(false, |v| v == "2");
+
+    Some(RealtimeData::ExecutionNotice(ExecutionNotice {
+        order_no: parts[2].clone(),
+        stock_code: parts[8].clone(),
+        stock_name: parts.get(24).cloned().unwrap_or_default().trim().to_string(),
+        side: parts[4].clone(),
+        filled_qty: parts[9].parse().unwrap_or(0),
+        filled_price: parts[10].parse().unwrap_or(0),
+        order_qty: parts[16].parse().unwrap_or(0),
+        is_filled,
+        timestamp: parts[11].clone(),
+    }))
+}
+
+/// 장운영 정보 (H0STMKO0) 파싱 — 평문
+/// 필드: 종목코드[0]|거래정지여부[1]|거래정지사유[2]|장운영구분코드[3]|
+///       예상장운영구분코드[4]|임의연장구분코드[5]|동시호가배분처리구분코드[6]|
+///       종목상태구분코드[7]|VI적용구분코드[8]|시간외단일가VI적용구분코드[9]
+pub fn parse_market_operation(data: &DataMessage) -> Option<RealtimeData> {
+    if data.data_parts.len() < 9 {
+        return None;
+    }
+
+    let parts = &data.data_parts;
+    Some(RealtimeData::MarketOperation(MarketOperation {
+        stock_code: parts[0].clone(),
+        is_trading_halt: parts[1] == "Y",
+        halt_reason: parts[2].clone(),
+        market_operation_code: parts[3].clone(),
+        vi_applied: parts[8].clone(),
+    }))
+}
+
 /// tr_id로 파이프 데이터 분기 파싱
 pub fn parse_data_message(data: &DataMessage) -> Option<RealtimeData> {
     match data.tr_id.as_str() {
         "H0STCNT0" => parse_execution(data),
         "H0STASP0" => parse_orderbook(data),
+        "H0STMKO0" => parse_market_operation(data),
+        "H0STCNI0" | "H0STCNI9" => parse_execution_notice(data), // 복호화 후 호출 시
         _ => None,
     }
 }

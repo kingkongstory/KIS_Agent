@@ -5,6 +5,7 @@ import type {
   CandleUpdate,
   PriceSnapshot,
   BalanceSnapshot,
+  MarketOperation,
 } from '../types/websocket';
 
 /** 완성된 분봉 캔들 */
@@ -33,6 +34,8 @@ interface WsState {
   balance: BalanceSnapshot | null;
   /** 잔고 갱신 트리거 (주문 체결 시 증가) */
   balanceVersion: number;
+  /** 장운영 상태 (종목코드별) */
+  marketStatus: Map<string, MarketOperation>;
 
   setConnected: (connected: boolean) => void;
   addExecution: (data: RealtimeExecution) => void;
@@ -41,6 +44,7 @@ interface WsState {
   updatePrice: (data: PriceSnapshot) => void;
   updateBalance: (data: BalanceSnapshot) => void;
   triggerBalanceRefresh: () => void;
+  updateMarketStatus: (data: MarketOperation) => void;
 }
 
 export const useWsStore = create<WsState>((set) => ({
@@ -51,6 +55,7 @@ export const useWsStore = create<WsState>((set) => ({
   candles: new Map(),
   currentCandle: new Map(),
   balance: null,
+  marketStatus: new Map(),
   balanceVersion: 0,
 
   setConnected: (connected) => set({ connected }),
@@ -133,4 +138,11 @@ export const useWsStore = create<WsState>((set) => ({
 
   triggerBalanceRefresh: () =>
     set((state) => ({ balanceVersion: state.balanceVersion + 1 })),
+
+  updateMarketStatus: (data) =>
+    set((state) => {
+      const map = new Map(state.marketStatus);
+      map.set(data.stock_code, data);
+      return { marketStatus: map };
+    }),
 }));
