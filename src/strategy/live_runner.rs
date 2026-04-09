@@ -1009,7 +1009,15 @@ impl LiveRunner {
             .execute(HttpMethod::Post, "/uapi/domestic-stock/v1/trading/order-cash", &tr_id, None, Some(&body))
             .await?;
 
+        let side_str = format!("{:?}", order_side);
         if resp.rt_cd != "0" {
+            // 주문 실패 로그
+            if let Some(ref store) = self.db_store {
+                store.save_order_log(
+                    self.stock_code.as_str(), "진입", &side_str,
+                    self.quantity as i64, entry_price, "", "실패", &resp.msg1,
+                ).await;
+            }
             return Err(KisError::classify(resp.rt_cd, resp.msg_cd, resp.msg1));
         }
 
@@ -1019,6 +1027,14 @@ impl LiveRunner {
             .unwrap_or("")
             .to_string();
         let actual_entry = self.fetch_fill_price(&order_no).await.unwrap_or(entry_price);
+
+        // 주문 성공 로그
+        if let Some(ref store) = self.db_store {
+            store.save_order_log(
+                self.stock_code.as_str(), "진입", &side_str,
+                self.quantity as i64, actual_entry, &order_no, "체결", "",
+            ).await;
+        }
 
         info!("{}: {:?} {}주 진입 완료 (이론={}, 실제={})", self.stock_name, order_side, self.quantity, entry_price, actual_entry);
         self.notify_trade("entry");
@@ -1128,6 +1144,12 @@ impl LiveRunner {
             Ok(r) => r,
             Err(e) => {
                 error!("{}: 청산 주문 네트워크 오류 — 포지션 복원: {e}", self.stock_name);
+                if let Some(ref store) = self.db_store {
+                    store.save_order_log(
+                        self.stock_code.as_str(), "청산", &format!("{:?}", order_side),
+                        pos.quantity as i64, 0, "", "네트워크오류", &e.to_string(),
+                    ).await;
+                }
                 self.state.write().await.current_position = Some(pos);
                 return Err(e);
             }
@@ -1135,6 +1157,12 @@ impl LiveRunner {
 
         if resp.rt_cd != "0" {
             error!("{}: 청산 주문 거부 — 포지션 복원: {}", self.stock_name, resp.msg1);
+            if let Some(ref store) = self.db_store {
+                store.save_order_log(
+                    self.stock_code.as_str(), "청산", &format!("{:?}", order_side),
+                    pos.quantity as i64, 0, "", "거부", &resp.msg1,
+                ).await;
+            }
             self.state.write().await.current_position = Some(pos);
             return Err(KisError::classify(resp.rt_cd, resp.msg_cd, resp.msg1));
         }
@@ -1147,6 +1175,14 @@ impl LiveRunner {
         let ws_price = self.get_current_price().await.unwrap_or(pos.entry_price);
         let exit_price = self.fetch_fill_price(&order_no).await.unwrap_or(ws_price);
         let exit_time = Local::now().time();
+
+        // 청산 성공 로그
+        if let Some(ref store) = self.db_store {
+            store.save_order_log(
+                self.stock_code.as_str(), &format!("청산({:?})", reason), &format!("{:?}", order_side),
+                pos.quantity as i64, exit_price, &order_no, "체결", "",
+            ).await;
+        }
 
         info!("{}: {:?} 청산 — {} @ {} ({:?}, WS={})", self.stock_name, pos.side, self.quantity, exit_price, reason, ws_price);
         self.notify_trade("exit");
@@ -1264,14 +1300,32 @@ impl LiveRunner {
                     .and_then(|v| v.get("KRX_FWDG_ORD_ORGNO").and_then(|o| o.as_str()))
                     .unwrap_or("").to_string();
                 info!("{}: TP 지정가 발주 완료 — {}원, 주문번호={}", self.stock_name, price, order_no);
+                if let Some(ref store) = self.db_store {
+                    store.save_order_log(
+                        self.stock_code.as_str(), "TP지정가", "Sell",
+                        quantity as i64, price, &order_no, "체결", "",
+                    ).await;
+                }
                 Some((order_no, krx_orgno))
             }
             Ok(r) => {
                 warn!("{}: TP 지정가 발주 실패 — {}", self.stock_name, r.msg1);
+                if let Some(ref store) = self.db_store {
+                    store.save_order_log(
+                        self.stock_code.as_str(), "TP지정가", "Sell",
+                        quantity as i64, price, "", "실패", &r.msg1,
+                    ).await;
+                }
                 None
             }
             Err(e) => {
                 warn!("{}: TP 지정가 발주 에러 — {e}", self.stock_name);
+                if let Some(ref store) = self.db_store {
+                    store.save_order_log(
+                        self.stock_code.as_str(), "TP지정가", "Sell",
+                        quantity as i64, price, "", "에러", &e.to_string(),
+                    ).await;
+                }
                 None
             }
         }

@@ -154,6 +154,25 @@ impl PostgresStore {
         .await
         .map_err(|e| KisError::Internal(format!("마이그레이션 실패: {e}")))?;
 
+        // 주문 이벤트 로그 (모든 주문 시도를 비동기 기록)
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS order_log (
+                id BIGSERIAL PRIMARY KEY,
+                stock_code VARCHAR(10) NOT NULL,
+                order_type VARCHAR(20) NOT NULL,
+                side VARCHAR(5) NOT NULL,
+                quantity BIGINT NOT NULL,
+                price BIGINT DEFAULT 0,
+                order_no VARCHAR(20) DEFAULT '',
+                status VARCHAR(20) NOT NULL,
+                message TEXT DEFAULT '',
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            )",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| KisError::Internal(format!("마이그레이션 실패: {e}")))?;
+
         // 인덱스
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_trades_code_date ON trades (stock_code, entry_time)")
             .execute(&self.pool)
@@ -563,6 +582,34 @@ impl PostgresStore {
             .await
             .map_err(|e| KisError::Internal(format!("활성 포지션 삭제 실패: {e}")))?;
         Ok(())
+    }
+
+    /// 주문 이벤트 로그 (비동기, 에러 무시)
+    pub async fn save_order_log(
+        &self,
+        stock_code: &str,
+        order_type: &str,
+        side: &str,
+        quantity: i64,
+        price: i64,
+        order_no: &str,
+        status: &str,
+        message: &str,
+    ) {
+        let _ = sqlx::query(
+            "INSERT INTO order_log (stock_code, order_type, side, quantity, price, order_no, status, message)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        )
+        .bind(stock_code)
+        .bind(order_type)
+        .bind(side)
+        .bind(quantity)
+        .bind(price)
+        .bind(order_no)
+        .bind(status)
+        .bind(message)
+        .execute(&self.pool)
+        .await;
     }
 
     pub fn pool(&self) -> &PgPool {
