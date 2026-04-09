@@ -6,11 +6,22 @@ import { TradeLog } from '../components/strategy/TradeLog';
 import { AccountSummary } from '../components/account/AccountSummary';
 import { useStockStore, STOCK_CODES } from '../stores/stockStore';
 import { useWsStore } from '../stores/wsStore';
+import { get } from '../api/client';
 import type { PriceData } from '../types/stock';
 
 export function DashboardPage() {
   const { setPriceData } = useStockStore();
   const prices = useWsStore((s) => s.prices);
+
+  // 마운트 시 REST로 초기 가격 로드 (WS PriceSnapshot 도착 전)
+  useEffect(() => {
+    STOCK_CODES.forEach(async (meta, i) => {
+      try {
+        const data = await get<PriceData>(`/stocks/${meta.code}/price`);
+        setPriceData(i, data);
+      } catch { /* 무시 */ }
+    });
+  }, [setPriceData]);
 
   // WebSocket PriceSnapshot → stockStore 동기화 (가격 카드에서 사용)
   useEffect(() => {

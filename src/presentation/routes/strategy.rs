@@ -30,6 +30,20 @@ pub struct StrategyStatus {
     pub message: String,
     pub or_high: Option<i64>,
     pub or_low: Option<i64>,
+    /// Multi-Stage OR 범위 [(단계, high, low)]
+    pub or_stages: Vec<(String, i64, i64)>,
+    /// 전략 파라미터 요약
+    pub params: StrategyParams,
+}
+
+/// 전략 파라미터 (웹 표시용)
+#[derive(Debug, Clone, Serialize)]
+pub struct StrategyParams {
+    pub rr_ratio: f64,
+    pub trailing_r: f64,
+    pub breakeven_r: f64,
+    pub max_daily_trades: usize,
+    pub long_only: bool,
 }
 
 /// 종목별 러너 핸들
@@ -56,6 +70,7 @@ impl StrategyManager {
     pub fn new() -> Self {
         let mut map = HashMap::new();
         for (code, name) in [("122630", "KODEX 레버리지"), ("114800", "KODEX 인버스")] {
+            let cfg = crate::strategy::orb_fvg::OrbFvgConfig::default();
             map.insert(code.to_string(), StrategyStatus {
                 code: code.to_string(),
                 name: name.to_string(),
@@ -66,6 +81,14 @@ impl StrategyManager {
                 message: "자동매매 비활성".to_string(),
                 or_high: None,
                 or_low: None,
+                or_stages: Vec::new(),
+                params: StrategyParams {
+                    rr_ratio: cfg.rr_ratio,
+                    trailing_r: cfg.trailing_r,
+                    breakeven_r: cfg.breakeven_r,
+                    max_daily_trades: cfg.max_daily_trades,
+                    long_only: cfg.long_only,
+                },
             });
         }
         Self {
@@ -310,6 +333,7 @@ impl StrategyManager {
                     status.today_pnl = rs.today_pnl;
                     status.or_high = rs.or_high;
                     status.or_low = rs.or_low;
+                    status.or_stages = rs.or_stages.clone();
                     if let Some(ref pos) = rs.current_position {
                         status.message = format!("{:?} {}주 @ {}", pos.side, pos.quantity, pos.entry_price);
                     } else {
@@ -373,11 +397,17 @@ async fn start_strategy(
         }
     }
 
+    let cfg = crate::strategy::orb_fvg::OrbFvgConfig::default();
     Json(StrategyStatus {
         code: req.code, name: String::new(), active: false,
         state: "오류".to_string(), today_trades: 0, today_pnl: 0.0,
         message: "종목 없음".to_string(),
-        or_high: None, or_low: None,
+        or_high: None, or_low: None, or_stages: Vec::new(),
+        params: StrategyParams {
+            rr_ratio: cfg.rr_ratio, trailing_r: cfg.trailing_r,
+            breakeven_r: cfg.breakeven_r, max_daily_trades: cfg.max_daily_trades,
+            long_only: cfg.long_only,
+        },
     })
 }
 
@@ -395,11 +425,17 @@ async fn stop_strategy(
         status.message = "중지 요청됨".to_string();
         Json(status.clone())
     } else {
+        let cfg = crate::strategy::orb_fvg::OrbFvgConfig::default();
         Json(StrategyStatus {
             code: req.code, name: String::new(), active: false,
             state: "오류".to_string(), today_trades: 0, today_pnl: 0.0,
             message: "종목 없음".to_string(),
-            or_high: None, or_low: None,
+            or_high: None, or_low: None, or_stages: Vec::new(),
+            params: StrategyParams {
+                rr_ratio: cfg.rr_ratio, trailing_r: cfg.trailing_r,
+                breakeven_r: cfg.breakeven_r, max_daily_trades: cfg.max_daily_trades,
+                long_only: cfg.long_only,
+            },
         })
     }
 }

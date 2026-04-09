@@ -15,7 +15,17 @@ export function AccountSummary() {
   const updateBalance = useWsStore((s) => s.updateBalance);
   const prevVersion = useRef(balanceVersion);
 
-  // 주문 체결 시 즉시 잔고 갱신 (1회성 REST fetch, 폴링 아님)
+  // 마운트 시 REST로 초기 잔고 로드
+  useEffect(() => {
+    (async () => {
+      try {
+        const data = await get<BalanceSnapshot>('/account/balance');
+        updateBalance({ ...data, type: 'BalanceSnapshot' });
+      } catch { /* 무시 */ }
+    })();
+  }, [updateBalance]);
+
+  // 주문 체결 시 즉시 잔고 갱신 (1회성 REST fetch)
   useEffect(() => {
     if (balanceVersion !== prevVersion.current) {
       prevVersion.current = balanceVersion;
@@ -23,9 +33,7 @@ export function AccountSummary() {
         try {
           const data = await get<BalanceSnapshot>('/account/balance');
           updateBalance({ ...data, type: 'BalanceSnapshot' });
-        } catch {
-          // 무시 — 다음 스케줄러 push에서 갱신됨
-        }
+        } catch { /* 무시 */ }
       }, 1000);
       return () => clearTimeout(timer);
     }
@@ -40,8 +48,7 @@ export function AccountSummary() {
   }
 
   const s = balance.summary;
-  const totalAsset = s.total_eval; // tot_evlu_amt = 예수금 + 유가평가액 (이미 합산된 값)
-  const halfAlloc = Math.floor(totalAsset / 2);
+  const totalAsset = s.total_eval;
 
   // 종목별 보유 현황
   const posMap = new Map(balance.positions.map((p) => [p.stock_code, p]));
@@ -50,9 +57,9 @@ export function AccountSummary() {
     <div className="bg-card rounded-lg border border-border p-3">
       <div className="flex items-center justify-between mb-2">
         <span className="text-xs font-semibold text-text-muted">모의투자 계좌</span>
-        <span className="text-xs text-text-muted">5:5 배분</span>
+        <span className="text-xs text-text-muted">전액 투입 (선착순)</span>
       </div>
-      <div className="grid grid-cols-4 gap-3 text-xs">
+      <div className="grid grid-cols-3 gap-3 text-xs">
         <div>
           <span className="text-text-muted">총 자산</span>
           <div className="text-sm font-bold">{formatKRW(totalAsset)}</div>
@@ -60,10 +67,6 @@ export function AccountSummary() {
         <div>
           <span className="text-text-muted">예수금</span>
           <div>{formatKRW(s.cash)}</div>
-        </div>
-        <div>
-          <span className="text-text-muted">종목별 배분</span>
-          <div>{formatKRW(halfAlloc)}</div>
         </div>
         <div>
           <span className="text-text-muted">평가 손익</span>
@@ -76,18 +79,15 @@ export function AccountSummary() {
       <div className="mt-2 pt-2 border-t border-border grid grid-cols-2 gap-2">
         {STOCKS.map(({ code, name }) => {
           const pos = posMap.get(code);
-          const invested = pos ? pos.eval_amount : 0;
-          const remaining = halfAlloc - invested;
           return (
             <div key={code} className="text-xs">
               <div className="flex items-center justify-between">
                 <span className="text-text-muted">{name}</span>
-                <span className="font-medium">{formatKRW(halfAlloc)}</span>
               </div>
               {pos ? (
                 <div className="flex items-center justify-between mt-0.5">
                   <span className="text-text-muted">
-                    {pos.quantity}주 보유
+                    {pos.quantity}주 @ {pos.avg_price.toLocaleString()}
                   </span>
                   <span className={pos.profit_loss >= 0 ? 'text-rise' : 'text-fall'}>
                     {pos.profit_loss >= 0 ? '+' : ''}{formatKRW(pos.profit_loss)}
@@ -95,9 +95,7 @@ export function AccountSummary() {
                   </span>
                 </div>
               ) : (
-                <div className="text-text-muted mt-0.5">
-                  대기 ({formatKRW(remaining)} 가용)
-                </div>
+                <div className="text-text-muted mt-0.5">대기</div>
               )}
             </div>
           );

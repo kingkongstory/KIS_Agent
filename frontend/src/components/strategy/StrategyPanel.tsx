@@ -2,6 +2,14 @@ import { useEffect, useState, useCallback } from 'react';
 import { get, post } from '../../api/client';
 import { cn } from '../../utils/cn';
 
+interface StrategyParams {
+  rr_ratio: number;
+  trailing_r: number;
+  breakeven_r: number;
+  max_daily_trades: number;
+  long_only: boolean;
+}
+
 interface StrategyStatus {
   code: string;
   name: string;
@@ -12,6 +20,8 @@ interface StrategyStatus {
   message: string;
   or_high: number | null;
   or_low: number | null;
+  or_stages: [string, number, number][];
+  params: StrategyParams;
 }
 
 export function StrategyPanel() {
@@ -97,14 +107,31 @@ export function StrategyPanel() {
               )}
             </div>
             <div className="text-xs text-text-muted mt-1">{s.message}</div>
-            {s.or_high && s.or_low && (
+            {s.or_stages && s.or_stages.length > 0 ? (
+              <div className="mt-1 flex flex-wrap gap-1">
+                {s.or_stages.map(([stage, h, l]) => (
+                  <span key={stage} className="text-xs px-1.5 py-0.5 rounded bg-accent/20 text-accent">
+                    {stage} {l.toLocaleString()}~{h.toLocaleString()}
+                  </span>
+                ))}
+              </div>
+            ) : s.or_high && s.or_low ? (
               <div className="text-xs text-text-muted mt-1">
                 OR {s.or_low.toLocaleString()} ~ {s.or_high.toLocaleString()}
               </div>
-            )}
+            ) : null}
           </div>
         ))}
       </div>
+      {statuses.length > 0 && statuses[0].params && (
+        <div className="mt-3 pt-2 border-t border-border flex flex-wrap gap-2 text-xs text-text-muted">
+          <span>RR 1:{statuses[0].params.rr_ratio}</span>
+          <span>Trail {statuses[0].params.trailing_r}R</span>
+          <span>BE {statuses[0].params.breakeven_r}R</span>
+          <span>Max {statuses[0].params.max_daily_trades}회</span>
+          <span>{statuses[0].params.long_only ? 'Long' : 'L+S'}</span>
+        </div>
+      )}
     </div>
   );
 }
