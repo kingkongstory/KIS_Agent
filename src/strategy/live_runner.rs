@@ -471,13 +471,31 @@ impl LiveRunner {
         info!("수량: {}주, RR: 1:{:.1}, 트레일링: {:.1}R, 본전: {:.1}R",
             self.quantity, cfg.rr_ratio, cfg.trailing_r, cfg.breakeven_r);
 
-        // 잔존 포지션 확인 및 복구
+        // 잔존 포지션 확인
         self.check_and_restore_position().await;
 
         // 장 시작 대기
         self.update_phase("장 시작 대기").await;
         self.wait_until(cfg.or_start).await;
         if self.is_stopped() { return Ok(Vec::new()); }
+
+        // 잔존 포지션이 있으면 장 시작 즉시 시장가 청산 (전일 잔여분 정리)
+        let has_leftover = self.state.read().await.current_position.is_some();
+        if has_leftover {
+            info!("{}: 전일 잔여 포지션 — 장 시작 시장가 청산", self.stock_name);
+            self.update_phase("잔여 포지션 청산").await;
+            // 장 시작 직후 체결 안정화 대기 (5초)
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            match self.close_position_market(ExitReason::EndOfDay).await {
+                Ok(result) => {
+                    info!("{}: 잔여 포지션 청산 완료 — {:.2}%", self.stock_name, result.pnl_pct());
+                    self.save_trade_to_db(&result).await;
+                }
+                Err(e) => {
+                    error!("{}: 잔여 포지션 청산 실패 — 수동 확인 필요: {e}", self.stock_name);
+                }
+            }
+        }
 
         // Multi-Stage OR: 5분 OR(09:05)부터 시작, 15분(09:15), 30분(09:30) 점진 추가
         let or_5m_end = NaiveTime::from_hms_opt(9, 5, 0).unwrap();
