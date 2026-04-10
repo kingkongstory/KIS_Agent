@@ -230,9 +230,9 @@ impl StrategyManager {
         let stock_code = StockCode::new(code).map_err(|e| e.to_string())?;
         let stop_flag = Arc::new(AtomicBool::new(false));
 
-        // 전액 투입 (선착순 — 한쪽 포지션 보유 시 다른 쪽 진입 차단)
-        const ALLOC_PER_STOCK: i64 = 10_000_000;
+        // 전액 투입: KIS 매수가능조회 API로 실제 주문가능수량 조회
         let quantity = {
+            // 1) 현재가 조회
             let query = [
                 ("FID_COND_MRKT_DIV_CODE", "J"),
                 ("FID_INPUT_ISCD", code),
@@ -247,11 +247,48 @@ impl StrategyManager {
             if price <= 0 {
                 return Err("현재가가 0 이하입니다".to_string());
             }
-            let qty = (ALLOC_PER_STOCK / price) as u64;
+
+            // 2) 매수가능수량 조회 (KIS API가 가용금액 기준으로 계산)
+            let price_str = price.to_string();
+            let buyable_query = [
+                ("CANO", client.account_no()),
+                ("ACNT_PRDT_CD", client.account_product_code()),
+                ("PDNO", code),
+                ("ORD_UNPR", price_str.as_str()),
+                ("ORD_DVSN", "01"),
+                ("CMA_EVLU_AMT_ICLD_YN", "N"),
+                ("OVRS_ICLD_YN", "N"),
+            ];
+            use crate::domain::models::account::BuyableInfo;
+            let buyable_resp: Result<KisResponse<BuyableInfo>, _> = client
+                .execute(HttpMethod::Get, "/uapi/domestic-stock/v1/trading/inquire-psbl-order",
+                    &TransactionId::InquireBuyable, Some(&buyable_query), None)
+                .await;
+
+            let qty = match buyable_resp {
+                Ok(r) => {
+                    match r.into_result() {
+                        Ok(info) => {
+                            let api_qty = info.ord_psbl_qty as u64;
+                            info!("{}: 현재가 {}원, 주문가능금액 {}원, 주문가능수량 {}주",
+                                name, price, info.ord_psbl_cash, api_qty);
+                            api_qty
+                        }
+                        Err(e) => {
+                            warn!("{}: 매수가능조회 파싱 실패 — 현재가 기반 fallback: {e}", name);
+                            (10_000_000 / price) as u64
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("{}: 매수가능조회 실패 — 현재가 기반 fallback: {e}", name);
+                    (10_000_000 / price) as u64
+                }
+            };
+
             if qty == 0 {
-                return Err(format!("현재가 {}원 — 배정금액으로 1주도 매수 불가", price));
+                return Err(format!("현재가 {}원 — 주문가능수량 0주", price));
             }
-            info!("{}: 현재가 {}원, 매수수량 {}주 (배정 {}만원)", name, price, qty, ALLOC_PER_STOCK / 10_000);
             qty
         };
 
