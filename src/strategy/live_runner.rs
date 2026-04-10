@@ -1071,8 +1071,16 @@ impl LiveRunner {
                     }
                 },
                 Err(e) => {
-                    warn!("{}: 매수가능조회 실패: {e}", self.stock_name);
-                    self.quantity.saturating_sub(1)
+                    warn!("{}: 매수가능조회 실패: {e} — 잔고 기반 fallback", self.stock_name);
+                    // 잔고 API로 가용현금 조회 → 수량 계산
+                    let available = self.get_available_cash().await;
+                    if available > 0 && entry_price > 0 {
+                        let qty = ((available / entry_price) - 1).max(0) as u64;
+                        info!("{}: 잔고 기반 수량 {}주 (가용 {}원)", self.stock_name, qty, available);
+                        qty
+                    } else {
+                        0
+                    }
                 }
             }
         };
@@ -1347,6 +1355,34 @@ impl LiveRunner {
         } else {
             info!("{}: 거래 DB 저장 완료 ({:?} {:.2}%)", self.stock_name, result.exit_reason, result.pnl_pct());
         }
+    }
+
+    /// 잔고 API로 가용현금 조회 (예수금 - 매입금)
+    async fn get_available_cash(&self) -> i64 {
+        let query = [
+            ("CANO", self.client.account_no()),
+            ("ACNT_PRDT_CD", self.client.account_product_code()),
+            ("AFHR_FLPR_YN", "N"), ("OFL_YN", ""), ("INQR_DVSN", "02"),
+            ("UNPR_DVSN", "01"), ("FUND_STTL_ICLD_YN", "N"),
+            ("FNCG_AMT_AUTO_RDPT_YN", "N"), ("PRCS_DVSN", "00"),
+            ("CTX_AREA_FK100", ""), ("CTX_AREA_NK100", ""),
+        ];
+        let resp: Result<KisResponse<Vec<serde_json::Value>>, _> = self.client
+            .execute(HttpMethod::Get, "/uapi/domestic-stock/v1/trading/inquire-balance",
+                &TransactionId::InquireBalance, Some(&query), None)
+            .await;
+        if let Ok(r) = resp {
+            if let Some(output2) = r.output2 {
+                if let Some(first) = output2.first() {
+                    let cash: i64 = first.get("dnca_tot_amt").and_then(|v| v.as_str())
+                        .and_then(|s| s.parse().ok()).unwrap_or(0);
+                    let purchase: i64 = first.get("pchs_amt_smtl_amt").and_then(|v| v.as_str())
+                        .and_then(|s| s.parse().ok()).unwrap_or(0);
+                    return (cash - purchase).max(0);
+                }
+            }
+        }
+        0
     }
 
     /// 잔고 API로 해당 종목 실제 보유 여부 확인
