@@ -1036,12 +1036,57 @@ impl LiveRunner {
             PositionSide::Short => OrderSide::Sell,
         };
 
+        // 주문 직전 매수가능수량 실시간 조회 (가용금액 변동 반영)
+        let actual_qty = {
+            let price_str = entry_price.to_string();
+            let buyable_query = [
+                ("CANO", self.client.account_no()),
+                ("ACNT_PRDT_CD", self.client.account_product_code()),
+                ("PDNO", self.stock_code.as_str()),
+                ("ORD_UNPR", price_str.as_str()),
+                ("ORD_DVSN", "01"),
+                ("CMA_EVLU_AMT_ICLD_YN", "N"),
+                ("OVRS_ICLD_YN", "N"),
+            ];
+            use crate::domain::models::account::BuyableInfo;
+            let resp: Result<KisResponse<BuyableInfo>, _> = self.client
+                .execute(HttpMethod::Get, "/uapi/domestic-stock/v1/trading/inquire-psbl-order",
+                    &TransactionId::InquireBuyable, Some(&buyable_query), None)
+                .await;
+            match resp {
+                Ok(r) => match r.into_result() {
+                    Ok(info) if info.ord_psbl_qty > 1 => {
+                        let qty = (info.ord_psbl_qty - 1) as u64; // 1주 여유 (슬리피지 대비)
+                        info!("{}: 주문 직전 매수가능 {}주 (API {}주 - 1, 가용 {}원)",
+                            self.stock_name, qty, info.ord_psbl_qty, info.ord_psbl_cash);
+                        qty
+                    }
+                    Ok(info) => {
+                        warn!("{}: 매수가능수량 부족 ({}주)", self.stock_name, info.ord_psbl_qty);
+                        0
+                    }
+                    Err(e) => {
+                        warn!("{}: 매수가능조회 파싱 실패: {e}", self.stock_name);
+                        0
+                    }
+                },
+                Err(e) => {
+                    warn!("{}: 매수가능조회 실패: {e}", self.stock_name);
+                    self.quantity.saturating_sub(1)
+                }
+            }
+        };
+
+        if actual_qty == 0 {
+            return Err(KisError::InsufficientBalance("매수가능수량 0주".into()));
+        }
+
         let body = serde_json::json!({
             "CANO": self.client.account_no(),
             "ACNT_PRDT_CD": self.client.account_product_code(),
             "PDNO": self.stock_code.as_str(),
             "ORD_DVSN": "01",
-            "ORD_QTY": self.quantity.to_string(),
+            "ORD_QTY": actual_qty.to_string(),
             "ORD_UNPR": "0",
         });
 
@@ -1077,11 +1122,11 @@ impl LiveRunner {
         if let Some(ref store) = self.db_store {
             store.save_order_log(
                 self.stock_code.as_str(), "진입", &side_str,
-                self.quantity as i64, actual_entry, &order_no, "체결", "",
+                actual_qty as i64, actual_entry, &order_no, "체결", "",
             ).await;
         }
 
-        info!("{}: {:?} {}주 진입 완료 (이론={}, 실제={})", self.stock_name, order_side, self.quantity, entry_price, actual_entry);
+        info!("{}: {:?} {}주 진입 완료 (이론={}, 실제={})", self.stock_name, order_side, actual_qty, entry_price, actual_entry);
         self.notify_trade("entry");
 
         // 실제 체결가 기준으로 SL/TP 재계산
@@ -1094,7 +1139,7 @@ impl LiveRunner {
 
         // TP 지정가 매도 발주 (실패 시 시장가 fallback)
         let (tp_order_no, tp_krx_orgno, tp_limit_price) =
-            if let Some((no, orgno)) = self.place_tp_limit_order(actual_tp, self.quantity).await {
+            if let Some((no, orgno)) = self.place_tp_limit_order(actual_tp, actual_qty).await {
                 (Some(no), Some(orgno), Some(actual_tp))
             } else {
                 warn!("{}: TP 지정가 발주 실패 — 시장가 fallback 모드", self.stock_name);
@@ -1108,7 +1153,7 @@ impl LiveRunner {
             stop_loss,
             take_profit: actual_tp,
             entry_time: Local::now().time(),
-            quantity: self.quantity,
+            quantity: actual_qty,
             tp_order_no,
             tp_krx_orgno,
             tp_limit_price,
