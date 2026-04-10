@@ -229,8 +229,8 @@ impl LiveRunner {
 
                 // 새 TP 지정가 발주
                 let (tp_order_no, tp_krx_orgno, tp_limit_price) =
-                    if let Some((no, orgno)) = self.place_tp_limit_order(saved.take_profit, saved.quantity as u64).await {
-                        (Some(no), Some(orgno), Some(saved.take_profit))
+                    if let Some((no, orgno, placed_price)) = self.place_tp_limit_order(saved.take_profit, saved.quantity as u64).await {
+                        (Some(no), Some(orgno), Some(placed_price))
                     } else {
                         warn!("{}: 복구 TP 지정가 발주 실패 — 시장가 fallback", self.stock_name);
                         (None, None, None)
@@ -352,8 +352,8 @@ impl LiveRunner {
 
         // TP 지정가 매도 발주
         let (tp_order_no, tp_krx_orgno, tp_limit_price) =
-            if let Some((no, orgno)) = self.place_tp_limit_order(take_profit, quantity).await {
-                (Some(no), Some(orgno), Some(take_profit))
+            if let Some((no, orgno, placed_price)) = self.place_tp_limit_order(take_profit, quantity).await {
+                (Some(no), Some(orgno), Some(placed_price))
             } else {
                 (None, None, None)
             };
@@ -1146,60 +1146,73 @@ impl LiveRunner {
         info!("{}: {:?} {}주 진입 완료 (이론={}, 실제={})", self.stock_name, order_side, actual_qty, entry_price, actual_entry);
         self.notify_trade("entry");
 
-        // 실제 체결가 기준으로 SL/TP 재계산
-        let risk = (actual_entry - stop_loss).abs();
+        // 실제 체결가 기준으로 SL/TP 재계산.
+        // R(=theoretical risk)은 (이론 entry - 이론 SL)로 유지하고, actual entry에 평행 이동.
+        // 이렇게 해야 actual_entry가 이론 entry와 다르더라도 R 비율이 그대로 보존됨.
+        let theoretical_risk = (entry_price - stop_loss).abs();
         let rr = self.strategy.config.rr_ratio;
-        let actual_tp = match side {
-            PositionSide::Long => actual_entry + (risk as f64 * rr) as i64,
-            PositionSide::Short => actual_entry - (risk as f64 * rr) as i64,
+        let (actual_sl, actual_tp) = match side {
+            PositionSide::Long => (
+                actual_entry - theoretical_risk,
+                actual_entry + (theoretical_risk as f64 * rr) as i64,
+            ),
+            PositionSide::Short => (
+                actual_entry + theoretical_risk,
+                actual_entry - (theoretical_risk as f64 * rr) as i64,
+            ),
         };
+        info!("{}: SL/TP 재계산 — actual entry {}원, R={}원, SL={}원, TP={}원",
+            self.stock_name, actual_entry, theoretical_risk, actual_sl, actual_tp);
 
         // TP 지정가 매도 발주 (실패 시 시장가 fallback)
         let (tp_order_no, tp_krx_orgno, tp_limit_price) =
-            if let Some((no, orgno)) = self.place_tp_limit_order(actual_tp, actual_qty).await {
-                (Some(no), Some(orgno), Some(actual_tp))
+            if let Some((no, orgno, placed_price)) = self.place_tp_limit_order(actual_tp, actual_qty).await {
+                (Some(no), Some(orgno), Some(placed_price))
             } else {
                 warn!("{}: TP 지정가 발주 실패 — 시장가 fallback 모드", self.stock_name);
                 (None, None, None)
             };
 
-        let mut state = self.state.write().await;
-        state.current_position = Some(Position {
-            side,
-            entry_price: actual_entry,
-            stop_loss,
-            take_profit: actual_tp,
-            entry_time: Local::now().time(),
-            quantity: actual_qty,
-            tp_order_no,
-            tp_krx_orgno,
-            tp_limit_price,
-            reached_1r: false,
-            best_price: actual_entry,
-            original_sl: stop_loss,
-        });
-        state.phase = "포지션 보유".to_string();
+        // ActivePosition을 write lock 안에서 만들어 두고 lock 해제 후 DB 저장.
+        // 같은 task에서 read+write를 동시에 잡으면 tokio RwLock에서 deadlock 발생.
+        let ap_to_save = {
+            let mut state = self.state.write().await;
+            state.current_position = Some(Position {
+                side,
+                entry_price: actual_entry,
+                stop_loss: actual_sl,
+                take_profit: actual_tp,
+                entry_time: Local::now().time(),
+                quantity: actual_qty,
+                tp_order_no: tp_order_no.clone(),
+                tp_krx_orgno: tp_krx_orgno.clone(),
+                tp_limit_price,
+                reached_1r: false,
+                best_price: actual_entry,
+                original_sl: actual_sl,
+            });
+            state.phase = "포지션 보유".to_string();
 
-        // DB에 활성 포지션 저장 (재시작 복구용)
-        if let Some(ref store) = self.db_store {
-            let state_r = self.state.read().await;
-            if let Some(ref pos) = state_r.current_position {
-                let ap = ActivePosition {
-                    stock_code: self.stock_code.as_str().to_string(),
-                    side: format!("{:?}", pos.side),
-                    entry_price: pos.entry_price,
-                    stop_loss: pos.stop_loss,
-                    take_profit: pos.take_profit,
-                    quantity: pos.quantity as i64,
-                    tp_order_no: pos.tp_order_no.clone().unwrap_or_default(),
-                    tp_krx_orgno: pos.tp_krx_orgno.clone().unwrap_or_default(),
-                    entry_time: Local::now().naive_local(),
-                    original_sl: pos.original_sl,
-                };
-                drop(state_r);
-                if let Err(e) = store.save_active_position(&ap).await {
-                    error!("{}: 활성 포지션 DB 저장 실패 — 재시작 시 복구 불가: {e}", self.stock_name);
-                }
+            self.db_store.as_ref().map(|_| ActivePosition {
+                stock_code: self.stock_code.as_str().to_string(),
+                side: format!("{:?}", side),
+                entry_price: actual_entry,
+                stop_loss: actual_sl,
+                take_profit: actual_tp,
+                quantity: actual_qty as i64,
+                tp_order_no: tp_order_no.clone().unwrap_or_default(),
+                tp_krx_orgno: tp_krx_orgno.clone().unwrap_or_default(),
+                entry_time: Local::now().naive_local(),
+                original_sl: actual_sl,
+            })
+        }; // write lock dropped here
+
+        // DB save (lock 해제 후)
+        if let (Some(store), Some(ap)) = (self.db_store.as_ref(), ap_to_save) {
+            if let Err(e) = store.save_active_position(&ap).await {
+                error!("{}: 활성 포지션 DB 저장 실패 — 재시작 시 복구 불가: {e}", self.stock_name);
+            } else {
+                info!("{}: 활성 포지션 DB 저장 완료", self.stock_name);
             }
         }
 
@@ -1438,15 +1451,18 @@ impl LiveRunner {
         }
     }
 
-    /// TP 지정가 매도 주문 발주
-    async fn place_tp_limit_order(&self, price: i64, quantity: u64) -> Option<(String, String)> {
+    /// TP 지정가 매도 주문 발주.
+    /// 가격은 KRX ETF 호가단위(2023 개편: 5,000원 미만 1원, 이상 5원)로 round.
+    /// 반환: (주문번호, KRX 거래소번호, 실제 발주된 가격)
+    async fn place_tp_limit_order(&self, price: i64, quantity: u64) -> Option<(String, String, i64)> {
+        let rounded = round_to_etf_tick(price);
         let body = serde_json::json!({
             "CANO": self.client.account_no(),
             "ACNT_PRDT_CD": self.client.account_product_code(),
             "PDNO": self.stock_code.as_str(),
             "ORD_DVSN": "00",
             "ORD_QTY": quantity.to_string(),
-            "ORD_UNPR": price.to_string(),
+            "ORD_UNPR": rounded.to_string(),
         });
 
         let resp: Result<KisResponse<serde_json::Value>, _> = self.client
@@ -1462,21 +1478,26 @@ impl LiveRunner {
                 let krx_orgno = r.output.as_ref()
                     .and_then(|v| v.get("KRX_FWDG_ORD_ORGNO").and_then(|o| o.as_str()))
                     .unwrap_or("").to_string();
-                info!("{}: TP 지정가 발주 완료 — {}원, 주문번호={}", self.stock_name, price, order_no);
+                if rounded != price {
+                    info!("{}: TP 지정가 발주 완료 — {}원(이론 {}원 호가단위 round), 주문번호={}",
+                        self.stock_name, rounded, price, order_no);
+                } else {
+                    info!("{}: TP 지정가 발주 완료 — {}원, 주문번호={}", self.stock_name, rounded, order_no);
+                }
                 if let Some(ref store) = self.db_store {
                     store.save_order_log(
                         self.stock_code.as_str(), "TP지정가", "Sell",
-                        quantity as i64, price, &order_no, "체결", "",
+                        quantity as i64, rounded, &order_no, "체결", "",
                     ).await;
                 }
-                Some((order_no, krx_orgno))
+                Some((order_no, krx_orgno, rounded))
             }
             Ok(r) => {
-                warn!("{}: TP 지정가 발주 실패 — {}", self.stock_name, r.msg1);
+                warn!("{}: TP 지정가 발주 실패 — {} (가격 {}원)", self.stock_name, r.msg1, rounded);
                 if let Some(ref store) = self.db_store {
                     store.save_order_log(
                         self.stock_code.as_str(), "TP지정가", "Sell",
-                        quantity as i64, price, "", "실패", &r.msg1,
+                        quantity as i64, rounded, "", "실패", &r.msg1,
                     ).await;
                 }
                 None
@@ -1486,7 +1507,7 @@ impl LiveRunner {
                 if let Some(ref store) = self.db_store {
                     store.save_order_log(
                         self.stock_code.as_str(), "TP지정가", "Sell",
-                        quantity as i64, price, "", "에러", &e.to_string(),
+                        quantity as i64, rounded, "", "에러", &e.to_string(),
                     ).await;
                 }
                 None
@@ -1864,5 +1885,41 @@ impl LiveRunner {
         let l = or_ticks.iter().map(|(_, p)| *p).min().unwrap();
         info!("{}: 네이버에서 OR 수집 (종가 근사) — {}틱 사용", self.stock_name, or_ticks.len());
         Some((h, l))
+    }
+}
+
+/// KRX ETF 호가단위로 round-nearest (2023년 KRX 호가단위 개편 후).
+/// - 5,000원 미만: 1원 단위 (round 불필요)
+/// - 5,000원 이상: 5원 단위
+///
+/// KODEX 인버스(1,500원대)는 1원 단위, KODEX 레버리지(91,000원대)는 5원 단위다.
+fn round_to_etf_tick(price: i64) -> i64 {
+    if price < 5_000 {
+        price
+    } else {
+        let tick = 5;
+        ((price + tick / 2) / tick) * tick
+    }
+}
+
+#[cfg(test)]
+mod tick_tests {
+    use super::round_to_etf_tick;
+
+    #[test]
+    fn test_round_to_etf_tick() {
+        // 5,000원 미만은 그대로
+        assert_eq!(round_to_etf_tick(1_524), 1_524);
+        assert_eq!(round_to_etf_tick(1_519), 1_519);
+        assert_eq!(round_to_etf_tick(4_999), 4_999);
+
+        // 5,000원 이상은 5원 단위로 round
+        assert_eq!(round_to_etf_tick(5_000), 5_000);
+        assert_eq!(round_to_etf_tick(5_002), 5_000); // 5002 → 5000
+        assert_eq!(round_to_etf_tick(5_003), 5_005); // 5003 → 5005 (반올림)
+        assert_eq!(round_to_etf_tick(92_794), 92_795); // 실제 사례
+        assert_eq!(round_to_etf_tick(92_792), 92_790);
+        assert_eq!(round_to_etf_tick(91_525), 91_525); // 이미 정렬됨
+        assert_eq!(round_to_etf_tick(92_102), 92_100); // 92102 → 92100
     }
 }
