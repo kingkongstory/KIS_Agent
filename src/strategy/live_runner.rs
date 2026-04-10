@@ -275,11 +275,16 @@ impl LiveRunner {
                 info!("{}: 포지션 복구 완료 — SL={}, TP={}", self.stock_name, saved.stop_loss, saved.take_profit);
                 return;
             }
-            Ok(None) => {} // DB에 저장된 포지션 없음 → 잔고 API로 확인
+            Ok(None) => {
+                info!("{}: DB에 활성 포지션 없음 — 깨끗한 상태", self.stock_name);
+                // 잔고 API fallback은 사용하지 않음
+                // 모의투자에서 잔고잠김 문제로 매도 불가한 잔여 보유가 있을 수 있으나 무시
+                return;
+            }
             Err(e) => warn!("{}: DB 포지션 조회 실패: {e}", self.stock_name),
         }
 
-        // DB에 없으면 잔고 API로 fallback
+        // DB 조회 실패 시에만 잔고 API로 fallback
         self.check_and_restore_from_balance().await;
     }
 
@@ -492,26 +497,20 @@ impl LiveRunner {
                     self.save_trade_to_db(&result).await;
                 }
                 Err(e) => {
-                    warn!("{}: 잔여 포지션 청산 실패: {e} — 잔고 확인 후 판단", self.stock_name);
-                    // 잔고 API로 실제 보유 확인 → 없으면 유령 포지션 폐기
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    let actually_held = self.check_balance_has_stock().await;
-                    if !actually_held {
-                        warn!("{}: 잔고에 실제 보유 없음 — 유령 포지션 폐기", self.stock_name);
-                        let mut state = self.state.write().await;
-                        state.current_position = None;
-                        state.phase = "신호 탐색".to_string();
-                        // DB 활성 포지션도 삭제
-                        if let Some(ref store) = self.db_store {
-                            let _ = store.delete_active_position(self.stock_code.as_str()).await;
-                        }
-                        // position_lock 해제
-                        if let Some(ref lock) = self.position_lock {
-                            *lock.write().await = None;
-                        }
-                    } else {
-                        error!("{}: 실제 보유 확인됨 — 다음 manage_position에서 재시도", self.stock_name);
+                    warn!("{}: 잔여 포지션 청산 실패: {e} — 포지션 강제 폐기 (모의투자 잔고잠김 가능)", self.stock_name);
+                    // 모의투자에서 잔고 있어도 매도 불가한 경우 발생
+                    // 무한 재시도 방지를 위해 포지션 강제 폐기
+                    let mut state = self.state.write().await;
+                    state.current_position = None;
+                    state.phase = "신호 탐색".to_string();
+                    if let Some(ref store) = self.db_store {
+                        let _ = store.delete_active_position(self.stock_code.as_str()).await;
                     }
+                    drop(state);
+                    if let Some(ref lock) = self.position_lock {
+                        *lock.write().await = None;
+                    }
+                    warn!("{}: 포지션 강제 폐기 완료 — 깨끗한 상태에서 시작", self.stock_name);
                 }
             }
         }
