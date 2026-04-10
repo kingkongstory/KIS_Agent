@@ -1066,8 +1066,15 @@ impl LiveRunner {
                         0
                     }
                     Err(e) => {
-                        warn!("{}: 매수가능조회 파싱 실패: {e}", self.stock_name);
-                        0
+                        warn!("{}: 매수가능조회 파싱 실패: {e} — 잔고 기반 fallback", self.stock_name);
+                        let available = self.get_available_cash().await;
+                        if available > 0 && entry_price > 0 {
+                            let qty = ((available / entry_price) - 1).max(0) as u64;
+                            info!("{}: 잔고 기반 수량 {}주 (가용 {}원)", self.stock_name, qty, available);
+                            qty
+                        } else {
+                            0
+                        }
                     }
                 },
                 Err(e) => {
