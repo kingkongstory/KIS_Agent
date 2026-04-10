@@ -65,6 +65,8 @@ pub struct TradeResult {
     pub entry_time: NaiveTime,
     pub exit_time: NaiveTime,
     pub exit_reason: ExitReason,
+    /// 거래된 실제 수량. 백테스트에서는 0(기본).
+    pub quantity: u64,
 }
 
 impl TradeResult {

@@ -485,8 +485,17 @@ impl LiveRunner {
         if self.is_stopped() { return Ok(Vec::new()); }
 
         // 잔존 포지션이 있으면 장 시작 즉시 시장가 청산 (전일 잔여분 정리)
+        // 단, "장 시작 직후"(or_start ~ or_start+5분)일 때만 동작.
+        // 장중 재시작 시(예: 13:39 핫픽스 후 재시작) 오늘 들어간 정상 포지션을
+        // 잘못 청산하지 않도록 시간 게이팅.
+        let now_time = Local::now().time();
+        let elapsed_secs_since_open = (now_time - cfg.or_start).num_seconds();
+        let is_market_open_window = elapsed_secs_since_open >= 0 && elapsed_secs_since_open <= 300;
         let has_leftover = self.state.read().await.current_position.is_some();
-        if has_leftover {
+        if has_leftover && !is_market_open_window {
+            info!("{}: 잔존 포지션 발견했지만 장 시작 직후가 아님(elapsed={}s) — 정상 운용 진행", self.stock_name, elapsed_secs_since_open);
+        }
+        if has_leftover && is_market_open_window {
             info!("{}: 전일 잔여 포지션 — 장 시작 시장가 청산", self.stock_name);
             self.update_phase("잔여 포지션 청산").await;
             // 장 시작 직후 체결 안정화 대기 (5초)
@@ -931,6 +940,7 @@ impl LiveRunner {
                             entry_time: pos.entry_time,
                             exit_time: Local::now().time(),
                             exit_reason: ExitReason::TakeProfit,
+                            quantity: pos.quantity,
                         };
                         state.current_position = None;
                         state.phase = "신호 탐색".to_string();
@@ -1302,7 +1312,7 @@ impl LiveRunner {
             ).await;
         }
 
-        info!("{}: {:?} 청산 — {} @ {} ({:?}, WS={})", self.stock_name, pos.side, self.quantity, exit_price, reason, ws_price);
+        info!("{}: {:?} 청산 — {}주 @ {} ({:?}, WS={})", self.stock_name, pos.side, pos.quantity, exit_price, reason, ws_price);
         self.notify_trade("exit");
 
         let result = TradeResult {
@@ -1314,6 +1324,7 @@ impl LiveRunner {
             entry_time: pos.entry_time,
             exit_time,
             exit_reason: reason,
+            quantity: pos.quantity,
         };
 
         {
@@ -1356,11 +1367,13 @@ impl LiveRunner {
     async fn save_trade_to_db(&self, result: &TradeResult) {
         let Some(ref store) = self.db_store else { return };
         let today = Local::now().date_naive();
+        // result.quantity가 0이면 (안전망) self.quantity로 폴백
+        let qty = if result.quantity > 0 { result.quantity } else { self.quantity };
         let record = TradeRecord {
             stock_code: self.stock_code.as_str().to_string(),
             stock_name: self.stock_name.clone(),
             side: format!("{:?}", result.side),
-            quantity: self.quantity as i64,
+            quantity: qty as i64,
             entry_price: result.entry_price,
             exit_price: result.exit_price,
             stop_loss: result.stop_loss,
