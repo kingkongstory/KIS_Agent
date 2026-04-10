@@ -15,7 +15,7 @@ use crate::domain::ports::realtime::RealtimeData;
 use crate::domain::types::{StockCode, TransactionId};
 use crate::infrastructure::cache::postgres_store::PostgresStore;
 use crate::infrastructure::kis_client::http_client::{HttpMethod, KisHttpClient, KisResponse};
-use crate::infrastructure::websocket::candle_aggregator::CompletedCandle;
+use crate::infrastructure::websocket::candle_aggregator::{CandleAggregator, CompletedCandle};
 use crate::strategy::live_runner::LiveRunner;
 
 /// 종목별 전략 실행 상태
@@ -32,6 +32,8 @@ pub struct StrategyStatus {
     pub or_low: Option<i64>,
     /// Multi-Stage OR 범위 [(단계, high, low)]
     pub or_stages: Vec<(String, i64, i64)>,
+    /// OR 백필 데이터 출처: "ws" / "yahoo" / "naver" / None (미수집)
+    pub or_source: Option<String>,
     /// 전략 파라미터 요약
     pub params: StrategyParams,
 }
@@ -62,6 +64,8 @@ pub struct StrategyManager {
     realtime_tx: Option<broadcast::Sender<RealtimeData>>,
     db_store: Option<Arc<PostgresStore>>,
     ws_candles: Option<Arc<RwLock<std::collections::HashMap<String, Vec<CompletedCandle>>>>>,
+    /// OR 백필 출처 조회 + 수동 리프레시용
+    candle_aggregator: Option<Arc<CandleAggregator>>,
     /// 공유 포지션 잠금: 한 종목이 포지션 보유 중이면 다른 종목 진입 차단
     active_position_lock: Arc<RwLock<Option<String>>>,
 }
@@ -82,6 +86,7 @@ impl StrategyManager {
                 or_high: None,
                 or_low: None,
                 or_stages: Vec::new(),
+                or_source: None,
                 params: StrategyParams {
                     rr_ratio: cfg.rr_ratio,
                     trailing_r: cfg.trailing_r,
@@ -98,6 +103,7 @@ impl StrategyManager {
             realtime_tx: None,
             db_store: None,
             ws_candles: None,
+            candle_aggregator: None,
             active_position_lock: Arc::new(RwLock::new(None)),
         }
     }
@@ -125,6 +131,10 @@ impl StrategyManager {
 
     pub fn set_ws_candles(&mut self, candles: Arc<RwLock<std::collections::HashMap<String, Vec<CompletedCandle>>>>) {
         self.ws_candles = Some(candles);
+    }
+
+    pub fn set_candle_aggregator(&mut self, agg: Arc<CandleAggregator>) {
+        self.candle_aggregator = Some(agg);
     }
 
     /// 서버 시작 시 모든 종목 자동매매 활성화 + 잔존 포지션 복구
@@ -430,10 +440,55 @@ pub struct ToggleRequest {
 
 /// GET /api/v1/strategy/status
 async fn get_status(State(state): State<AppState>) -> Json<Vec<StrategyStatus>> {
-    let mgr = state.strategy_manager.statuses.read().await;
-    let mut list: Vec<StrategyStatus> = mgr.values().cloned().collect();
+    let mut list: Vec<StrategyStatus> = {
+        let mgr = state.strategy_manager.statuses.read().await;
+        mgr.values().cloned().collect()
+    };
     list.sort_by(|a, b| b.code.cmp(&a.code));
+
+    // aggregator로부터 실효 출처 덮어쓰기
+    if let Some(ref agg) = state.strategy_manager.candle_aggregator {
+        for status in list.iter_mut() {
+            status.or_source = agg.effective_source(&status.code).await;
+        }
+    }
+
     Json(list)
+}
+
+/// POST /api/v1/strategy/refresh-or-backfill
+/// 수동 OR 백필 재수행 — Yahoo 1순위, 실패 시 네이버 fallback.
+async fn refresh_or_backfill(State(state): State<AppState>) -> Json<RefreshOrResponse> {
+    let Some(ref agg) = state.strategy_manager.candle_aggregator else {
+        return Json(RefreshOrResponse {
+            ok: false,
+            message: "CandleAggregator 미설정".to_string(),
+            sources: HashMap::new(),
+        });
+    };
+
+    let codes = ["122630", "114800"];
+    agg.backfill_or(&codes, true).await;
+
+    let mut sources = HashMap::new();
+    for code in &codes {
+        if let Some(src) = agg.effective_source(code).await {
+            sources.insert((*code).to_string(), src);
+        }
+    }
+
+    Json(RefreshOrResponse {
+        ok: true,
+        message: "백필 재수행 완료".to_string(),
+        sources,
+    })
+}
+
+#[derive(Serialize)]
+struct RefreshOrResponse {
+    ok: bool,
+    message: String,
+    sources: HashMap<String, String>,
 }
 
 /// POST /api/v1/strategy/start
@@ -470,7 +525,7 @@ async fn start_strategy(
         code: req.code, name: String::new(), active: false,
         state: "오류".to_string(), today_trades: 0, today_pnl: 0.0,
         message: "종목 없음".to_string(),
-        or_high: None, or_low: None, or_stages: Vec::new(),
+        or_high: None, or_low: None, or_stages: Vec::new(), or_source: None,
         params: StrategyParams {
             rr_ratio: cfg.rr_ratio, trailing_r: cfg.trailing_r,
             breakeven_r: cfg.breakeven_r, max_daily_trades: cfg.max_daily_trades,
@@ -498,7 +553,7 @@ async fn stop_strategy(
             code: req.code, name: String::new(), active: false,
             state: "오류".to_string(), today_trades: 0, today_pnl: 0.0,
             message: "종목 없음".to_string(),
-            or_high: None, or_low: None, or_stages: Vec::new(),
+            or_high: None, or_low: None, or_stages: Vec::new(), or_source: None,
             params: StrategyParams {
                 rr_ratio: cfg.rr_ratio, trailing_r: cfg.trailing_r,
                 breakeven_r: cfg.breakeven_r, max_daily_trades: cfg.max_daily_trades,
@@ -549,4 +604,8 @@ pub fn routes() -> Router<AppState> {
         .route("/api/v1/strategy/start", post(start_strategy))
         .route("/api/v1/strategy/stop", post(stop_strategy))
         .route("/api/v1/strategy/trades", get(get_trades))
+        .route(
+            "/api/v1/strategy/refresh-or-backfill",
+            post(refresh_or_backfill),
+        )
 }

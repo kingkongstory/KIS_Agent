@@ -8,6 +8,12 @@ use tracing::{debug, info, warn};
 
 use crate::domain::ports::realtime::{RealtimeCandleUpdate, RealtimeData, RealtimeExecution};
 use crate::infrastructure::cache::postgres_store::{MinuteCandle, PostgresStore};
+use crate::infrastructure::collector::yahoo_minute::YahooMinuteCollector;
+
+/// OR 백필 데이터의 출처 태그
+pub const SOURCE_WS: &str = "ws";
+pub const SOURCE_YAHOO: &str = "yahoo";
+pub const SOURCE_NAVER: &str = "naver";
 
 /// 집계 중인 부분 캔들
 #[derive(Debug, Clone)]
@@ -82,6 +88,8 @@ pub struct CompletedCandle {
 pub struct CandleAggregator {
     /// 완성된 캔들 히스토리 (종목별)
     completed: Arc<RwLock<HashMap<String, Vec<CompletedCandle>>>>,
+    /// 종목별 마지막 OR 백필 출처 ("ws", "yahoo", "naver")
+    backfill_source: Arc<RwLock<HashMap<String, String>>>,
     /// PostgreSQL 저장소 (실시간 분봉 영속화)
     store: Option<Arc<PostgresStore>>,
 }
@@ -90,6 +98,7 @@ impl CandleAggregator {
     pub fn new() -> Self {
         Self {
             completed: Arc::new(RwLock::new(HashMap::new())),
+            backfill_source: Arc::new(RwLock::new(HashMap::new())),
             store: None,
         }
     }
@@ -102,6 +111,54 @@ impl CandleAggregator {
     /// 특정 종목의 완성된 캔들 목록 조회
     pub fn completed_candles(&self) -> Arc<RwLock<HashMap<String, Vec<CompletedCandle>>>> {
         Arc::clone(&self.completed)
+    }
+
+    /// 종목별 OR 백필 출처 맵 참조 — 프론트 표시용
+    pub fn backfill_sources(&self) -> Arc<RwLock<HashMap<String, String>>> {
+        Arc::clone(&self.backfill_source)
+    }
+
+    /// 특정 종목의 실효 출처 반환.
+    /// 백필 맵에 기록된 값이 있으면 그 값, 없어도 OR 데이터가 있으면 "ws",
+    /// 둘 다 없으면 `None` (아직 OR 미수집).
+    pub async fn effective_source(&self, stock_code: &str) -> Option<String> {
+        {
+            let s = self.backfill_source.read().await;
+            if let Some(v) = s.get(stock_code) {
+                return Some(v.clone());
+            }
+        }
+        if self.has_or_data(&[stock_code]).await {
+            Some(SOURCE_WS.to_string())
+        } else {
+            None
+        }
+    }
+
+    /// 출처 태그 갱신 (내부/외부 모두 사용)
+    async fn mark_source(&self, stock_codes: &[&str], source: &str) {
+        let mut s = self.backfill_source.write().await;
+        for code in stock_codes {
+            s.insert((*code).to_string(), source.to_string());
+        }
+    }
+
+    /// 09:00~09:14 구간 캔들이 모든 종목에 존재하는지 확인
+    async fn has_or_data(&self, stock_codes: &[&str]) -> bool {
+        let or_start = NaiveTime::from_hms_opt(9, 0, 0).unwrap();
+        let or_end = NaiveTime::from_hms_opt(9, 15, 0).unwrap();
+        let completed = self.completed.read().await;
+        stock_codes.iter().all(|code| {
+            completed.get(*code).is_some_and(|bars| {
+                bars.iter().any(|c| {
+                    let parts: Vec<&str> = c.time.split(':').collect();
+                    let h: u32 = parts.first().and_then(|s| s.parse().ok()).unwrap_or(99);
+                    let m: u32 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+                    NaiveTime::from_hms_opt(h, m, 0)
+                        .is_some_and(|t| t >= or_start && t < or_end)
+                })
+            })
+        })
     }
 
     /// DB에서 당일 분봉을 로딩하여 completed에 주입 (장중 재시작 복구)
@@ -147,30 +204,121 @@ impl CandleAggregator {
         }
     }
 
-    /// OR 데이터(09:00~09:15)가 없으면 네이버 금융에서 당일 분봉 자동 보충
-    pub async fn backfill_from_naver(&self, stock_codes: &[&str]) {
-        let or_start = NaiveTime::from_hms_opt(9, 0, 0).unwrap();
+    /// 통합 OR 백필: Yahoo 1순위, 실패 시 네이버 fallback
+    ///
+    /// - `force=false` — OR 데이터가 이미 있으면 스킵 (서버 시작 시 자동 호출)
+    /// - `force=true`  — 기존 데이터 무시하고 무조건 Yahoo부터 재수집 (수동 리프레시)
+    pub async fn backfill_or(&self, stock_codes: &[&str], force: bool) {
+        if !force && self.has_or_data(stock_codes).await {
+            info!("OR 데이터 이미 존재 — 백필 불필요 (출처=ws)");
+            self.mark_source(stock_codes, SOURCE_WS).await;
+            return;
+        }
 
-        // OR 데이터가 이미 있는지 확인
-        {
-            let completed = self.completed.read().await;
-            let all_have_or = stock_codes.iter().all(|code| {
-                completed.get(*code).map_or(false, |bars| {
-                    bars.iter().any(|c| {
-                        let parts: Vec<&str> = c.time.split(':').collect();
-                        let h: u32 = parts.first().and_then(|s| s.parse().ok()).unwrap_or(99);
-                        let m: u32 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-                        NaiveTime::from_hms_opt(h, m, 0).map_or(false, |t| t >= or_start && t < NaiveTime::from_hms_opt(9, 15, 0).unwrap())
-                    })
-                })
-            });
-            if all_have_or {
-                info!("OR 데이터 이미 존재 — 네이버 백필 불필요");
-                return;
+        info!("OR 백필 시작 — Yahoo 1순위");
+        if self.backfill_from_yahoo(stock_codes).await {
+            info!("Yahoo OR 백필 성공");
+            return;
+        }
+
+        warn!("Yahoo OR 백필 실패 — 네이버 fallback (OHLC 정확도 손실)");
+        self.backfill_from_naver(stock_codes).await;
+    }
+
+    /// Yahoo Finance 5분봉으로 당일 OR 데이터 백필
+    ///
+    /// 성공 시 `true` 반환. 실패/빈 응답/DB 미설정 시 `false`.
+    /// 진짜 OHLC를 제공하므로 OR high/low wick이 정확히 반영됨.
+    pub async fn backfill_from_yahoo(&self, stock_codes: &[&str]) -> bool {
+        let Some(ref store) = self.store else {
+            warn!("Yahoo 백필: DB 스토어 미설정 — 스킵");
+            return false;
+        };
+
+        let collector = YahooMinuteCollector::new(Arc::clone(store));
+        let mut all_ok = true;
+
+        for code in stock_codes {
+            match collector.collect(code, "5m", "1d", 5).await {
+                Ok(n) if n > 0 => info!("{}: Yahoo 5m {}건 저장", code, n),
+                Ok(_) => {
+                    warn!("{}: Yahoo 응답 0건", code);
+                    all_ok = false;
+                }
+                Err(e) => {
+                    warn!("{}: Yahoo 수집 실패: {e}", code);
+                    all_ok = false;
+                }
             }
         }
 
-        info!("OR 데이터 부족 — 네이버 금융에서 당일 분봉 보충 시작");
+        if !all_ok {
+            return false;
+        }
+
+        // DB → completed 캐시 리로드 (5분봉). 실시간 WS 캔들이 이미 있으면 우선.
+        let today = Local::now().date_naive();
+        let start = today.and_hms_opt(9, 0, 0).unwrap();
+        let end = today.and_hms_opt(15, 30, 0).unwrap();
+
+        {
+            let mut completed = self.completed.write().await;
+            for code in stock_codes {
+                match store.get_minute_ohlcv(code, start, end, 5).await {
+                    Ok(candles) if !candles.is_empty() => {
+                        let bars: Vec<CompletedCandle> = candles
+                            .iter()
+                            .map(|c| CompletedCandle {
+                                stock_code: (*code).to_string(),
+                                time: format!(
+                                    "{:02}:{:02}",
+                                    c.datetime.time().hour(),
+                                    c.datetime.time().minute()
+                                ),
+                                open: c.open,
+                                high: c.high,
+                                low: c.low,
+                                close: c.close,
+                                volume: c.volume as u64,
+                                is_realtime: false,
+                            })
+                            .collect();
+
+                        let count = bars.len();
+                        let existing = completed.entry((*code).to_string()).or_default();
+                        for bar in bars {
+                            // 실시간(ws) 캔들이 동일 시각에 있으면 유지, 외부 백필 자리는 덮어쓰기
+                            let has_ws = existing.iter().any(|e| e.time == bar.time && e.is_realtime);
+                            if has_ws {
+                                continue;
+                            }
+                            existing.retain(|e| e.time != bar.time);
+                            existing.push(bar);
+                        }
+                        existing.sort_by(|a, b| a.time.cmp(&b.time));
+                        info!("{}: Yahoo 5m → 캐시 리로드 {}건", code, count);
+                    }
+                    Ok(_) => {
+                        warn!("{}: Yahoo 5m 캐시 리로드 0건", code);
+                        all_ok = false;
+                    }
+                    Err(e) => {
+                        warn!("{}: Yahoo 5m 캐시 리로드 실패: {e}", code);
+                        all_ok = false;
+                    }
+                }
+            }
+        }
+
+        if all_ok {
+            self.mark_source(stock_codes, SOURCE_YAHOO).await;
+        }
+        all_ok
+    }
+
+    /// 네이버 금융에서 당일 분봉 보충 (fallback 전용, 1분 close-only → OHLC 동일)
+    pub async fn backfill_from_naver(&self, stock_codes: &[&str]) {
+        info!("네이버 금융에서 당일 분봉 보충 시작 (close-only fallback)");
 
         let client = reqwest::Client::new();
         let today = Local::now().date_naive();
@@ -226,6 +374,8 @@ impl CandleAggregator {
                     }
                     existing.sort_by(|a, b| a.time.cmp(&b.time));
                     info!("{}: 네이버에서 당일 {}봉 보충 완료", code, count);
+                    drop(completed);
+                    self.mark_source(&[*code], SOURCE_NAVER).await;
                 }
                 Ok(_) => warn!("{}: 네이버 데이터 비어 있음", code),
                 Err(e) => warn!("{}: 네이버 조회 실패: {e}", code),

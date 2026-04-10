@@ -543,15 +543,18 @@ async fn run_server(config: AppConfig) {
         let aggregator = Arc::new(agg);
         // DB에서 당일 분봉 프리로딩 (장중 재시작 복구)
         aggregator.preload_from_db(&["122630", "114800"]).await;
-        // OR 데이터 없으면 네이버 금융에서 자동 보충
-        aggregator.backfill_from_naver(&["122630", "114800"]).await;
+        // OR 데이터 없으면 Yahoo 1순위 / 네이버 fallback으로 자동 보충
+        aggregator
+            .backfill_or(&["122630", "114800"], false)
+            .await;
 
         let candles = aggregator.completed_candles();
         let rx = realtime_tx.subscribe();
         Arc::clone(&aggregator).spawn(rx, realtime_tx.clone());
         info!("분봉 실시간 집계기 시작");
-        candles
+        (candles, aggregator)
     };
+    let (ws_candles, candle_aggregator) = ws_candles;
 
     // 전략 관리자 (스케줄러와 AppState 공유)
     let strategy_manager = {
@@ -559,6 +562,7 @@ async fn run_server(config: AppConfig) {
         mgr.set_client(Arc::clone(&http_client));
         mgr.set_realtime_tx(realtime_tx.clone());
         mgr.set_ws_candles(ws_candles);
+        mgr.set_candle_aggregator(Arc::clone(&candle_aggregator));
         if let Some(ref store) = pg_store {
             mgr.set_db_store(Arc::clone(store));
         }
