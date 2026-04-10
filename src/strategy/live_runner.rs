@@ -1067,10 +1067,11 @@ impl LiveRunner {
                     }
                     Err(e) => {
                         warn!("{}: 매수가능조회 파싱 실패: {e} — 잔고 기반 fallback", self.stock_name);
-                        let available = self.get_available_cash().await;
+                        let raw = self.get_available_cash().await;
+                        let available = (raw as f64 * 0.90) as i64;
                         if available > 0 && entry_price > 0 {
-                            let qty = ((available / entry_price) - 1).max(0) as u64;
-                            info!("{}: 잔고 기반 수량 {}주 (가용 {}원)", self.stock_name, qty, available);
+                            let qty = (available / entry_price) as u64;
+                            info!("{}: 잔고 기반 수량 {}주 (가용 {}원의 90%={}원)", self.stock_name, qty, raw, available);
                             qty
                         } else {
                             0
@@ -1079,11 +1080,11 @@ impl LiveRunner {
                 },
                 Err(e) => {
                     warn!("{}: 매수가능조회 실패: {e} — 잔고 기반 fallback", self.stock_name);
-                    // 잔고 API로 가용현금 조회 → 수량 계산
-                    let available = (self.get_available_cash().await as f64 * 0.90) as i64; // 90%만 사용 (수수료+여유)
+                    let raw = self.get_available_cash().await;
+                    let available = (raw as f64 * 0.90) as i64;
                     if available > 0 && entry_price > 0 {
                         let qty = (available / entry_price) as u64;
-                        info!("{}: 잔고 기반 수량 {}주 (가용 {}원의 95%)", self.stock_name, qty, available);
+                        info!("{}: 잔고 기반 수량 {}주 (가용 {}원의 90%={}원)", self.stock_name, qty, raw, available);
                         qty
                     } else {
                         0
