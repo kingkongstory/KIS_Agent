@@ -79,6 +79,20 @@ pub struct LiveRunner {
     db_store: Option<Arc<PostgresStore>>,
     /// 공유 포지션 잠금: 한 종목이 포지션 보유 시 다른 종목 진입 차단
     position_lock: Option<Arc<RwLock<Option<String>>>>,
+    /// 신호 탐색 진행 상태 (백테스트 BacktestEngine state.search_from 등가).
+    /// 청산 시각 이후의 5분봉만 탐색하도록 하여 같은 FVG 재진입을 차단한다.
+    /// 2026-04-10 사고(trade #54~58 같은 entry_price 4회 반복) 핫픽스.
+    signal_state: Arc<RwLock<LiveSignalState>>,
+}
+
+/// 라이브 신호 탐색 상태 — 청산 시각 이후의 5분봉만 탐색하도록 한다.
+/// 백테스트 `BacktestEngine::next_valid_candidate` 의 `state.search_from` 과
+/// `simulate_day_locked` 의 `sync_search_to(target=last_unlock_time)` 에 대응.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct LiveSignalState {
+    /// 이 시각보다 큰 5분봉만 탐색 (`c.time > search_after`).
+    /// None이면 제한 없이 모든 5분봉 탐색 (장 시작 직후).
+    search_after: Option<NaiveTime>,
 }
 
 impl LiveRunner {
@@ -113,6 +127,7 @@ impl LiveRunner {
             ws_candles: None,
             db_store: None,
             position_lock: None,
+            signal_state: Arc::new(RwLock::new(LiveSignalState::default())),
         }
     }
 
@@ -479,6 +494,18 @@ impl LiveRunner {
         // 잔존 포지션 확인
         self.check_and_restore_position().await;
 
+        // 재시작 회귀 방지: DB에서 오늘 trades 상태를 읽어 signal_state.search_after 복구.
+        // 핫픽스 commit 후 cargo build + restart 로 새 binary 가 시작될 때 (예: 2026-04-10 13:38:53),
+        // 메인 루프 로컬 변수(trade_count / confirmed_side) 가 0/None 으로 reset 되어
+        // 같은 5분봉의 같은 FVG 가 청산 후 다시 잡히는 것을 막기 위함.
+        let today = Local::now().date_naive();
+        if let Some(ref store) = self.db_store {
+            if let Ok(Some(t)) = store.get_last_trade_exit_today(self.stock_code.as_str(), today).await {
+                self.signal_state.write().await.search_after = Some(t);
+                info!("{}: 재시작 복구 — signal_state.search_after = {} (DB)", self.stock_name, t);
+            }
+        }
+
         // 장 시작 대기
         self.update_phase("장 시작 대기").await;
         self.wait_until(cfg.or_start).await;
@@ -534,9 +561,26 @@ impl LiveRunner {
         if self.is_stopped() { return Ok(Vec::new()); }
 
         // 메인 루프: 분봉 폴링 → 전략 평가 → 주문 실행
+        // 재시작 복구: trade_count / confirmed_side 를 DB의 오늘 거래에서 복원하여
+        // 백테스트와 라이브의 일별 상태가 항상 일치하도록 한다.
         let mut all_trades: Vec<TradeResult> = Vec::new();
-        let mut trade_count = 0;
-        let mut confirmed_side: Option<PositionSide> = None;
+        let mut trade_count: usize = if let Some(ref store) = self.db_store {
+            store.count_trades_today(self.stock_code.as_str(), today).await.unwrap_or(0) as usize
+        } else { 0 };
+        let mut confirmed_side: Option<PositionSide> = if let Some(ref store) = self.db_store {
+            match store.get_last_trade_side_pnl_today(self.stock_code.as_str(), today).await {
+                Ok(Some((side, pnl))) if pnl > 0.0 => match side.as_str() {
+                    "Long" => Some(PositionSide::Long),
+                    "Short" => Some(PositionSide::Short),
+                    _ => None,
+                },
+                _ => None,
+            }
+        } else { None };
+        if trade_count > 0 {
+            info!("{}: 재시작 복구 — trade_count={}, confirmed_side={:?} (DB)",
+                self.stock_name, trade_count, confirmed_side);
+        }
 
         self.update_phase("신호 탐색").await;
 
@@ -587,10 +631,19 @@ impl LiveRunner {
                     Ok(Some(result)) => {
                         let pnl = result.pnl_pct();
                         let side = result.side;
+                        let exit_time = result.exit_time;
                         self.save_trade_to_db(&result).await;
                         all_trades.push(result);
                         trade_count += 1;
                         self.update_pnl(&all_trades).await;
+
+                        // 백테스트 sync_search_to(last_unlock_time) 등가:
+                        // 다음 신호 탐색을 청산 시각 이후의 5분봉으로 한정.
+                        // 같은 FVG 재진입 차단 (2026-04-10 trade #54~58 사고 핫픽스).
+                        {
+                            let mut ss = self.signal_state.write().await;
+                            ss.search_after = Some(exit_time);
+                        }
 
                         let cumulative_pnl: f64 = all_trades.iter().map(|t| t.pnl_pct()).sum();
 
@@ -646,8 +699,11 @@ impl LiveRunner {
                 }
             }
 
+            // 폴링 5초: 두 종목 LiveRunner 가 거의 동시에 깨어나도록 하여
+            // 한 종목이 청산 후 즉시 재진입하면서 다른 종목이 lock 잡을 윈도우 자체가
+            // 사라지는 race 를 줄임. fetch_candles_split 은 local 메모리 조회라 부하 영향 없음.
             tokio::select! {
-                _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
+                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
                 _ = self.stop_notify.notified() => {}
             }
         }
@@ -745,12 +801,21 @@ impl LiveRunner {
         // 각 OR 단계별 FVG 탐색 → 선착순 (가장 빠른 진입 시각)
         let mut best_signal: Option<(PositionSide, i64, i64, i64, &str)> = None; // (side, entry, sl, tp, stage)
 
+        // 백테스트 sync_search_to 등가: 이전 청산 시각 이후의 캔들만 탐색.
+        // 같은 5분봉의 같은 FVG 가 청산 후 재발견되는 것을 차단한다.
+        let search_after = self.signal_state.read().await.search_after;
+
         for (stage_name, or_high, or_low, or_end) in &available_stages {
             let scan: Vec<_> = realtime_candles.iter()
                 .filter(|c| c.time >= *or_end)
                 .cloned()
                 .collect();
-            let candles_5m = candle::aggregate(&scan, 5);
+            let candles_5m_full = candle::aggregate(&scan, 5);
+            // 백테스트 BacktestEngine::next_valid_candidate 의 search_from 진행과 등가
+            let candles_5m: Vec<_> = match search_after {
+                Some(t) => candles_5m_full.into_iter().filter(|c| c.time > t).collect(),
+                None => candles_5m_full,
+            };
             if candles_5m.len() < 3 { continue; }
 
             // FVG 탐색 (백테스트 scan_and_trade 동일 로직)

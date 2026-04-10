@@ -228,6 +228,7 @@ async fn run_backtest(
     strategy_config.breakeven_r = be_r;
     strategy_config.fvg_expiry_candles = fvg_exp;
     strategy_config.min_first_pnl_for_second = min2nd;
+    strategy_config.max_daily_trades = 3; // TEMP: 일회성 백테스트 (5→3)
 
     let source_interval = 5_i16;
     let engine = BacktestEngine::with_config(store, strategy_config, source_interval);
@@ -419,11 +420,8 @@ async fn run_collect_minute(config: &AppConfig) {
     let collector = KisMinuteCollector::new(http_client, store);
 
     let stocks = [
-        "005930", // 삼성전자
-        "000660", // SK하이닉스
-        "005380", // 현대차
-        "035420", // NAVER
-        "035720", // 카카오
+        "122630", // KODEX 레버리지
+        "114800", // KODEX 인버스
     ];
 
     match collector.collect_today_batch(&stocks).await {

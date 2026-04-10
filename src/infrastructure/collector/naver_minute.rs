@@ -125,7 +125,8 @@ impl NaverMinuteCollector {
     }
 }
 
-/// 네이버 응답 파싱 → MinuteTick 목록
+/// 네이버 응답 파싱 → MinuteTick 목록.
+/// MinuteTick.datetime은 KST 시각(naive). UTC 변환은 aggregate 후 candle 생성 시점에 한다.
 fn parse_minute_ticks(raw: &str) -> Result<Vec<MinuteTick>, KisError> {
     let cleaned = raw.replace('\'', "\"");
 
@@ -143,7 +144,7 @@ fn parse_minute_ticks(raw: &str) -> Result<Vec<MinuteTick>, KisError> {
                 return None;
             }
 
-            // 날짜 파싱 (YYYYMMDDHHMM, 12자리)
+            // 날짜 파싱 (YYYYMMDDHHMM, 12자리, KST 시각)
             let dt_str = row[0].as_str()?.trim().trim_matches('"');
             if dt_str.len() != 12 {
                 return None;
@@ -151,7 +152,7 @@ fn parse_minute_ticks(raw: &str) -> Result<Vec<MinuteTick>, KisError> {
             let datetime = NaiveDateTime::parse_from_str(dt_str, "%Y%m%d%H%M").ok()?;
             let time = datetime.time();
 
-            // 장 시간 필터 (09:00 ~ 15:30)
+            // 장 시간 필터 (09:00 ~ 15:30, KST 기준)
             if time < market_open || time > market_close {
                 return None;
             }
@@ -237,11 +238,15 @@ fn aggregate_ticks_to_candles(day_ticks: &[MinuteTick], interval_min: i16) -> Ve
         let low = slot.iter().map(|t| t.close).min().unwrap();
         let volume = (last.cumulative_volume - first.cumulative_volume).max(0);
 
-        // 캔들 시작 시각 = 슬롯의 첫 번째 시각
+        // 캔들 시작 시각 = 슬롯의 첫 번째 시각 (KST)
         let slot_start_min = market_open_min + key * interval_min as u32;
         let candle_time = NaiveTime::from_hms_opt(slot_start_min / 60, slot_start_min % 60, 0)
             .unwrap_or(first.datetime.time());
-        let candle_dt = NaiveDateTime::new(first.datetime.date(), candle_time);
+        let kst_dt = NaiveDateTime::new(first.datetime.date(), candle_time);
+
+        // KST → UTC 변환 (sqlx가 NaiveDateTime을 timestamptz에 INSERT 시 UTC로 가정함).
+        // 9시간 빼야 표시 시 KST가 정확히 복원됨.
+        let candle_dt = kst_dt - chrono::Duration::hours(9);
 
         candles.push(MinuteCandle {
             datetime: candle_dt,

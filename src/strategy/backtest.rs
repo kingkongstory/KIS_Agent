@@ -8,7 +8,16 @@ use crate::infrastructure::cache::postgres_store::PostgresStore;
 
 use super::candle::MinuteCandle;
 use super::orb_fvg::OrbFvgStrategy;
-use super::types::TradeResult;
+use super::types::{PositionSide, TradeResult};
+
+/// 종목별 incremental 시뮬레이션 상태 (run_dual_locked 전용)
+#[derive(Default)]
+struct StockState {
+    search_from: usize,
+    trade_count: usize,
+    cumulative_pnl: f64,
+    confirmed_side: Option<PositionSide>,
+}
 
 /// 백테스트 보고서
 #[derive(Debug)]
@@ -93,8 +102,15 @@ impl BacktestEngine {
         self.run_impl(stock_code, days, false).await
     }
 
-    /// 두 종목 통합 백테스트: position_lock 시뮬레이션 (선착순 전액 투입)
-    /// 같은 날 두 종목 모두 신호 → 먼저 진입한 쪽만 거래, 청산 후 다른 쪽 진입 가능
+    /// 두 종목 통합 백테스트: 라이브 position_lock과 일치하는 incremental 시뮬레이션
+    ///
+    /// 동작:
+    /// 1. multi_stage=true이면 종목별로 5m/15m/30m OR 중 첫 진입한 stage를 사전 결정
+    /// 2. 결정된 stage의 strategy로 양 종목 5분봉을 incremental하게 처리
+    /// 3. 매 lap마다 양 종목에서 다음 거래 후보를 scan_and_trade로 탐색
+    /// 4. 둘 중 entry_time이 더 빠른 후보 채택, 청산 시점까지 lock
+    /// 5. 청산 후 양쪽 search 위치를 lock 해제 시각 이후로 동기화하여 다음 lap
+    /// 6. max_daily_trades / max_daily_loss_pct / confirmed_side는 종목별 독립 적용 (라이브 LiveRunner와 동일)
     pub async fn run_dual_locked(
         &self,
         code_a: &str,
@@ -102,7 +118,6 @@ impl BacktestEngine {
         days: usize,
         multi_stage: bool,
     ) -> Result<(BacktestReport, BacktestReport), KisError> {
-        // 두 종목의 날짜 교집합
         let dates_a = self.fetch_available_dates(code_a, days).await?;
         let dates_b = self.fetch_available_dates(code_b, days).await?;
         let dates_set: std::collections::HashSet<NaiveDate> = dates_b.iter().cloned().collect();
@@ -111,7 +126,7 @@ impl BacktestEngine {
             .cloned()
             .collect();
 
-        info!("통합 백테스트 (position_lock): {} + {}, {}일", code_a, code_b, common_dates.len());
+        info!("통합 백테스트 (incremental position_lock): {} + {}, {}일", code_a, code_b, common_dates.len());
 
         let stages = [
             ("5m",  NaiveTime::from_hms_opt(9, 0, 0).unwrap(), NaiveTime::from_hms_opt(9, 5, 0).unwrap()),
@@ -126,66 +141,221 @@ impl BacktestEngine {
             let candles_a = self.fetch_day_candles(code_a, *date).await?;
             let candles_b = self.fetch_day_candles(code_b, *date).await?;
 
-            // 각 종목의 Multi-Stage 결과를 먼저 계산
-            let results_a = if multi_stage {
-                self.run_day_multi_stage(&candles_a, &stages)
-            } else {
-                self.strategy.run_day(&candles_a)
-            };
-            let results_b = if multi_stage {
-                self.run_day_multi_stage(&candles_b, &stages)
-            } else {
-                self.strategy.run_day(&candles_b)
-            };
-
-            // 선착순: 첫 진입 시각 비교
-            let first_a = results_a.first().map(|r| r.entry_time);
-            let first_b = results_b.first().map(|r| r.entry_time);
-
-            match (first_a, first_b) {
-                (Some(ta), Some(tb)) => {
-                    if ta <= tb {
-                        // A가 먼저 → A 거래 실행, B는 A 청산 후 가능한 거래만
-                        let a_last_exit = results_a.last().map(|r| r.exit_time);
-                        for r in &results_a {
-                            trades_a.push((*date, r.clone()));
-                        }
-                        // B에서 A 청산 이후 거래만 포함
-                        if let Some(a_exit) = a_last_exit {
-                            for r in &results_b {
-                                if r.entry_time > a_exit {
-                                    trades_b.push((*date, r.clone()));
-                                }
-                            }
-                        }
-                    } else {
-                        // B가 먼저
-                        let b_last_exit = results_b.last().map(|r| r.exit_time);
-                        for r in &results_b {
-                            trades_b.push((*date, r.clone()));
-                        }
-                        if let Some(b_exit) = b_last_exit {
-                            for r in &results_a {
-                                if r.entry_time > b_exit {
-                                    trades_a.push((*date, r.clone()));
-                                }
-                            }
-                        }
-                    }
-                }
-                (Some(_), None) => {
-                    for r in results_a { trades_a.push((*date, r)); }
-                }
-                (None, Some(_)) => {
-                    for r in results_b { trades_b.push((*date, r)); }
-                }
-                (None, None) => {}
-            }
+            let day_pair = self.simulate_day_locked(&candles_a, &candles_b, multi_stage, &stages);
+            for r in day_pair.0 { trades_a.push((*date, r)); }
+            for r in day_pair.1 { trades_b.push((*date, r)); }
         }
 
         let report_a = Self::build_report(code_a, common_dates.len(), trades_a);
         let report_b = Self::build_report(code_b, common_dates.len(), trades_b);
         Ok((report_a, report_b))
+    }
+
+    /// 하루치 두 종목 캔들로 incremental position_lock 시뮬레이션
+    fn simulate_day_locked(
+        &self,
+        candles_a: &[MinuteCandle],
+        candles_b: &[MinuteCandle],
+        multi_stage: bool,
+        stages: &[(&str, NaiveTime, NaiveTime)],
+    ) -> (Vec<TradeResult>, Vec<TradeResult>) {
+        // 1) 종목별 strategy 결정 (multi_stage이면 가장 빠른 진입 stage)
+        let strat_a = self.pick_strategy_for_day(candles_a, multi_stage, stages);
+        let strat_b = self.pick_strategy_for_day(candles_b, multi_stage, stages);
+
+        let (strat_a, candles_5m_a, or_high_a, or_low_a) = match strat_a {
+            Some(x) => x,
+            None => {
+                // A는 진입 신호 없음 → B만 단독으로 처리
+                return (Vec::new(), strat_b
+                    .map(|(s, c, h, l)| Self::run_solo(&s, &c, h, l))
+                    .unwrap_or_default());
+            }
+        };
+        let (strat_b, candles_5m_b, or_high_b, or_low_b) = match strat_b {
+            Some(x) => x,
+            None => {
+                // B는 신호 없음 → A만 단독으로 처리
+                return (Self::run_solo(&strat_a, &candles_5m_a, or_high_a, or_low_a), Vec::new());
+            }
+        };
+
+        // 2) incremental 시뮬레이션 — lock-aware
+        let mut state_a = StockState::default();
+        let mut state_b = StockState::default();
+        let mut last_unlock_time: NaiveTime = NaiveTime::from_hms_opt(0, 0, 0).unwrap();
+        let mut results_a: Vec<TradeResult> = Vec::new();
+        let mut results_b: Vec<TradeResult> = Vec::new();
+
+        loop {
+            // 한도/종료 조건
+            let a_done = state_a.trade_count >= strat_a.config.max_daily_trades
+                || state_a.cumulative_pnl <= strat_a.config.max_daily_loss_pct;
+            let b_done = state_b.trade_count >= strat_b.config.max_daily_trades
+                || state_b.cumulative_pnl <= strat_b.config.max_daily_loss_pct;
+            if a_done && b_done { break; }
+
+            // 양쪽에서 다음 거래 후보 탐색 (lock 해제 시각 이후로 search 동기화)
+            Self::sync_search_to(&mut state_a.search_from, &candles_5m_a, last_unlock_time);
+            Self::sync_search_to(&mut state_b.search_from, &candles_5m_b, last_unlock_time);
+
+            let cand_a = if a_done { None } else {
+                Self::next_valid_candidate(&strat_a, &candles_5m_a, or_high_a, or_low_a, &mut state_a)
+            };
+            let cand_b = if b_done { None } else {
+                Self::next_valid_candidate(&strat_b, &candles_5m_b, or_high_b, or_low_b, &mut state_b)
+            };
+
+            // 둘 중 더 빠른 진입 채택
+            match (cand_a, cand_b) {
+                (Some((trade_a, exit_idx_a)), Some((trade_b, exit_idx_b))) => {
+                    if trade_a.entry_time <= trade_b.entry_time {
+                        Self::accept_trade(&trade_a, &mut state_a, exit_idx_a);
+                        last_unlock_time = trade_a.exit_time;
+                        results_a.push(trade_a);
+                    } else {
+                        Self::accept_trade(&trade_b, &mut state_b, exit_idx_b);
+                        last_unlock_time = trade_b.exit_time;
+                        results_b.push(trade_b);
+                    }
+                }
+                (Some((trade_a, exit_idx_a)), None) => {
+                    Self::accept_trade(&trade_a, &mut state_a, exit_idx_a);
+                    last_unlock_time = trade_a.exit_time;
+                    results_a.push(trade_a);
+                }
+                (None, Some((trade_b, exit_idx_b))) => {
+                    Self::accept_trade(&trade_b, &mut state_b, exit_idx_b);
+                    last_unlock_time = trade_b.exit_time;
+                    results_b.push(trade_b);
+                }
+                (None, None) => break,
+            }
+        }
+
+        (results_a, results_b)
+    }
+
+    /// 종목 단독 처리 (다른 종목이 신호 없을 때)
+    fn run_solo(
+        strat: &OrbFvgStrategy,
+        candles_5m: &[MinuteCandle],
+        or_high: i64,
+        or_low: i64,
+    ) -> Vec<TradeResult> {
+        let mut state = StockState::default();
+        let mut results = Vec::new();
+        loop {
+            if state.trade_count >= strat.config.max_daily_trades { break; }
+            if state.cumulative_pnl <= strat.config.max_daily_loss_pct { break; }
+            match Self::next_valid_candidate(strat, candles_5m, or_high, or_low, &mut state) {
+                Some((trade, exit_idx)) => {
+                    Self::accept_trade(&trade, &mut state, exit_idx);
+                    results.push(trade);
+                }
+                None => break,
+            }
+        }
+        results
+    }
+
+    /// 종목별 strategy + 사용할 5분봉 + OR 범위 결정
+    /// multi_stage=true이면 5m/15m/30m OR 중 첫 진입이 가장 빠른 stage 채택
+    fn pick_strategy_for_day(
+        &self,
+        candles: &[MinuteCandle],
+        multi_stage: bool,
+        stages: &[(&str, NaiveTime, NaiveTime)],
+    ) -> Option<(OrbFvgStrategy, Vec<MinuteCandle>, i64, i64)> {
+        if candles.is_empty() { return None; }
+
+        let prepare = |cfg: super::orb_fvg::OrbFvgConfig| -> Option<(OrbFvgStrategy, Vec<MinuteCandle>, i64, i64)> {
+            let or_candles: Vec<_> = candles.iter()
+                .filter(|c| c.time >= cfg.or_start && c.time < cfg.or_end)
+                .cloned().collect();
+            if or_candles.is_empty() { return None; }
+            let or_high = or_candles.iter().map(|c| c.high).max().unwrap();
+            let or_low = or_candles.iter().map(|c| c.low).min().unwrap();
+            let scan: Vec<_> = candles.iter().filter(|c| c.time >= cfg.or_end).cloned().collect();
+            if scan.is_empty() { return None; }
+            Some((OrbFvgStrategy { config: cfg }, scan, or_high, or_low))
+        };
+
+        if !multi_stage {
+            return prepare(self.strategy.config.clone());
+        }
+
+        // Multi-Stage: 각 stage별로 첫 진입을 dry-run으로 측정 → 가장 빠른 stage 채택
+        let mut earliest_entry = NaiveTime::from_hms_opt(23, 59, 59).unwrap();
+        let mut earliest: Option<(OrbFvgStrategy, Vec<MinuteCandle>, i64, i64)> = None;
+        for (_, or_start, or_end) in stages {
+            let mut cfg = self.strategy.config.clone();
+            cfg.or_start = *or_start;
+            cfg.or_end = *or_end;
+            let prepared = match prepare(cfg) {
+                Some(p) => p,
+                None => continue,
+            };
+            // dry-run: scan_and_trade로 첫 거래 entry_time만 측정
+            let (first_trade, _, _) = prepared.0.scan_and_trade(&prepared.1, prepared.2, prepared.3, true);
+            if let Some(t) = first_trade {
+                if t.entry_time < earliest_entry {
+                    earliest_entry = t.entry_time;
+                    earliest = Some(prepared);
+                }
+            }
+        }
+        earliest
+    }
+
+    /// search_from 인덱스를 target 시각 이후 첫 캔들 위치로 동기화
+    fn sync_search_to(search_from: &mut usize, candles: &[MinuteCandle], target: NaiveTime) {
+        let new_pos = candles.iter().position(|c| c.time > target).unwrap_or(candles.len());
+        if new_pos > *search_from {
+            *search_from = new_pos;
+        }
+    }
+
+    /// 종목 state로 다음 유효 거래 후보 탐색 (confirmed_side / search_from 진행 처리)
+    /// 반환: (TradeResult, search_from에 더할 진행 인덱스)
+    fn next_valid_candidate(
+        strat: &OrbFvgStrategy,
+        candles_5m: &[MinuteCandle],
+        or_high: i64,
+        or_low: i64,
+        state: &mut StockState,
+    ) -> Option<(TradeResult, usize)> {
+        loop {
+            if state.search_from >= candles_5m.len() { return None; }
+            let scan_slice = &candles_5m[state.search_from..];
+            let require_or = state.trade_count == 0;
+            let (trade_result, exit_idx_rel, _) =
+                strat.scan_and_trade(scan_slice, or_high, or_low, require_or);
+
+            match trade_result {
+                Some(trade) => {
+                    // 방향 일치 체크 (1차 이후)
+                    if let Some(cs) = state.confirmed_side {
+                        if trade.side != cs {
+                            // 거부 → 다음 신호 탐색
+                            state.search_from += exit_idx_rel.max(1);
+                            continue;
+                        }
+                    }
+                    return Some((trade, exit_idx_rel));
+                }
+                None => return None,
+            }
+        }
+    }
+
+    /// 채택된 거래로 state 업데이트
+    fn accept_trade(trade: &TradeResult, state: &mut StockState, exit_idx_rel: usize) {
+        let pnl = trade.pnl_pct();
+        state.trade_count += 1;
+        state.cumulative_pnl += pnl;
+        state.confirmed_side = if pnl > 0.0 { Some(trade.side) } else { None };
+        state.search_from += exit_idx_rel;
     }
 
     /// 단일 날짜 Multi-Stage 실행 (선착순)

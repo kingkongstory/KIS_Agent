@@ -93,6 +93,7 @@ Rust 워크스페이스로 구성된 웹 애플리케이션이며, 아래 계층
 - 환경(실전/모의투자)은 명시적으로 관리 — `tr_id` 코드가 환경에 따라 변경됨
 - 토큰 생명주기(24시간 만료, 분당 1회 제한)에 대응하는 중앙 토큰 관리자와 자동 갱신 필수
 - WebSocket 재연결 로직 필수 — KIS 연결은 "No close frame received" 오류로 끊어질 수 있음
+- **DB 세션 timezone 강제 KST** — `PostgresStore::new`는 `PgPoolOptions::after_connect`로 모든 sqlx 연결에 `SET TIME ZONE 'Asia/Seoul'`을 실행한다. `minute_ohlcv.datetime`이 `timestamptz`라 NaiveDateTime ↔ timestamptz cast가 세션 TZ를 따르며, KST가 아니면 백테스트의 09:00~15:30 조회가 0건이 된다 (2026-04-10 사고 분석: [docs/monitoring/2026-04-10.md](docs/monitoring/2026-04-10.md))
 
 ## 자동매매 시스템
 
@@ -150,3 +151,32 @@ Rust 워크스페이스로 구성된 웹 애플리케이션이며, 아래 계층
 - 진입 마감: 15:20, 강제 청산: 15:25
 - 트레일링: 0.5R, 본전스탑: 1.0R
 - 일일 최대 손실: -1.5% (거래 횟수 제한 없음)
+
+### 일일 운영 절차
+
+매 거래일 장 마감 후 (15:30 이후) Yahoo에서 **당일 5분봉만 받아 DB에 추가**한다. `range=1d`라 73 캔들/종목만 호출되며, UPSERT로 안전. **DB는 매일 1일치씩 영구 누적**되며 60일 윈도우 슬라이딩이 아니다 → 시작일 이전 과거를 잃지 않는다.
+
+```bash
+# 1. 백테스트용 5분봉 당일 추가 — Yahoo Finance range=1d (당일 73캔들/종목)
+./target/release/kis_agent.exe collect-yahoo --codes "122630,114800" --interval 5m --range 1d
+
+# 2. 당일 결과 재현 백테스트 (라이브와 동일한 Multi-Stage + dual_locked 모드)
+./target/release/kis_agent.exe backtest 122630 --days 1 --rr 2.5 --multi-stage --dual-locked
+
+# 3. 누적 백테스트 (DB가 보유한 전체 일자 = 시간이 지날수록 길어짐)
+./target/release/kis_agent.exe backtest 122630 --days 365 --rr 2.5 --multi-stage --dual-locked
+```
+
+**자동화 (Windows Task Scheduler 권장)**:
+```cmd
+schtasks /Create /SC WEEKLY /D MON,TUE,WED,THU,FRI /TN "KIS_Yahoo_Daily" /TR "C:\workspace_google\KIS_Agent\target\release\kis_agent.exe collect-yahoo --codes 122630,114800 --interval 5m --range 1d" /ST 15:35
+```
+평일 15:35에 자동 실행. 거래일 휴장 체크는 yahoo가 빈 응답으로 처리하므로 별도 로직 불필요.
+
+**최초 적재**: 빈 DB라면 한 번만 `--range 60d`로 60 영업일치 적재 후, 다음 날부터 `--range 1d` 일일 호출로 전환. 현재 DB에는 이미 2026-01-13 이후 60일치가 있음.
+
+**데이터 소스 결정 (2026-04-10)**: 백테스트 5분봉은 **Yahoo Finance**를 사용한다. 네이버 분봉(`collect-minute-naver`)은 1분 종가만 제공하여 5분봉 OHLC를 만들면 1분 wick을 못 잡고 가짜 신호가 발생한다. Yahoo는 진짜 OHLC + KST timezone(`exchangeTz=Asia/Seoul`)을 제공하며 라이브 모니터링 OR과 일치한다 (114800 완전 일치, 122630은 5~15원 더 정확).
+
+**Yahoo 5분봉의 한계**: 단일 호출 최대 `range=60d` (90d/6mo/1y는 yahoo가 명시 거부, max는 일봉 fall-back). 즉 시간 여행 불가. 매일 1d 호출로 누적해야 60일 윈도우 이전 일자도 영구 보존된다.
+
+**1분봉은 사용하지 않는다.** Yahoo 1분봉도 받을 수 있으나 (`interval=1m`) range가 8일 한계이고, 백테스트 엔진의 `source_interval = 5_i16`이 5분봉 전용이라 백테스트에 미사용. 라이브는 WebSocket 실시간 적재로 충분.

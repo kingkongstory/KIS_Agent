@@ -161,24 +161,79 @@ cargo run -- backtest 114800 --days 60
 # 백테스트 파라미터 커스터마이징
 cargo run -- backtest 122630 --days 60 --trail 0.1 --be-r 0.3 --tstop 3 --fvg-exp 6 --min2nd 0.0
 
+# 라이브 운영과 동일한 모드 (Multi-Stage + dual_locked)
+cargo run -- backtest 122630 --days 1 --rr 2.5 --multi-stage --dual-locked
+
 # 실시간 모의투자
 cargo run -- trade 122630 --qty 1 --rr 2.0
 
-# Yahoo Finance 5분봉 수집 (최대 60일)
+# Yahoo Finance 5분봉 수집 (60d = 약 59 영업일치, 매일 실행)
 cargo run -- collect-yahoo --codes "122630,114800" --interval 5m --range 60d
-
-# KIS API 당일 분봉 수집 (매일 실행 권장)
-cargo run -- collect-minute
 ```
 
 ## 데이터 소스
 
 | 소스 | 용도 | 범위 | 비고 |
 |------|------|------|------|
-| Yahoo Finance | 백테스트 5분봉 | 최대 60일 | 무료, 월요일 09:00 volume=0 이슈 |
-| KIS API | 당일 1분봉 | 당일만 | 실시간 매매 + 매일 수집 |
-| 네이버 금융 | 1분봉 종가 | ~6일 | OHLC 없음, 참고용 |
-| PostgreSQL | 수집 데이터 저장 | 누적 | minute_ohlcv 테이블 |
+| **Yahoo Finance** | **백테스트 5분봉 (메인)** | **60d (~59 영업일)** | **진짜 OHLC, KST timezone 정확. 60d가 yahoo 절대 천장 (90d/6mo/1y 거부). 매일 60d 호출로 누적** |
+| 네이버 금융 일봉 | 일봉 OHLCV / KOSPI·KOSDAQ 지수 | 수 년치 | 일봉만 사용. 분봉은 close-only라 미사용 |
+| KIS WebSocket | 실시간 시세 (라이브 운영) | 라이브 | 매매 엔진용 |
+| LS증권 Open API | 1년치 정밀 분봉 (예비) | 1년 | 계좌/키 미발급 상태 |
+| PostgreSQL | 수집 데이터 저장 | 누적 | `minute_ohlcv` 테이블 (5분봉만 사용) |
+
+## 일일 운영 절차
+
+매 거래일 장 마감 후 **당일 5분봉만** Yahoo에서 받아 DB에 추가한다 (`range=1d` → 73 캔들/종목). UPSERT라 안전, **DB는 매일 1일치씩 영구 누적**되며 60일 윈도우 슬라이딩이 아니다.
+
+```bash
+# 1. 장 마감 후 (15:30 이후) — Yahoo 5분봉 당일 추가
+./target/release/kis_agent.exe collect-yahoo --codes "122630,114800" --interval 5m --range 1d
+
+# 2. 당일 결과 재현 백테스트 (라이브와 동일한 Multi-Stage + dual_locked 모드)
+./target/release/kis_agent.exe backtest 122630 --days 1 --rr 2.5 --multi-stage --dual-locked
+
+# 3. 누적 백테스트 (DB가 보유한 모든 일자, 시간이 지날수록 길어짐)
+./target/release/kis_agent.exe backtest 122630 --days 365 --rr 2.5 --multi-stage --dual-locked
+```
+
+### 자동화 (Windows Task Scheduler)
+
+평일 15:35에 자동 실행하도록 등록:
+
+```cmd
+schtasks /Create /SC WEEKLY /D MON,TUE,WED,THU,FRI ^
+  /TN "KIS_Yahoo_Daily" ^
+  /TR "C:\workspace_google\KIS_Agent\target\release\kis_agent.exe collect-yahoo --codes 122630,114800 --interval 5m --range 1d" ^
+  /ST 15:35
+```
+
+확인/삭제:
+```cmd
+schtasks /Query /TN "KIS_Yahoo_Daily"
+schtasks /Delete /TN "KIS_Yahoo_Daily" /F
+```
+
+휴장일에는 yahoo가 빈 응답을 주므로 별도 휴장 체크 로직 불필요.
+
+### 최초 적재 (한 번만)
+
+빈 DB부터 시작할 때 60일치 한 번에 받아 베이스 라인 만든 뒤 다음 날부터 일일 1d 호출로 전환:
+
+```bash
+./target/release/kis_agent.exe collect-yahoo --codes "122630,114800" --interval 5m --range 60d
+```
+
+현재 DB에는 이미 2026-01-13 이후 60일치(122630/114800 각 4239건)가 있음.
+
+### 데이터 소스 결정 근거 (2026-04-10)
+
+네이버 분봉(`collect-minute-naver`)은 1분 종가만 제공하여 5분봉 OHLC를 만들면 H/L이 1분 close에서만 결정된다. 1분 내 wick(특히 09:00 동시호가)을 못 잡아 OR 범위가 좁아지고 가짜 진입 신호가 발생한다. 04-10 검증: 네이버 데이터로 5건 백테스트 → Yahoo로 1건. 차이 4건은 모두 가짜 wick이 만든 가짜 신호.
+
+Yahoo Finance는 진짜 OHLC + 거래량을 제공하며 `exchangeTz=Asia/Seoul, gmtoffset=32400` 명시. 라이브 모니터링 보고서의 OR과 비교 시 114800은 완전 일치, 122630은 Yahoo가 5~15원 더 넓음 (라이브가 잡지 못한 미세 wick까지 포함된 정확한 ground truth).
+
+**Yahoo 5분봉의 한계**: 단일 호출 최대 `range=60d` (90d/6mo/1y는 yahoo가 명시 거부, `max`는 일봉 fall-back). 즉 과거로 시간 여행 불가. 매일 1d 호출로 누적해야 시간이 지남에 따라 백테스트 가능 기간이 길어진다. 향후 1년치 일괄 적재가 필요하면 LS증권 Open API(계좌 미발급 상태)가 옵션이다.
+
+> **timezone 주의**: `PostgresStore::new`는 모든 sqlx 연결에 `SET TIME ZONE 'Asia/Seoul'`을 강제한다 (2026-04-10 추가). 이게 빠지면 KST 시각으로 저장된 `timestamptz` 데이터를 NaiveDateTime으로 조회할 때 0건이 반환된다. 사고 분석은 [docs/monitoring/2026-04-10.md](../monitoring/2026-04-10.md) 참조.
 
 ## 주요 발견 사항
 

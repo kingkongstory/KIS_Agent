@@ -68,7 +68,8 @@ impl KisMinuteCollector {
     ) -> Result<usize, KisError> {
         let mut all_items = Vec::new();
         let mut fid_input_hour = "153000".to_string(); // 장 마감부터 역순 조회
-        let max_pages = 10;
+        // 09:00~15:30 = 390분, 페이지당 30개 → 13페이지 + 여유 1
+        let max_pages = 14;
 
         for page in 0..max_pages {
             let query = [

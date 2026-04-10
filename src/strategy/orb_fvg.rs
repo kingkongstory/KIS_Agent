@@ -189,7 +189,7 @@ impl OrbFvgStrategy {
     ///
     /// `require_or_breakout`: true면 OR 돌파+FVG 동시 감지, false면 FVG만
     /// 반환: (거래 결과, 청산 시점 캔들 인덱스, 확인된 방향)
-    fn scan_and_trade(
+    pub(crate) fn scan_and_trade(
         &self,
         candles_5m: &[MinuteCandle],
         or_high: i64,

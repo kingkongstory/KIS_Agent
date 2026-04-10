@@ -1,5 +1,5 @@
-use chrono::{NaiveDate, NaiveDateTime};
-use sqlx::postgres::PgPool;
+use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
+use sqlx::postgres::{PgPool, PgPoolOptions};
 use tracing::info;
 
 use crate::domain::error::KisError;
@@ -12,7 +12,19 @@ pub struct PostgresStore {
 
 impl PostgresStore {
     pub async fn new(database_url: &str) -> Result<Self, KisError> {
-        let pool = PgPool::connect(database_url)
+        // 모든 새 연결에 KST 세션 timezone 강제.
+        // sqlx가 NaiveDateTime을 timestamp(naive)로 인코딩 → timestamptz와 비교 시 세션 TZ 사용.
+        // 한국 시각 데이터를 다루므로 명시적으로 Asia/Seoul로 고정해야 함.
+        let pool = PgPoolOptions::new()
+            .after_connect(|conn, _meta| {
+                Box::pin(async move {
+                    sqlx::query("SET TIME ZONE 'Asia/Seoul'")
+                        .execute(conn)
+                        .await?;
+                    Ok(())
+                })
+            })
+            .connect(database_url)
             .await
             .map_err(|e| KisError::Internal(format!("PostgreSQL 연결 실패: {e}")))?;
 
@@ -459,6 +471,72 @@ impl PostgresStore {
         .await
         .map_err(|e| KisError::Internal(format!("거래 저장 실패: {e}")))?;
         Ok(())
+    }
+
+    // ── 거래 기록: 재시작 복구용 헬퍼 ──
+    //
+    // 라이브 운영 중 핫픽스로 재시작 시 LiveRunner의 trade_count / confirmed_side /
+    // signal_state.search_after 가 0/None 으로 reset 되는 회귀를 막기 위한 헬퍼.
+    // 백테스트 BacktestEngine 의 search_from / cumulative state 와 동일한 메커니즘
+    // 을 라이브에서 영속화하여, 같은 5분봉의 같은 FVG 가 청산 후 재진입되는 사고
+    // (2026-04-10 trade #54~58) 의 재발을 차단한다.
+
+    /// 오늘 마지막 거래의 청산 시각 (NaiveTime). 없으면 None.
+    /// LiveSignalState.search_after 복구용.
+    pub async fn get_last_trade_exit_today(
+        &self,
+        stock_code: &str,
+        date: NaiveDate,
+    ) -> Result<Option<NaiveTime>, KisError> {
+        let row: Option<(NaiveDateTime,)> = sqlx::query_as(
+            "SELECT MAX(exit_time) FROM trades
+             WHERE stock_code = $1 AND exit_time::date = $2",
+        )
+        .bind(stock_code)
+        .bind(date)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| KisError::Internal(format!("오늘 마지막 청산 조회 실패: {e}")))?;
+
+        Ok(row.map(|(dt,)| dt.time()))
+    }
+
+    /// 오늘 거래 건수. 재시작 후 trade_count 복구용.
+    pub async fn count_trades_today(
+        &self,
+        stock_code: &str,
+        date: NaiveDate,
+    ) -> Result<i64, KisError> {
+        let row: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM trades
+             WHERE stock_code = $1 AND entry_time::date = $2",
+        )
+        .bind(stock_code)
+        .bind(date)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| KisError::Internal(format!("오늘 거래 건수 조회 실패: {e}")))?;
+        Ok(row.0)
+    }
+
+    /// 오늘 마지막 거래의 (side, pnl_pct). confirmed_side 복구용.
+    /// 수익이면 같은 방향만 다음 진입 허용 (백테스트 OrbFvgStrategy::run_day 와 동일).
+    pub async fn get_last_trade_side_pnl_today(
+        &self,
+        stock_code: &str,
+        date: NaiveDate,
+    ) -> Result<Option<(String, f64)>, KisError> {
+        let row: Option<(String, f64)> = sqlx::query_as(
+            "SELECT side, pnl_pct FROM trades
+             WHERE stock_code = $1 AND entry_time::date = $2
+             ORDER BY entry_time DESC LIMIT 1",
+        )
+        .bind(stock_code)
+        .bind(date)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| KisError::Internal(format!("오늘 마지막 거래 조회 실패: {e}")))?;
+        Ok(row)
     }
 
     // ── 일별 OR 범위 ──
