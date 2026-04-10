@@ -1364,7 +1364,7 @@ impl LiveRunner {
         }
     }
 
-    /// 잔고 API로 가용현금 조회 (예수금 - 매입금)
+    /// 잔고 API로 실제 주문가능금액 조회 (총평가 - 매입금)
     async fn get_available_cash(&self) -> i64 {
         let query = [
             ("CANO", self.client.account_no()),
@@ -1381,11 +1381,14 @@ impl LiveRunner {
         if let Ok(r) = resp {
             if let Some(output2) = r.output2 {
                 if let Some(first) = output2.first() {
-                    let cash: i64 = first.get("dnca_tot_amt").and_then(|v| v.as_str())
+                    // tot_evlu_amt(총평가) 사용 — 실제 주문가능금액에 가장 근접
+                    let total_eval: i64 = first.get("tot_evlu_amt").and_then(|v| v.as_str())
                         .and_then(|s| s.parse().ok()).unwrap_or(0);
                     let purchase: i64 = first.get("pchs_amt_smtl_amt").and_then(|v| v.as_str())
                         .and_then(|s| s.parse().ok()).unwrap_or(0);
-                    return (cash - purchase).max(0);
+                    let available = (total_eval - purchase).max(0);
+                    info!("{}: 가용현금 = 총평가 {} - 매입금 {} = {}", self.stock_name, total_eval, purchase, available);
+                    return available;
                 }
             }
         }
