@@ -171,6 +171,42 @@ impl StrategyManager {
         }
     }
 
+    /// 가용 현금 조회 (예수금 - 매입금)
+    async fn get_available_cash(&self, client: &KisHttpClient) -> i64 {
+        let query = [
+            ("CANO", client.account_no()),
+            ("ACNT_PRDT_CD", client.account_product_code()),
+            ("AFHR_FLPR_YN", "N"), ("OFL_YN", ""), ("INQR_DVSN", "02"),
+            ("UNPR_DVSN", "01"), ("FUND_STTL_ICLD_YN", "N"),
+            ("FNCG_AMT_AUTO_RDPT_YN", "N"), ("PRCS_DVSN", "00"),
+            ("CTX_AREA_FK100", ""), ("CTX_AREA_NK100", ""),
+        ];
+        let resp: Result<KisResponse<Vec<serde_json::Value>>, _> = client
+            .execute(HttpMethod::Get, "/uapi/domestic-stock/v1/trading/inquire-balance",
+                &TransactionId::InquireBalance, Some(&query), None)
+            .await;
+        if let Ok(r) = resp {
+            // output2에서 예수금 추출
+            if let Some(output2) = r.output2 {
+                if let Some(first) = output2.first() {
+                    let cash: i64 = first.get("dnca_tot_amt")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0);
+                    let purchase: i64 = first.get("pchs_amt_smtl_amt")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0);
+                    let available = (cash - purchase).max(0);
+                    info!("가용 현금: 예수금 {} - 매입금 {} = {}", cash, purchase, available);
+                    return available;
+                }
+            }
+        }
+        warn!("가용 현금 조회 실패 — 500만원 기본값 사용");
+        5_000_000 // 최소 안전값
+    }
+
     /// 잔고 조회 → 보유 종목별 (평균가, 수량) 반환
     async fn fetch_balance(&self, client: &KisHttpClient) -> Result<std::collections::HashMap<String, (i64, u64)>, String> {
         let query = [
@@ -275,14 +311,14 @@ impl StrategyManager {
                             api_qty
                         }
                         Err(e) => {
-                            warn!("{}: 매수가능조회 파싱 실패 — 현재가 기반 fallback: {e}", name);
-                            (10_000_000 / price) as u64
+                            warn!("{}: 매수가능조회 파싱 실패 — 잔고 기반 fallback: {e}", name);
+                            (self.get_available_cash(&client).await / price) as u64
                         }
                     }
                 }
                 Err(e) => {
-                    warn!("{}: 매수가능조회 실패 — 현재가 기반 fallback: {e}", name);
-                    (10_000_000 / price) as u64
+                    warn!("{}: 매수가능조회 실패 — 잔고 기반 fallback: {e}", name);
+                    (self.get_available_cash(&client).await / price) as u64
                 }
             };
 
