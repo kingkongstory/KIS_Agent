@@ -72,24 +72,68 @@ pub struct AccountSummary {
     pub pchs_amt_smtl_amt: i64,
 }
 
-/// 매수 가능 정보
+/// 매수 가능 정보 (KIS inquire-psbl-order 응답)
+///
+/// 종목증거금율이 반영된 정확한 가능수량은 `nrcvb_buy_qty` (미수 사용 X) 또는
+/// `max_buy_qty` (미수 사용 O)에서 확인. KIS 응답에는 `ord_psbl_qty` 필드가
+/// 존재하지 않으므로 사용 금지.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuyableInfo {
     /// 주문가능현금
-    #[serde(deserialize_with = "string_to_i64::deserialize", serialize_with = "string_to_i64::serialize")]
+    #[serde(
+        default,
+        deserialize_with = "string_to_i64::deserialize",
+        serialize_with = "string_to_i64::serialize"
+    )]
     pub ord_psbl_cash: i64,
 
-    /// 주문가능수량
-    #[serde(deserialize_with = "string_to_i64::deserialize", serialize_with = "string_to_i64::serialize")]
-    pub ord_psbl_qty: i64,
-
-    /// 미수불가매수금액
+    /// 미수없는매수금액 (미수 사용 X)
     #[serde(
         default,
         deserialize_with = "string_to_i64::deserialize",
         serialize_with = "string_to_i64::serialize"
     )]
     pub nrcvb_buy_amt: i64,
+
+    /// 미수없는매수수량 (미수 사용 X — 종목증거금율 반영)
+    #[serde(
+        default,
+        deserialize_with = "string_to_i64::deserialize",
+        serialize_with = "string_to_i64::serialize"
+    )]
+    pub nrcvb_buy_qty: i64,
+
+    /// 최대매수금액 (미수 사용 O)
+    #[serde(
+        default,
+        deserialize_with = "string_to_i64::deserialize",
+        serialize_with = "string_to_i64::serialize"
+    )]
+    pub max_buy_amt: i64,
+
+    /// 최대매수수량 (미수 사용 O)
+    #[serde(
+        default,
+        deserialize_with = "string_to_i64::deserialize",
+        serialize_with = "string_to_i64::serialize"
+    )]
+    pub max_buy_qty: i64,
+}
+
+impl BuyableInfo {
+    /// 미수 사용 X 기준 매수가능수량 (우리는 모의/실전 모두 미수 사용 X)
+    pub fn orderable_qty(&self) -> i64 {
+        self.nrcvb_buy_qty
+    }
+
+    /// 미수 사용 X 기준 매수가능금액
+    pub fn orderable_cash(&self) -> i64 {
+        if self.nrcvb_buy_amt > 0 {
+            self.nrcvb_buy_amt
+        } else {
+            self.ord_psbl_cash
+        }
+    }
 }
 
 #[cfg(test)]
@@ -128,13 +172,19 @@ mod tests {
 
     #[test]
     fn test_buyable_info_deserialize() {
+        // KIS 공식 응답 필드명 (ord_psbl_qty는 존재하지 않음)
         let json = r#"{
-            "ord_psbl_cash": "5000000",
-            "ord_psbl_qty": "69",
-            "nrcvb_buy_amt": "0"
+            "ord_psbl_cash": "9837431",
+            "nrcvb_buy_amt": "9837431",
+            "nrcvb_buy_qty": "82",
+            "max_buy_amt": "9837431",
+            "max_buy_qty": "82"
         }"#;
         let info: BuyableInfo = serde_json::from_str(json).unwrap();
-        assert_eq!(info.ord_psbl_cash, 5_000_000);
-        assert_eq!(info.ord_psbl_qty, 69);
+        assert_eq!(info.ord_psbl_cash, 9_837_431);
+        assert_eq!(info.nrcvb_buy_qty, 82);
+        assert_eq!(info.max_buy_qty, 82);
+        assert_eq!(info.orderable_qty(), 82);
+        assert_eq!(info.orderable_cash(), 9_837_431);
     }
 }

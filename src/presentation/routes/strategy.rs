@@ -171,7 +171,8 @@ impl StrategyManager {
         }
     }
 
-    /// 가용 현금 조회 (예수금 - 매입금)
+    /// 가용 현금 조회 — D+2 가수도정산금액(prvs_rcdl_excc_amt) 사용
+    /// KIS HTS "D+2 예수금"과 동일하며 매도 정산 대금까지 포함된 실제 주문가능 cash.
     async fn get_available_cash(&self, client: &KisHttpClient) -> i64 {
         let query = [
             ("CANO", client.account_no()),
@@ -186,20 +187,14 @@ impl StrategyManager {
                 &TransactionId::InquireBalance, Some(&query), None)
             .await;
         if let Ok(r) = resp {
-            // output2에서 예수금 추출
             if let Some(output2) = r.output2 {
                 if let Some(first) = output2.first() {
-                    let cash: i64 = first.get("dnca_tot_amt")
+                    let d2_cash: i64 = first.get("prvs_rcdl_excc_amt")
                         .and_then(|v| v.as_str())
                         .and_then(|s| s.parse().ok())
                         .unwrap_or(0);
-                    let purchase: i64 = first.get("pchs_amt_smtl_amt")
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(0);
-                    let available = (cash - purchase).max(0);
-                    info!("가용 현금: 예수금 {} - 매입금 {} = {}", cash, purchase, available);
-                    return available;
+                    info!("가용 현금: D+2 예수금 {}", d2_cash);
+                    return d2_cash;
                 }
             }
         }
@@ -305,20 +300,20 @@ impl StrategyManager {
                 Ok(r) => {
                     match r.into_result() {
                         Ok(info) => {
-                            let api_qty = info.ord_psbl_qty as u64;
-                            info!("{}: 현재가 {}원, 주문가능금액 {}원, 주문가능수량 {}주",
-                                name, price, info.ord_psbl_cash, api_qty);
+                            let api_qty = info.orderable_qty() as u64;
+                            info!("{}: 현재가 {}원, 주문가능금액 {}원, 주문가능수량 {}주 (증거금율 반영)",
+                                name, price, info.orderable_cash(), api_qty);
                             api_qty
                         }
                         Err(e) => {
-                            warn!("{}: 매수가능조회 파싱 실패 — 잔고 기반 fallback: {e}", name);
-                            (self.get_available_cash(&client).await / price) as u64
+                            warn!("{}: 매수가능조회 파싱 실패 — 잔고 기반 fallback (80%): {e}", name);
+                            ((self.get_available_cash(&client).await as f64 * 0.80) as i64 / price) as u64
                         }
                     }
                 }
                 Err(e) => {
-                    warn!("{}: 매수가능조회 실패 — 잔고 기반 fallback: {e}", name);
-                    (self.get_available_cash(&client).await / price) as u64
+                    warn!("{}: 매수가능조회 실패 — 잔고 기반 fallback (80%): {e}", name);
+                    ((self.get_available_cash(&client).await as f64 * 0.80) as i64 / price) as u64
                 }
             };
 

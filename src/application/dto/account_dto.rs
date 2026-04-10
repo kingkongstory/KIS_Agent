@@ -107,8 +107,8 @@ pub struct BuyableDto {
 impl From<BuyableInfo> for BuyableDto {
     fn from(b: BuyableInfo) -> Self {
         Self {
-            available_cash: b.ord_psbl_cash,
-            available_quantity: b.ord_psbl_qty,
+            available_cash: b.orderable_cash(),
+            available_quantity: b.orderable_qty(),
         }
     }
 }

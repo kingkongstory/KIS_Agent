@@ -1055,23 +1055,24 @@ impl LiveRunner {
                 .await;
             match resp {
                 Ok(r) => match r.into_result() {
-                    Ok(info) if info.ord_psbl_qty > 1 => {
-                        let qty = (info.ord_psbl_qty - 1) as u64; // 1주 여유 (슬리피지 대비)
-                        info!("{}: 주문 직전 매수가능 {}주 (API {}주 - 1, 가용 {}원)",
-                            self.stock_name, qty, info.ord_psbl_qty, info.ord_psbl_cash);
+                    Ok(info) if info.orderable_qty() > 1 => {
+                        let api_qty = info.orderable_qty();
+                        let qty = (api_qty - 1) as u64; // 1주 여유 (슬리피지 대비)
+                        info!("{}: 주문 직전 매수가능 {}주 (API {}주 - 1, 가용 {}원, 종목증거금율 반영)",
+                            self.stock_name, qty, api_qty, info.orderable_cash());
                         qty
                     }
                     Ok(info) => {
-                        warn!("{}: 매수가능수량 부족 ({}주)", self.stock_name, info.ord_psbl_qty);
+                        warn!("{}: 매수가능수량 부족 ({}주)", self.stock_name, info.orderable_qty());
                         0
                     }
                     Err(e) => {
-                        warn!("{}: 매수가능조회 파싱 실패: {e} — 잔고 기반 fallback", self.stock_name);
+                        warn!("{}: 매수가능조회 파싱 실패: {e} — 잔고 기반 fallback (증거금율 미반영, 80%)", self.stock_name);
                         let raw = self.get_available_cash().await;
-                        let available = (raw as f64 * 0.90) as i64;
+                        let available = (raw as f64 * 0.80) as i64;
                         if available > 0 && entry_price > 0 {
                             let qty = (available / entry_price) as u64;
-                            info!("{}: 잔고 기반 수량 {}주 (가용 {}원의 90%={}원)", self.stock_name, qty, raw, available);
+                            info!("{}: 잔고 기반 수량 {}주 (가용 {}원의 80%={}원)", self.stock_name, qty, raw, available);
                             qty
                         } else {
                             0
@@ -1079,12 +1080,12 @@ impl LiveRunner {
                     }
                 },
                 Err(e) => {
-                    warn!("{}: 매수가능조회 실패: {e} — 잔고 기반 fallback", self.stock_name);
+                    warn!("{}: 매수가능조회 실패: {e} — 잔고 기반 fallback (증거금율 미반영, 80%)", self.stock_name);
                     let raw = self.get_available_cash().await;
-                    let available = (raw as f64 * 0.90) as i64;
+                    let available = (raw as f64 * 0.80) as i64;
                     if available > 0 && entry_price > 0 {
                         let qty = (available / entry_price) as u64;
-                        info!("{}: 잔고 기반 수량 {}주 (가용 {}원의 90%={}원)", self.stock_name, qty, raw, available);
+                        info!("{}: 잔고 기반 수량 {}주 (가용 {}원의 80%={}원)", self.stock_name, qty, raw, available);
                         qty
                     } else {
                         0
@@ -1365,7 +1366,8 @@ impl LiveRunner {
         }
     }
 
-    /// 잔고 API로 실제 주문가능금액 조회 (총평가 - 매입금)
+    /// 잔고 API로 D+2 가수도정산금액(prvs_rcdl_excc_amt) 조회.
+    /// 이게 KIS HTS의 "D+2 예수금" = 실제 주문가능 cash와 동일.
     async fn get_available_cash(&self) -> i64 {
         let query = [
             ("CANO", self.client.account_no()),
@@ -1382,14 +1384,12 @@ impl LiveRunner {
         if let Ok(r) = resp {
             if let Some(output2) = r.output2 {
                 if let Some(first) = output2.first() {
-                    // tot_evlu_amt(총평가) 사용 — 실제 주문가능금액에 가장 근접
-                    let total_eval: i64 = first.get("tot_evlu_amt").and_then(|v| v.as_str())
+                    // prvs_rcdl_excc_amt = 가수도정산금액 (D+2 예수금)
+                    // KIS HTS의 "D+2 예수금"과 동일하며 매도 대금 정산까지 포함됨.
+                    let d2_cash: i64 = first.get("prvs_rcdl_excc_amt").and_then(|v| v.as_str())
                         .and_then(|s| s.parse().ok()).unwrap_or(0);
-                    let purchase: i64 = first.get("pchs_amt_smtl_amt").and_then(|v| v.as_str())
-                        .and_then(|s| s.parse().ok()).unwrap_or(0);
-                    let available = (total_eval - purchase).max(0);
-                    info!("{}: 가용현금 = 총평가 {} - 매입금 {} = {}", self.stock_name, total_eval, purchase, available);
-                    return available;
+                    info!("{}: D+2 예수금(prvs_rcdl_excc_amt) = {}", self.stock_name, d2_cash);
+                    return d2_cash;
                 }
             }
         }
