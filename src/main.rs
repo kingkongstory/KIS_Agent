@@ -84,6 +84,9 @@ enum Commands {
         /// 두 종목 통합 (position_lock 시뮬레이션, 122630+114800)
         #[arg(long, default_value = "false")]
         dual_locked: bool,
+        /// 일일 최대 거래 횟수 (기본: 5, 실전값 일치)
+        #[arg(long, default_value = "5")]
+        max_trades: usize,
     },
     /// 네이버 금융 일봉 수집
     CollectDaily,
@@ -157,8 +160,8 @@ async fn main() {
         Some(Commands::Trade { stock_code, rr, qty }) => {
             run_trade(&config, &stock_code, rr, qty).await;
         }
-        Some(Commands::Backtest { stock_code, days, rr, trail, tstop, be_r, fvg_exp, min2nd, dynamic_lookback, session_reset, multi_stage, dual_locked }) => {
-            run_backtest(&config, &stock_code, days, rr, trail, tstop, be_r, fvg_exp, min2nd, dynamic_lookback, session_reset, multi_stage, dual_locked).await;
+        Some(Commands::Backtest { stock_code, days, rr, trail, tstop, be_r, fvg_exp, min2nd, dynamic_lookback, session_reset, multi_stage, dual_locked, max_trades }) => {
+            run_backtest(&config, &stock_code, days, rr, trail, tstop, be_r, fvg_exp, min2nd, dynamic_lookback, session_reset, multi_stage, dual_locked, max_trades).await;
         }
         Some(Commands::CollectDaily) => {
             run_collect_daily(&config).await;
@@ -212,6 +215,7 @@ async fn run_backtest(
     config: &AppConfig, stock_code: &str, days: usize, rr: f64,
     trail: f64, tstop: usize, be_r: f64, fvg_exp: usize, min2nd: f64,
     dynamic_lookback: usize, session_reset: bool, multi_stage: bool, dual_locked: bool,
+    max_trades: usize,
 ) {
     use kis_agent::strategy::orb_fvg::OrbFvgConfig;
 
@@ -228,7 +232,7 @@ async fn run_backtest(
     strategy_config.breakeven_r = be_r;
     strategy_config.fvg_expiry_candles = fvg_exp;
     strategy_config.min_first_pnl_for_second = min2nd;
-    strategy_config.max_daily_trades = 3; // TEMP: 일회성 백테스트 (5→3)
+    strategy_config.max_daily_trades = max_trades;
 
     let source_interval = 5_i16;
     let engine = BacktestEngine::with_config(store, strategy_config, source_interval);
@@ -243,10 +247,12 @@ async fn run_backtest(
                 let total_pnl = report_a.total_pnl_pct + report_b.total_pnl_pct;
                 let total_trades = report_a.total_trades + report_b.total_trades;
                 let total_wins = report_a.wins + report_b.wins;
+                let actual_days = report_a.days_tested.max(1);
                 println!("\n=== 합산 ===");
+                println!("  실제 테스트 일수: {}일 (CLI --days={})", report_a.days_tested, days);
                 println!("  총 거래: {}회 (승리 {}회)", total_trades, total_wins);
                 println!("  총 손익: {:.2}%", total_pnl);
-                println!("  일평균: {:.2}%", total_pnl / days as f64);
+                println!("  일평균: {:.2}%", total_pnl / actual_days as f64);
             }
             Err(e) => { eprintln!("백테스트 에러: {e}"); std::process::exit(1); }
         }
