@@ -492,7 +492,26 @@ impl LiveRunner {
                     self.save_trade_to_db(&result).await;
                 }
                 Err(e) => {
-                    error!("{}: 잔여 포지션 청산 실패 — 수동 확인 필요: {e}", self.stock_name);
+                    warn!("{}: 잔여 포지션 청산 실패: {e} — 잔고 확인 후 판단", self.stock_name);
+                    // 잔고 API로 실제 보유 확인 → 없으면 유령 포지션 폐기
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    let actually_held = self.check_balance_has_stock().await;
+                    if !actually_held {
+                        warn!("{}: 잔고에 실제 보유 없음 — 유령 포지션 폐기", self.stock_name);
+                        let mut state = self.state.write().await;
+                        state.current_position = None;
+                        state.phase = "신호 탐색".to_string();
+                        // DB 활성 포지션도 삭제
+                        if let Some(ref store) = self.db_store {
+                            let _ = store.delete_active_position(self.stock_code.as_str()).await;
+                        }
+                        // position_lock 해제
+                        if let Some(ref lock) = self.position_lock {
+                            *lock.write().await = None;
+                        }
+                    } else {
+                        error!("{}: 실제 보유 확인됨 — 다음 manage_position에서 재시도", self.stock_name);
+                    }
                 }
             }
         }
@@ -1284,6 +1303,34 @@ impl LiveRunner {
         } else {
             info!("{}: 거래 DB 저장 완료 ({:?} {:.2}%)", self.stock_name, result.exit_reason, result.pnl_pct());
         }
+    }
+
+    /// 잔고 API로 해당 종목 실제 보유 여부 확인
+    async fn check_balance_has_stock(&self) -> bool {
+        let query = [
+            ("CANO", self.client.account_no()),
+            ("ACNT_PRDT_CD", self.client.account_product_code()),
+            ("AFHR_FLPR_YN", "N"), ("OFL_YN", ""), ("INQR_DVSN", "02"),
+            ("UNPR_DVSN", "01"), ("FUND_STTL_ICLD_YN", "N"),
+            ("FNCG_AMT_AUTO_RDPT_YN", "N"), ("PRCS_DVSN", "00"),
+            ("CTX_AREA_FK100", ""), ("CTX_AREA_NK100", ""),
+        ];
+        let resp: Result<KisResponse<Vec<serde_json::Value>>, _> = self.client
+            .execute(HttpMethod::Get, "/uapi/domestic-stock/v1/trading/inquire-balance",
+                &TransactionId::InquireBalance, Some(&query), None)
+            .await;
+        if let Ok(r) = resp {
+            let items = r.output.or(r.output1).unwrap_or_default();
+            for item in &items {
+                let code = item.get("pdno").and_then(|v| v.as_str()).unwrap_or("");
+                let qty: u64 = item.get("hldg_qty").and_then(|v| v.as_str())
+                    .and_then(|s| s.parse().ok()).unwrap_or(0);
+                if code == self.stock_code.as_str() && qty > 0 {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     async fn wait_until(&self, target: NaiveTime) {
