@@ -58,6 +58,13 @@ pub enum KisError {
     /// 내부 에러
     #[error("내부 에러: {0}")]
     Internal(String),
+
+    /// 다른 종목 선점 요청으로 진입 포기 (dual-locked 양보)
+    ///
+    /// FVG 자체는 유효하며 search_after 전진은 부적절.
+    /// 단순히 이번 사이클 lock 경쟁에 양보하는 의미.
+    #[error("다른 종목 선점 요청으로 진입 포기")]
+    Preempted,
 }
 
 impl KisError {
