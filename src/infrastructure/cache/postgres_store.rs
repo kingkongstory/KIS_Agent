@@ -122,12 +122,25 @@ impl PostgresStore {
                 pnl_pct DOUBLE PRECISION NOT NULL DEFAULT 0.0,
                 strategy VARCHAR(30) NOT NULL DEFAULT 'orb_fvg',
                 environment VARCHAR(10) NOT NULL DEFAULT 'paper',
+                intended_entry_price BIGINT DEFAULT 0,
+                entry_slippage BIGINT DEFAULT 0,
+                exit_slippage BIGINT DEFAULT 0,
+                order_to_fill_ms BIGINT DEFAULT 0,
                 created_at TIMESTAMPTZ DEFAULT NOW()
             )",
         )
         .execute(&self.pool)
         .await
         .map_err(|e| KisError::Internal(format!("마이그레이션 실패: {e}")))?;
+        // trades 스키마 마이그레이션: 기존 테이블에 슬리피지 컬럼 추가
+        for col_sql in [
+            "ALTER TABLE trades ADD COLUMN IF NOT EXISTS intended_entry_price BIGINT DEFAULT 0",
+            "ALTER TABLE trades ADD COLUMN IF NOT EXISTS entry_slippage BIGINT DEFAULT 0",
+            "ALTER TABLE trades ADD COLUMN IF NOT EXISTS exit_slippage BIGINT DEFAULT 0",
+            "ALTER TABLE trades ADD COLUMN IF NOT EXISTS order_to_fill_ms BIGINT DEFAULT 0",
+        ] {
+            let _ = sqlx::query(col_sql).execute(&self.pool).await;
+        }
 
         // 일별 OR 범위 (서버 재시작 시 복구용)
         sqlx::query(
@@ -159,12 +172,46 @@ impl PostgresStore {
                 tp_krx_orgno VARCHAR(20) DEFAULT '',
                 entry_time TIMESTAMP NOT NULL,
                 original_sl BIGINT DEFAULT 0,
+                reached_1r BOOLEAN DEFAULT FALSE,
+                best_price BIGINT DEFAULT 0,
                 updated_at TIMESTAMPTZ DEFAULT NOW()
             )",
         )
         .execute(&self.pool)
         .await
         .map_err(|e| KisError::Internal(format!("마이그레이션 실패: {e}")))?;
+
+        // active_positions 스키마 마이그레이션: 기존 테이블에 새 컬럼 추가
+        for col_sql in [
+            "ALTER TABLE active_positions ADD COLUMN IF NOT EXISTS reached_1r BOOLEAN DEFAULT FALSE",
+            "ALTER TABLE active_positions ADD COLUMN IF NOT EXISTS best_price BIGINT DEFAULT 0",
+        ] {
+            let _ = sqlx::query(col_sql).execute(&self.pool).await;
+        }
+
+        // 운영 이벤트 로그 (모니터링 — 전략/주문/포지션/시스템 이벤트 영속화)
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS event_log (
+                id BIGSERIAL PRIMARY KEY,
+                event_time TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                stock_code VARCHAR(10) NOT NULL DEFAULT '',
+                category VARCHAR(20) NOT NULL,
+                event_type VARCHAR(50) NOT NULL,
+                severity VARCHAR(10) NOT NULL DEFAULT 'info',
+                message TEXT NOT NULL DEFAULT '',
+                metadata JSONB DEFAULT '{}'
+            )",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| KisError::Internal(format!("마이그레이션 실패: {e}")))?;
+        // event_log 인덱스
+        for idx_sql in [
+            "CREATE INDEX IF NOT EXISTS idx_event_log_time ON event_log (event_time DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_event_log_stock ON event_log (stock_code, event_time DESC)",
+        ] {
+            let _ = sqlx::query(idx_sql).execute(&self.pool).await;
+        }
 
         // 주문 이벤트 로그 (모든 주문 시도를 비동기 기록)
         sqlx::query(
@@ -179,6 +226,30 @@ impl PostgresStore {
                 status VARCHAR(20) NOT NULL,
                 message TEXT DEFAULT '',
                 created_at TIMESTAMPTZ DEFAULT NOW()
+            )",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| KisError::Internal(format!("마이그레이션 실패: {e}")))?;
+
+        // 일일 결산 리포트
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS daily_report (
+                id BIGSERIAL PRIMARY KEY,
+                date DATE NOT NULL,
+                stock_code VARCHAR(10) NOT NULL DEFAULT '',
+                total_trades INT DEFAULT 0,
+                wins INT DEFAULT 0,
+                losses INT DEFAULT 0,
+                win_rate DOUBLE PRECISION DEFAULT 0.0,
+                total_pnl_pct DOUBLE PRECISION DEFAULT 0.0,
+                max_loss_pnl_pct DOUBLE PRECISION DEFAULT 0.0,
+                avg_entry_slippage BIGINT DEFAULT 0,
+                ws_reconnect_count INT DEFAULT 0,
+                api_error_count INT DEFAULT 0,
+                metadata JSONB DEFAULT '{}',
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                UNIQUE(date, stock_code)
             )",
         )
         .execute(&self.pool)
@@ -450,8 +521,9 @@ impl PostgresStore {
     pub async fn save_trade(&self, trade: &TradeRecord) -> Result<(), KisError> {
         sqlx::query(
             "INSERT INTO trades (stock_code, stock_name, side, quantity, entry_price, exit_price,
-             stop_loss, take_profit, entry_time, exit_time, exit_reason, pnl_pct, strategy, environment)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+             stop_loss, take_profit, entry_time, exit_time, exit_reason, pnl_pct, strategy, environment,
+             intended_entry_price, entry_slippage, exit_slippage, order_to_fill_ms)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)",
         )
         .bind(&trade.stock_code)
         .bind(&trade.stock_name)
@@ -467,6 +539,10 @@ impl PostgresStore {
         .bind(trade.pnl_pct)
         .bind(&trade.strategy)
         .bind(&trade.environment)
+        .bind(trade.intended_entry_price)
+        .bind(trade.entry_slippage)
+        .bind(trade.exit_slippage)
+        .bind(trade.order_to_fill_ms)
         .execute(&self.pool)
         .await
         .map_err(|e| KisError::Internal(format!("거래 저장 실패: {e}")))?;
@@ -602,10 +678,10 @@ impl PostgresStore {
     /// 활성 포지션 저장/갱신
     pub async fn save_active_position(&self, pos: &ActivePosition) -> Result<(), KisError> {
         sqlx::query(
-            "INSERT INTO active_positions (stock_code, side, entry_price, stop_loss, take_profit, quantity, tp_order_no, tp_krx_orgno, entry_time, original_sl)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            "INSERT INTO active_positions (stock_code, side, entry_price, stop_loss, take_profit, quantity, tp_order_no, tp_krx_orgno, entry_time, original_sl, reached_1r, best_price)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
              ON CONFLICT (stock_code) DO UPDATE
-             SET side=$2, entry_price=$3, stop_loss=$4, take_profit=$5, quantity=$6, tp_order_no=$7, tp_krx_orgno=$8, entry_time=$9, original_sl=$10, updated_at=NOW()",
+             SET side=$2, entry_price=$3, stop_loss=$4, take_profit=$5, quantity=$6, tp_order_no=$7, tp_krx_orgno=$8, entry_time=$9, original_sl=$10, reached_1r=$11, best_price=$12, updated_at=NOW()",
         )
         .bind(&pos.stock_code)
         .bind(&pos.side)
@@ -617,6 +693,8 @@ impl PostgresStore {
         .bind(&pos.tp_krx_orgno)
         .bind(pos.entry_time)
         .bind(pos.original_sl)
+        .bind(pos.reached_1r)
+        .bind(pos.best_price)
         .execute(&self.pool)
         .await
         .map_err(|e| KisError::Internal(format!("활성 포지션 저장 실패: {e}")))?;
@@ -626,7 +704,7 @@ impl PostgresStore {
     /// 활성 포지션 조회
     pub async fn get_active_position(&self, stock_code: &str) -> Result<Option<ActivePosition>, KisError> {
         let row: Option<ActivePositionRow> = sqlx::query_as(
-            "SELECT stock_code, side, entry_price, stop_loss, take_profit, quantity, tp_order_no, tp_krx_orgno, entry_time, original_sl
+            "SELECT stock_code, side, entry_price, stop_loss, take_profit, quantity, tp_order_no, tp_krx_orgno, entry_time, original_sl, reached_1r, best_price
              FROM active_positions WHERE stock_code = $1",
         )
         .bind(stock_code)
@@ -648,8 +726,32 @@ impl PostgresStore {
                 tp_krx_orgno: r.tp_krx_orgno,
                 entry_time: r.entry_time,
                 original_sl: if orig_sl != 0 { orig_sl } else { r.stop_loss },
+                reached_1r: r.reached_1r.unwrap_or(false),
+                best_price: r.best_price.unwrap_or(r.entry_price),
             }
         }))
+    }
+
+    /// 활성 포지션의 트레일링 상태만 갱신 (경량 업데이트)
+    pub async fn update_position_trailing(
+        &self,
+        stock_code: &str,
+        stop_loss: i64,
+        reached_1r: bool,
+        best_price: i64,
+    ) -> Result<(), KisError> {
+        sqlx::query(
+            "UPDATE active_positions SET stop_loss=$2, reached_1r=$3, best_price=$4, updated_at=NOW()
+             WHERE stock_code = $1",
+        )
+        .bind(stock_code)
+        .bind(stop_loss)
+        .bind(reached_1r)
+        .bind(best_price)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| KisError::Internal(format!("트레일링 상태 갱신 실패: {e}")))?;
+        Ok(())
     }
 
     /// 활성 포지션 삭제 (청산 완료 시)
@@ -711,6 +813,10 @@ pub struct ActivePosition {
     pub entry_time: NaiveDateTime,
     /// 원래 SL (트레일링 전 기준, risk 계산용)
     pub original_sl: i64,
+    /// 1R 도달 여부 (트레일링/본전스탑 활성화 상태 복구용)
+    pub reached_1r: bool,
+    /// 유리한 방향 최고가 (트레일링 SL 계산 기준 복구용)
+    pub best_price: i64,
 }
 
 #[derive(sqlx::FromRow)]
@@ -726,6 +832,10 @@ struct ActivePositionRow {
     entry_time: NaiveDateTime,
     #[sqlx(default)]
     original_sl: Option<i64>,
+    #[sqlx(default)]
+    reached_1r: Option<bool>,
+    #[sqlx(default)]
+    best_price: Option<i64>,
 }
 
 /// 거래 기록
@@ -745,6 +855,14 @@ pub struct TradeRecord {
     pub pnl_pct: f64,
     pub strategy: String,
     pub environment: String,
+    /// 이론 진입가 (FVG mid_price)
+    pub intended_entry_price: i64,
+    /// 진입 슬리피지 (actual_entry - intended_entry, 양수=불리)
+    pub entry_slippage: i64,
+    /// 청산 슬리피지 (TP 지정가는 0 정상)
+    pub exit_slippage: i64,
+    /// 주문 → 체결 확인 지연 (밀리초)
+    pub order_to_fill_ms: i64,
 }
 
 /// 분봉 캔들

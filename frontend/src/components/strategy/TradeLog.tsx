@@ -61,24 +61,39 @@ export function TradeLog() {
               <tr>
                 <th className="text-left py-1 pr-2">시각</th>
                 <th className="text-left py-1 pr-2">종목</th>
+                <th className="text-right py-1 pr-2">수량</th>
                 <th className="text-right py-1 pr-2">진입</th>
+                <th className="text-right py-1 pr-2">매수금액</th>
                 <th className="text-right py-1 pr-2">청산</th>
+                <th className="text-right py-1 pr-2">매도금액</th>
                 <th className="text-left py-1 pr-2">사유</th>
                 <th className="text-right py-1">손익</th>
               </tr>
             </thead>
             <tbody>
-              {trades.map((t) => (
+              {trades.map((t) => {
+                const buyAmt = t.entry_price * t.quantity;
+                const sellAmt = t.exit_price * t.quantity;
+                return (
                 <tr key={t.id} className="border-t border-border/30">
                   <td className="py-1 pr-2 text-text-muted">
                     {t.entry_time.slice(11, 16)}
                   </td>
                   <td className="py-1 pr-2">{t.stock_name.slice(0, 8)}</td>
+                  <td className="py-1 pr-2 text-right tabular-nums text-text-muted">
+                    {t.quantity.toLocaleString()}
+                  </td>
                   <td className="py-1 pr-2 text-right tabular-nums">
                     {t.entry_price.toLocaleString()}
                   </td>
+                  <td className="py-1 pr-2 text-right tabular-nums text-text-muted">
+                    {buyAmt.toLocaleString()}
+                  </td>
                   <td className="py-1 pr-2 text-right tabular-nums">
                     {t.exit_price.toLocaleString()}
+                  </td>
+                  <td className="py-1 pr-2 text-right tabular-nums text-text-muted">
+                    {sellAmt.toLocaleString()}
                   </td>
                   <td className="py-1 pr-2">
                     <span
@@ -104,7 +119,8 @@ export function TradeLog() {
                     {t.pnl_pct.toFixed(2)}%
                   </td>
                 </tr>
-              ))}
+                );
+              })}
             </tbody>
           </table>
         </div>

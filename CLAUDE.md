@@ -99,19 +99,33 @@ Rust 워크스페이스로 구성된 웹 애플리케이션이며, 아래 계층
 
 ### ORB+FVG 전략 흐름
 
-1. **OR 수집** (09:00~09:15): Opening Range 고가/저가 산출
+1. **OR 수집** (09:00~09:15): Opening Range 고가/저가 산출 (Multi-Stage 5m/15m/30m)
 2. **FVG 탐색** (09:15~15:20): 5분봉에서 3캔들 갭 패턴 탐지 + OR 돌파 확인
-3. **진입**: FVG 리트레이스 시 시장가 매수
+3. **진입**: FVG 리트레이스 시 **지정가 매수 (gap.top 기준, 30초 체결 대기)**
 4. **청산**: TP 지정가 매도 (KRX 자동 체결) / SL·트레일링·시간스탑은 시장가
 
 ### 주문 방식 (하이브리드)
 
 | 동작 | 주문 유형 | 이유 |
 |---|---|---|
-| 진입 (매수) | 시장가 (`ORD_DVSN=01`) | 신호 발생 시 즉시 체결 보장 |
+| 진입 (매수) | **지정가** (`ORD_DVSN=00`, **gap.top 가격**) | 슬리피지 0, 백테스트 zone 터치 조건과 일치 (2026-04-14 변경) |
 | 익절 (TP) | 지정가 (`ORD_DVSN=00`) | 정확한 목표가 체결, 슬리피지 0 |
 | 손절 (SL) | 시장가 | 즉시 청산 (TP 취소 후 실행) |
 | 장마감 청산 | 시장가 | TP 취소 후 강제 청산 |
+
+**지정가 매수 상세**: 30초 체결 대기 루프 → 미체결 시 자동 취소 → 다음 FVG 탐색. cancel 3회 실패 시 `cancel_all_pending_orders()` fallback 동작.
+
+### 포지션 잠금 (2단계 PositionLockState)
+
+두 종목(122630/114800) 간 동시 진입 방지용 공유 lock:
+
+| 상태 | 의미 | 전이 |
+|---|---|---|
+| `Free` | 잠금 없음 | 어느 종목이든 진입 가능 |
+| `Pending{code, preempted}` | 지정가 발주 후 체결 대기 중 | 다른 종목 진입 시 `preempted=true` 설정 → 대기 종목 즉시 취소 |
+| `Held(code)` | 포지션 보유 확정 | 다른 종목 진입 차단 (청산 시 Free) |
+
+**선점(preempt) 메커니즘**: `wait_execution_notice()`의 `tokio::select!` 에 200ms 폴링 branch로 preempted 플래그 감지 (live_runner.rs `wait_preempted` 함수).
 
 ### 데이터 소스 분리
 
@@ -126,6 +140,13 @@ Rust 워크스페이스로 구성된 웹 애플리케이션이며, 아래 계층
 - **이전 TP 지정가**: 저장된 주문번호로 취소 → 새 TP 재발주
 - **분봉 데이터**: `minute_ohlcv`에서 당일 분봉 프리로딩
 - OR 데이터 없으면 네이버 금융에서 자동 백필
+- **Orphan 매수 주문 정리** (2026-04-14 추가): `check_and_restore_position()`의 `Ok(None)` 분기에서 `cancel_all_pending_orders()` 호출. `taskkill /F`/SIGKILL/패닉 등 모든 비정상 종료 후 재시작 시 KIS에 남은 미체결 매수 주문을 자동 취소. `inquire-psbl-rvsecncl` API로 조회.
+
+### Graceful Shutdown (2026-04-14 추가)
+
+`main.rs`에 `tokio::signal::ctrl_c()` + Unix `SIGTERM` 핸들러. 신호 수신 시 `StrategyManager::stop_all()` → 모든 러너에 stop 신호 → 체결 대기 루프 즉시 탈출 → cancel → `wait_all_stopped(40s)` → axum graceful shutdown.
+
+**제약**: Windows `taskkill /F`와 SIGKILL은 OS 레벨 강제 종료이므로 커버 불가. 이 경우 재시작 시 orphan 정리 로직이 안전망 역할.
 
 ### DB 테이블
 
@@ -144,13 +165,15 @@ Rust 워크스페이스로 구성된 웹 애플리케이션이며, 아래 계층
 - Short 주문 없음 (모의투자 공매도 불가, 반대 ETF가 담당)
 - 종목당 500만원 배정 (5:5 배분)
 
-### 전략 파라미터 (OrbFvgConfig)
+### 전략 파라미터 (OrbFvgConfig, `src/strategy/orb_fvg.rs:41-59`)
 
-- RR 비율: 2.0 (손익비 1:2)
-- OR: 09:00~09:15
-- 진입 마감: 15:20, 강제 청산: 15:25
-- 트레일링: 0.5R, 본전스탑: 1.0R
-- 일일 최대 손실: -1.5% (거래 횟수 제한 없음)
+- **RR 비율: 2.5** (손익비 1:2.5)
+- OR: 09:00~09:15 (Multi-Stage 5m/15m/30m 동시 추적)
+- 진입 마감: 15:20 (지정가 대기 고려해 실제 컷오프 15:19:30), 강제 청산: 15:25
+- **트레일링: 0.05R (5%R)**, **본전스탑: 0.15R (15%R)** — 매우 공격적 설정 (2026-04-11 `360f167` 파라미터 최적화)
+- FVG 유효: 6캔들 (30분)
+- 일일 최대 손실: -1.5%, 최대 거래: 5회
+- Long only (공매도 금지)
 
 ### 일일 운영 절차
 
@@ -180,3 +203,21 @@ schtasks /Create /SC WEEKLY /D MON,TUE,WED,THU,FRI /TN "KIS_Yahoo_Daily" /TR "C:
 **Yahoo 5분봉의 한계**: 단일 호출 최대 `range=60d` (90d/6mo/1y는 yahoo가 명시 거부, max는 일봉 fall-back). 즉 시간 여행 불가. 매일 1d 호출로 누적해야 60일 윈도우 이전 일자도 영구 보존된다.
 
 **1분봉은 사용하지 않는다.** Yahoo 1분봉도 받을 수 있으나 (`interval=1m`) range가 8일 한계이고, 백테스트 엔진의 `source_interval = 5_i16`이 5분봉 전용이라 백테스트에 미사용. 라이브는 WebSocket 실시간 적재로 충분.
+
+## 사고/변경 이력 레퍼런스
+
+| 날짜 | 사고/변경 | 문서 |
+|---|---|---|
+| 2026-04-10 | DB 세션 KST timezone 강제 (백테스트 09:00~15:30 조회 0건 사고) | [docs/monitoring/2026-04-10.md](docs/monitoring/2026-04-10.md) |
+| 2026-04-14 | 지정가 매수 전환 + 2단계 lock + Graceful shutdown + orphan 정리 | [docs/monitoring/2026-04-14.md](docs/monitoring/2026-04-14.md) |
+
+## 운영 주의사항
+
+### 프로세스 종료 시 (2026-04-14 사고 교훈)
+1. **Ctrl+C 또는 일반 `taskkill` 사용** — graceful shutdown 경로로 30초 대기 중이던 주문을 취소 후 종료
+2. **`taskkill /F` (강제 종료) 지양** — 체결 대기 중 주문이 KIS에 orphan으로 남아 증거금이 묶임
+3. `taskkill /F`가 불가피한 경우 → **즉시 HTS/MTS에서 미체결 주문 수동 취소** 또는 재시작하여 자동 정리(`cancel_all_pending_orders`)
+4. 실제 `cancel_all_pending_orders`의 조회 파싱이 실패하는 경우가 있음 (모의투자 환경) → **HTS 수동 확인 권장**
+
+### WebSocket 재연결 패턴
+KIS 서버가 **매 정시(:00)에 연결 리셋** (2026-04-14 확인). 자동 재연결(2~4초) 정상 동작하므로 기능 영향 없음. 로그에 "WebSocket 연결 실패" 경고가 시간당 1회 나오는 것은 정상.

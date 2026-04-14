@@ -38,6 +38,15 @@ pub struct Position {
     pub best_price: i64,
     /// 원래 SL (1R 이전 기준, ExitReason 판정용)
     pub original_sl: i64,
+    /// WS 틱 리스너가 SL 돌파를 감지했을 때 설정되는 플래그.
+    /// `manage_position` 이 이 플래그를 보고 TP 체크를 건너뛰고
+    /// 즉시 시장가 청산 경로로 진입. 포지션 청산 후 position 자체가
+    /// drop 되면서 자동 리셋.
+    pub sl_triggered_tick: bool,
+    /// 이론 진입가 (FVG mid_price — 슬리피지 = entry_price - intended_entry_price)
+    pub intended_entry_price: i64,
+    /// 주문 → 체결 확인 지연 (밀리초)
+    pub order_to_fill_ms: i64,
 }
 
 /// 청산 사유
@@ -67,6 +76,10 @@ pub struct TradeResult {
     pub exit_reason: ExitReason,
     /// 거래된 실제 수량. 백테스트에서는 0(기본).
     pub quantity: u64,
+    /// 이론 진입가 (슬리피지 계산용, 백테스트는 entry_price와 동일)
+    pub intended_entry_price: i64,
+    /// 주문 → 체결 확인 지연 (밀리초, 백테스트는 0)
+    pub order_to_fill_ms: i64,
 }
 
 impl TradeResult {

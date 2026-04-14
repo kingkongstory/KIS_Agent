@@ -346,7 +346,7 @@ impl OrbFvgStrategy {
                 return Some(TradeResult {
                     side, entry_price, exit_price: c.open, stop_loss, take_profit,
                     entry_time, exit_time: c.time, exit_reason: reason,
-                    quantity: 0,
+                    quantity: 0, intended_entry_price: entry_price, order_to_fill_ms: 0,
                 });
             }
 
@@ -360,7 +360,7 @@ impl OrbFvgStrategy {
                 return Some(TradeResult {
                     side, entry_price, exit_price: take_profit, stop_loss, take_profit,
                     entry_time, exit_time: c.time, exit_reason: ExitReason::TakeProfit,
-                    quantity: 0,
+                    quantity: 0, intended_entry_price: entry_price, order_to_fill_ms: 0,
                 });
             }
 
@@ -419,7 +419,7 @@ impl OrbFvgStrategy {
                 return Some(TradeResult {
                     side, entry_price, exit_price: current_sl, stop_loss, take_profit,
                     entry_time, exit_time: c.time, exit_reason: reason,
-                    quantity: 0,
+                    quantity: 0, intended_entry_price: entry_price, order_to_fill_ms: 0,
                 });
             }
 
@@ -430,7 +430,7 @@ impl OrbFvgStrategy {
                 return Some(TradeResult {
                     side, entry_price, exit_price: c.close, stop_loss, take_profit,
                     entry_time, exit_time: c.time, exit_reason: ExitReason::TimeStop,
-                    quantity: 0,
+                    quantity: 0, intended_entry_price: entry_price, order_to_fill_ms: 0,
                 });
             }
 
@@ -440,7 +440,7 @@ impl OrbFvgStrategy {
                 return Some(TradeResult {
                     side, entry_price, exit_price: c.close, stop_loss, take_profit,
                     entry_time, exit_time: c.time, exit_reason: ExitReason::EndOfDay,
-                    quantity: 0,
+                    quantity: 0, intended_entry_price: entry_price, order_to_fill_ms: 0,
                 });
             }
         }
@@ -448,7 +448,7 @@ impl OrbFvgStrategy {
         remaining.last().map(|last| TradeResult {
             side, entry_price, exit_price: last.close, stop_loss, take_profit,
             entry_time, exit_time: last.time, exit_reason: ExitReason::EndOfDay,
-            quantity: 0,
+            quantity: 0, intended_entry_price: entry_price, order_to_fill_ms: 0,
         })
     }
 
@@ -679,6 +679,9 @@ mod tests {
             reached_1r: false,
             best_price: 10000,
             original_sl: 0,
+            sl_triggered_tick: false,
+            intended_entry_price: 0,
+            order_to_fill_ms: 0,
         };
 
         assert_eq!(strategy.check_exit(&pos, 10100), None);
@@ -702,6 +705,9 @@ mod tests {
             reached_1r: false,
             best_price: 10000,
             original_sl: 0,
+            sl_triggered_tick: false,
+            intended_entry_price: 0,
+            order_to_fill_ms: 0,
         };
 
         assert_eq!(strategy.check_exit(&pos, 9900), None);

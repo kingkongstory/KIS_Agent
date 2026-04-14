@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 use tokio::sync::broadcast;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
-use tracing::info;
+use tracing::{info, warn};
 
 use kis_agent::application::services::account_service::AccountService;
 use kis_agent::application::services::market_data_service::MarketDataService;
@@ -49,7 +49,7 @@ enum Commands {
     },
     /// ORB+FVG 전략 백테스트
     Backtest {
-        /// 종목코드 (6자리, 예: 005930)
+        /// 종목코드 (단일: 122630, dual-locked: 122630,114800)
         stock_code: String,
         /// 테스트 일수 (기본: 30)
         #[arg(long, default_value = "30")]
@@ -81,12 +81,18 @@ enum Commands {
         /// Multi-Stage ORB: 5분/15분/30분 OR 동시 추적
         #[arg(long, default_value = "false")]
         multi_stage: bool,
-        /// 두 종목 통합 (position_lock 시뮬레이션, 122630+114800)
+        /// 두 종목 통합 position_lock (종목코드를 쉼표로 구분: 122630,114800)
         #[arg(long, default_value = "false")]
         dual_locked: bool,
         /// 일일 최대 거래 횟수 (기본: 5, 실전값 일치)
         #[arg(long, default_value = "5")]
         max_trades: usize,
+        /// 진입 마감 시각 HH:MM (기본: 15:20)
+        #[arg(long, default_value = "15:20")]
+        cutoff: String,
+        /// 강제 청산 시각 HH:MM (기본: 15:25)
+        #[arg(long, default_value = "15:25")]
+        force_exit: String,
     },
     /// 네이버 금융 일봉 수집
     CollectDaily,
@@ -103,8 +109,8 @@ enum Commands {
     },
     /// Yahoo Finance 분봉 수집 (OHLCV, 최대 1달)
     CollectYahoo {
-        /// 종목코드 (쉼표 구분, 예: 069500,122630)
-        #[arg(long, default_value = "069500,122630")]
+        /// 종목코드 (쉼표 구분, 예: 122630,114800,233740,251340)
+        #[arg(long, default_value = "122630,114800,233740,251340")]
         codes: String,
         /// 분봉 간격 (5m, 15m 등)
         #[arg(long, default_value = "5m")]
@@ -117,22 +123,7 @@ enum Commands {
     Server,
 }
 
-/// KIS HTTP 클라이언트 생성 헬퍼
-fn create_kis_client(config: &AppConfig) -> Arc<KisHttpClient> {
-    let token_manager = Arc::new(TokenManager::new(
-        config.appkey.clone(),
-        config.appsecret.clone(),
-        config.environment,
-    ));
-    let rate_limiter = Arc::new(KisRateLimiter::new(config.environment));
-    Arc::new(KisHttpClient::new(
-        token_manager,
-        rate_limiter,
-        config.environment,
-        config.account_no.clone(),
-        config.account_product_code.clone(),
-    ))
-}
+
 
 #[tokio::main]
 async fn main() {
@@ -160,8 +151,8 @@ async fn main() {
         Some(Commands::Trade { stock_code, rr, qty }) => {
             run_trade(&config, &stock_code, rr, qty).await;
         }
-        Some(Commands::Backtest { stock_code, days, rr, trail, tstop, be_r, fvg_exp, min2nd, dynamic_lookback, session_reset, multi_stage, dual_locked, max_trades }) => {
-            run_backtest(&config, &stock_code, days, rr, trail, tstop, be_r, fvg_exp, min2nd, dynamic_lookback, session_reset, multi_stage, dual_locked, max_trades).await;
+        Some(Commands::Backtest { stock_code, days, rr, trail, tstop, be_r, fvg_exp, min2nd, dynamic_lookback, session_reset, multi_stage, dual_locked, max_trades, cutoff, force_exit }) => {
+            run_backtest(&config, &stock_code, days, rr, trail, tstop, be_r, fvg_exp, min2nd, dynamic_lookback, session_reset, multi_stage, dual_locked, max_trades, &cutoff, &force_exit).await;
         }
         Some(Commands::CollectDaily) => {
             run_collect_daily(&config).await;
@@ -181,8 +172,8 @@ async fn main() {
     }
 }
 
-/// ORB+FVG 실시간 트레이딩
-async fn run_trade(config: &AppConfig, stock_code: &str, rr: f64, qty: u64) {
+/// ORB+FVG 실시간 트레이딩 (CLI 단독 실행)
+async fn run_trade(config: &AppConfig, stock_code: &str, _rr: f64, _qty: u64) {
     let code = match StockCode::new(stock_code) {
         Ok(c) => c,
         Err(e) => {
@@ -191,9 +182,77 @@ async fn run_trade(config: &AppConfig, stock_code: &str, rr: f64, qty: u64) {
         }
     };
 
-    let client = create_kis_client(config);
+    // 인프라 구성 (웹 서버와 동일한 파이프라인)
+    let token_manager = Arc::new(TokenManager::new(
+        config.appkey.clone(), config.appsecret.clone(), config.environment,
+    ));
+    let rate_limiter = Arc::new(KisRateLimiter::new(config.environment));
+    let client = Arc::new(KisHttpClient::new(
+        Arc::clone(&token_manager), Arc::clone(&rate_limiter),
+        config.environment, config.account_no.clone(), config.account_product_code.clone(),
+    ));
+
+    // DB 연결
+    let pg_store = match PostgresStore::new(&config.database_url).await {
+        Ok(store) => {
+            info!("PostgreSQL 연결 완료");
+            Some(Arc::new(store))
+        }
+        Err(e) => {
+            tracing::warn!("PostgreSQL 연결 실패 (DB 없이 실행): {e}");
+            None
+        }
+    };
+
+    // 실시간 데이터 채널
+    let (realtime_tx, _) = broadcast::channel::<RealtimeData>(1024);
+
+    // WebSocket 실시간 스트리밍
+    {
+        use kis_agent::infrastructure::websocket::connection::KisWebSocketClient;
+        let ws_client = Arc::new(KisWebSocketClient::new(
+            Arc::clone(&token_manager), config.environment, realtime_tx.clone(),
+        ));
+        let sub_mgr = ws_client.subscription_manager();
+        sub_mgr.add("H0STCNT0", stock_code).await;
+        sub_mgr.add("H0STASP0", stock_code).await;
+        sub_mgr.add("H0STMKO0", stock_code).await;
+        let hts_id = std::env::var("KIS_HTS_ID").unwrap_or_default();
+        if !hts_id.is_empty() {
+            sub_mgr.add("H0STCNI9", &hts_id).await;
+        }
+        tokio::spawn(async move { ws_client.run().await });
+        info!("WebSocket 실시간 스트리밍 시작 ({})", stock_code);
+    }
+
+    // 분봉 집계기
+    let ws_candles = {
+        use kis_agent::infrastructure::websocket::candle_aggregator::CandleAggregator;
+        let mut agg = CandleAggregator::new();
+        if let Some(ref store) = pg_store {
+            agg = agg.with_store(Arc::clone(store));
+        }
+        let aggregator = Arc::new(agg);
+        aggregator.preload_from_db(&[stock_code]).await;
+        aggregator.backfill_or(&[stock_code], false).await;
+        let candles = aggregator.completed_candles();
+        let rx = realtime_tx.subscribe();
+        Arc::clone(&aggregator).spawn(rx, realtime_tx.clone());
+        candles
+    };
+
     let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let mut runner = LiveRunner::new(client, code, stock_code.to_string(), qty, stop_flag);
+    let mut runner = LiveRunner::new(
+        Arc::clone(&client), code, stock_code.to_string(), 0, stop_flag,
+    );
+    runner = runner.with_trade_tx(realtime_tx.clone());
+    runner = runner.with_ws_candles(ws_candles);
+    if let Some(ref store) = pg_store {
+        runner = runner.with_db_store(Arc::clone(store));
+        runner = runner.with_event_logger(Arc::new(
+            kis_agent::infrastructure::monitoring::event_logger::EventLogger::new(store.pool().clone()),
+        ));
+    }
 
     match runner.run().await {
         Ok(trades) if !trades.is_empty() => {
@@ -215,7 +274,7 @@ async fn run_backtest(
     config: &AppConfig, stock_code: &str, days: usize, rr: f64,
     trail: f64, tstop: usize, be_r: f64, fvg_exp: usize, min2nd: f64,
     dynamic_lookback: usize, session_reset: bool, multi_stage: bool, dual_locked: bool,
-    max_trades: usize,
+    max_trades: usize, cutoff: &str, force_exit: &str,
 ) {
     use kis_agent::strategy::orb_fvg::OrbFvgConfig;
 
@@ -233,14 +292,26 @@ async fn run_backtest(
     strategy_config.fvg_expiry_candles = fvg_exp;
     strategy_config.min_first_pnl_for_second = min2nd;
     strategy_config.max_daily_trades = max_trades;
+    if let Ok(t) = chrono::NaiveTime::parse_from_str(&format!("{}:00", cutoff), "%H:%M:%S") {
+        strategy_config.entry_cutoff = t;
+    }
+    if let Ok(t) = chrono::NaiveTime::parse_from_str(&format!("{}:00", force_exit), "%H:%M:%S") {
+        strategy_config.force_exit = t;
+    }
 
     let source_interval = 5_i16;
     let engine = BacktestEngine::with_config(store, strategy_config, source_interval);
 
     if dual_locked {
+        let codes: Vec<&str> = stock_code.split(',').map(|s| s.trim()).collect();
+        if codes.len() != 2 {
+            eprintln!("dual-locked 모드는 종목코드 2개를 쉼표로 구분해야 합니다 (예: 122630,114800)");
+            std::process::exit(1);
+        }
+        let (code_a, code_b) = (codes[0], codes[1]);
         info!("=== 두 종목 통합 백테스트 (position_lock) 시작 ===");
-        info!("122630 + 114800, 기간: {days}일, Multi-Stage: {multi_stage}");
-        match engine.run_dual_locked("122630", "114800", days, multi_stage).await {
+        info!("{code_a} + {code_b}, 기간: {days}일, Multi-Stage: {multi_stage}");
+        match engine.run_dual_locked(code_a, code_b, days, multi_stage).await {
             Ok((report_a, report_b)) => {
                 println!("{report_a}");
                 println!("{report_b}");
@@ -556,6 +627,13 @@ async fn run_server(config: AppConfig) {
     };
     let (ws_candles, candle_aggregator) = ws_candles;
 
+    // 운영 이벤트 로거 (fire-and-forget 비동기 DB 저장)
+    let event_logger = pg_store.as_ref().map(|store| {
+        Arc::new(kis_agent::infrastructure::monitoring::event_logger::EventLogger::new(
+            store.pool().clone(),
+        ))
+    });
+
     // 전략 관리자 (스케줄러와 AppState 공유)
     let strategy_manager = {
         let mut mgr = kis_agent::presentation::routes::strategy::StrategyManager::new();
@@ -565,6 +643,9 @@ async fn run_server(config: AppConfig) {
         mgr.set_candle_aggregator(Arc::clone(&candle_aggregator));
         if let Some(ref store) = pg_store {
             mgr.set_db_store(Arc::clone(store));
+        }
+        if let Some(ref el) = event_logger {
+            mgr.set_event_logger(Arc::clone(el));
         }
         mgr
     };
@@ -577,6 +658,45 @@ async fn run_server(config: AppConfig) {
         strategy_manager.clone(),
     );
 
+    // 장중 Yahoo OR 자동 교체 스케줄러 (09:06, 09:16, 09:31)
+    // WS 집계 5분봉은 동시호가 데이터를 포함하지 않아 OR이 백테스트와 다를 수 있음.
+    // Yahoo 데이터가 도착하면 OR 구간(09:00~09:30) 캔들을 교체하여 정합성 확보.
+    {
+        let agg = Arc::clone(&candle_aggregator);
+        tokio::spawn(async move {
+            let codes = ["122630", "114800"];
+            let schedules = [(9, 6, "5m"), (9, 16, "15m"), (9, 31, "30m")];
+            for (hour, min, stage) in schedules {
+                // 시작 시각까지 대기
+                loop {
+                    let now = chrono::Local::now().time();
+                    let target = chrono::NaiveTime::from_hms_opt(hour, min, 0).unwrap();
+                    if now >= target { break; }
+                    let secs = (target - now).num_seconds().max(1).min(10) as u64;
+                    tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+                }
+                // 성공할 때까지 1분 간격 재시도 (최대 20회)
+                let mut success = false;
+                for attempt in 1..=20u32 {
+                    info!("Yahoo OR 교체 시도 ({} OR, {}회차/20)", stage, attempt);
+                    if agg.refresh_or_from_yahoo(&codes).await {
+                        info!("Yahoo OR 교체 성공 ({} OR, {}회차)", stage, attempt);
+                        success = true;
+                        break;
+                    }
+                    if attempt < 20 {
+                        warn!("Yahoo OR 교체 실패 ({} OR, {}회차/20) — 60초 후 재시도", stage, attempt);
+                        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    }
+                }
+                if !success {
+                    tracing::error!("Yahoo OR 교체 최종 실패 ({} OR, 20회 시도) — WS OR 유지, 백테스트 정합성 미확보", stage);
+                    agg.mark_or_refresh_failed(stage).await;
+                }
+            }
+        });
+    }
+
     // 자동매매 자동 시작 (KIS 클라이언트 초기화 대기 후)
     {
         let mgr = strategy_manager.clone();
@@ -586,7 +706,8 @@ async fn run_server(config: AppConfig) {
         });
     }
 
-    // 앱 상태
+    // 앱 상태 (shutdown handler용 clone을 먼저 확보)
+    let shutdown_mgr = strategy_manager.clone();
     let state = AppState {
         market_data: market_data_service,
         trading: trading_service,
@@ -622,7 +743,37 @@ async fn run_server(config: AppConfig) {
     info!("서버 시작: http://{addr}");
     info!("API 문서: http://{addr}/api/v1/health");
 
+    // Graceful shutdown: SIGINT/SIGTERM 수신 시 모든 러너에 stop 신호 전송 후 axum 종료.
+    // taskkill /F, SIGKILL 등 OS 레벨 강제 종료는 처리 불가 (재시작 시 cancel_all_pending_orders로 복구).
+    let shutdown_signal = async move {
+        let ctrl_c = async {
+            tokio::signal::ctrl_c().await.expect("SIGINT 핸들러 설치 실패");
+        };
+        #[cfg(unix)]
+        let terminate = async {
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("SIGTERM 핸들러 설치 실패")
+                .recv().await;
+        };
+        #[cfg(not(unix))]
+        let terminate = std::future::pending::<()>();
+
+        tokio::select! {
+            _ = ctrl_c => { info!("SIGINT 수신 — graceful shutdown 시작"); }
+            _ = terminate => { info!("SIGTERM 수신 — graceful shutdown 시작"); }
+        }
+
+        // 1) 모든 러너에 stop 신호 → 체결 대기 루프 즉시 탈출 → cancel 경로 실행
+        shutdown_mgr.stop_all().await;
+        // 2) 러너들이 cancel 완료할 때까지 대기 (체결 대기 30초 + cancel 재시도 여유 = 40초)
+        shutdown_mgr.wait_all_stopped(std::time::Duration::from_secs(40)).await;
+        info!("모든 러너 종료 확인 — axum shutdown 진행");
+    };
+
     axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal)
         .await
         .expect("서버 실행 실패");
+
+    info!("서버 종료 완료");
 }

@@ -1,6 +1,7 @@
 pub mod account;
 pub mod health;
 pub mod market_data;
+pub mod monitoring;
 pub mod strategy;
 pub mod trading;
 
@@ -16,6 +17,7 @@ pub fn create_router(state: AppState) -> Router {
         .merge(trading::routes())
         .merge(account::routes())
         .merge(strategy::routes())
+        .merge(monitoring::routes())
         .merge(super::ws::routes())
         .with_state(state)
 }

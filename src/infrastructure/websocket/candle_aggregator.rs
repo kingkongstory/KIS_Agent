@@ -92,6 +92,8 @@ pub struct CandleAggregator {
     backfill_source: Arc<RwLock<HashMap<String, String>>>,
     /// PostgreSQL 저장소 (실시간 분봉 영속화)
     store: Option<Arc<PostgresStore>>,
+    /// Yahoo OR 교체 실패 단계 (프론트엔드 경고 표시용)
+    or_refresh_failures: Arc<RwLock<Vec<String>>>,
 }
 
 impl CandleAggregator {
@@ -100,6 +102,7 @@ impl CandleAggregator {
             completed: Arc::new(RwLock::new(HashMap::new())),
             backfill_source: Arc::new(RwLock::new(HashMap::new())),
             store: None,
+            or_refresh_failures: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -111,6 +114,16 @@ impl CandleAggregator {
     /// 특정 종목의 완성된 캔들 목록 조회
     pub fn completed_candles(&self) -> Arc<RwLock<HashMap<String, Vec<CompletedCandle>>>> {
         Arc::clone(&self.completed)
+    }
+
+    /// Yahoo OR 교체 실패 기록 (프론트엔드 경고 표시용)
+    pub async fn mark_or_refresh_failed(&self, stage: &str) {
+        self.or_refresh_failures.write().await.push(stage.to_string());
+    }
+
+    /// Yahoo OR 교체 실패 목록 조회
+    pub async fn or_refresh_failures(&self) -> Vec<String> {
+        self.or_refresh_failures.read().await.clone()
     }
 
     /// 종목별 OR 백필 출처 맵 참조 — 프론트 표시용
@@ -314,6 +327,72 @@ impl CandleAggregator {
             self.mark_source(stock_codes, SOURCE_YAHOO).await;
         }
         all_ok
+    }
+
+    /// 장중 Yahoo OR 교체 — OR 구간(09:00~09:30) 캔들을 Yahoo 5분봉으로 강제 교체.
+    ///
+    /// WS 집계 5분봉은 동시호가 데이터를 포함하지 않아 OR OHLC가 백테스트(Yahoo)와 다를 수 있음.
+    /// 이 메서드는 OR 구간만 Yahoo로 교체하고, 09:30 이후 WS 캔들은 유지.
+    /// 비동기 fire-and-forget으로 호출되며, 실패해도 기존 WS OR이 유지됨 (안전망).
+    pub async fn refresh_or_from_yahoo(&self, stock_codes: &[&str]) -> bool {
+        let Some(ref store) = self.store else { return false };
+
+        let collector = YahooMinuteCollector::new(Arc::clone(store));
+        let mut any_replaced = false;
+
+        for code in stock_codes {
+            // Yahoo 5분봉 수집 → DB 저장
+            match collector.collect(code, "5m", "1d", 5).await {
+                Ok(n) if n > 0 => info!("{}: Yahoo OR 교체용 {}건 수집", code, n),
+                Ok(_) => { warn!("{}: Yahoo OR 교체 — 응답 0건, WS 유지", code); continue; }
+                Err(e) => { warn!("{}: Yahoo OR 교체 실패: {e}, WS 유지", code); continue; }
+            }
+
+            // DB에서 5분봉 리로드 → OR 구간(09:00~09:30)만 강제 교체
+            let today = Local::now().date_naive();
+            let start = today.and_hms_opt(9, 0, 0).unwrap();
+            let end = today.and_hms_opt(15, 30, 0).unwrap();
+            let or_cutoff = "09:30"; // 이 시각까지 Yahoo 우선
+
+            match store.get_minute_ohlcv(code, start, end, 5).await {
+                Ok(candles) if !candles.is_empty() => {
+                    let bars: Vec<CompletedCandle> = candles.iter().map(|c| CompletedCandle {
+                        stock_code: code.to_string(),
+                        time: format!("{:02}:{:02}", c.datetime.time().hour(), c.datetime.time().minute()),
+                        open: c.open, high: c.high, low: c.low, close: c.close,
+                        volume: c.volume as u64,
+                        is_realtime: false,
+                    }).collect();
+
+                    let mut completed = self.completed.write().await;
+                    let existing = completed.entry(code.to_string()).or_default();
+                    let mut replaced = 0;
+                    for bar in &bars {
+                        if bar.time.as_str() <= or_cutoff {
+                            // OR 구간: WS 캔들 제거 → Yahoo로 교체
+                            let before = existing.len();
+                            existing.retain(|e| e.time != bar.time);
+                            if existing.len() < before { replaced += 1; }
+                            existing.push(bar.clone());
+                        }
+                        // 09:30 이후: WS 있으면 유지, 없으면 Yahoo 추가 (기존 로직)
+                        else if !existing.iter().any(|e| e.time == bar.time && e.is_realtime) {
+                            existing.retain(|e| e.time != bar.time);
+                            existing.push(bar.clone());
+                        }
+                    }
+                    existing.sort_by(|a, b| a.time.cmp(&b.time));
+                    info!("{}: Yahoo OR 교체 완료 — {}건 교체 (09:00~09:30)", code, replaced);
+                    if replaced > 0 { any_replaced = true; }
+                }
+                _ => warn!("{}: Yahoo OR 교체 — DB 리로드 실패, WS 유지", code),
+            }
+        }
+
+        if any_replaced {
+            self.mark_source(stock_codes, SOURCE_YAHOO).await;
+        }
+        any_replaced
     }
 
     /// 네이버 금융에서 당일 분봉 보충 (fallback 전용, 1분 close-only → OHLC 동일)

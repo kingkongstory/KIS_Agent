@@ -15,8 +15,9 @@ use crate::domain::ports::realtime::RealtimeData;
 use crate::domain::types::{StockCode, TransactionId};
 use crate::infrastructure::cache::postgres_store::PostgresStore;
 use crate::infrastructure::kis_client::http_client::{HttpMethod, KisHttpClient, KisResponse};
+use crate::infrastructure::monitoring::event_logger::EventLogger;
 use crate::infrastructure::websocket::candle_aggregator::{CandleAggregator, CompletedCandle};
-use crate::strategy::live_runner::LiveRunner;
+use crate::strategy::live_runner::{LiveRunner, PositionLockState};
 
 /// 종목별 전략 실행 상태
 #[derive(Debug, Clone, Serialize)]
@@ -34,6 +35,8 @@ pub struct StrategyStatus {
     pub or_stages: Vec<(String, i64, i64)>,
     /// OR 백필 데이터 출처: "ws" / "yahoo" / "naver" / None (미수집)
     pub or_source: Option<String>,
+    /// Yahoo OR 교체 실패 단계 (빈 배열이면 정상)
+    pub or_refresh_warnings: Vec<String>,
     /// 전략 파라미터 요약
     pub params: StrategyParams,
 }
@@ -67,7 +70,9 @@ pub struct StrategyManager {
     /// OR 백필 출처 조회 + 수동 리프레시용
     candle_aggregator: Option<Arc<CandleAggregator>>,
     /// 공유 포지션 잠금: 한 종목이 포지션 보유 중이면 다른 종목 진입 차단
-    active_position_lock: Arc<RwLock<Option<String>>>,
+    active_position_lock: Arc<RwLock<PositionLockState>>,
+    /// 운영 이벤트 로거 (fire-and-forget 비동기 DB 저장)
+    pub event_logger: Option<Arc<EventLogger>>,
 }
 
 impl StrategyManager {
@@ -87,6 +92,7 @@ impl StrategyManager {
                 or_low: None,
                 or_stages: Vec::new(),
                 or_source: None,
+                or_refresh_warnings: Vec::new(),
                 params: StrategyParams {
                     rr_ratio: cfg.rr_ratio,
                     trailing_r: cfg.trailing_r,
@@ -104,8 +110,13 @@ impl StrategyManager {
             db_store: None,
             ws_candles: None,
             candle_aggregator: None,
-            active_position_lock: Arc::new(RwLock::new(None)),
+            active_position_lock: Arc::new(RwLock::new(PositionLockState::Free)),
+            event_logger: None,
         }
+    }
+
+    pub fn set_event_logger(&mut self, logger: Arc<EventLogger>) {
+        self.event_logger = Some(logger);
     }
 
     /// 활성 자동매매 러너가 있는지 확인
@@ -311,8 +322,10 @@ impl StrategyManager {
                     match r.into_result() {
                         Ok(info) => {
                             let api_qty = info.orderable_qty() as u64;
-                            info!("{}: 현재가 {}원, 주문가능금액 {}원, 주문가능수량 {}주 (증거금율 반영)",
-                                name, price, info.orderable_cash(), api_qty);
+                            info!("{}: 매수가능조회 상세 — ord_psbl_cash={}, nrcvb_buy_amt={}, nrcvb_buy_qty={}, max_buy_amt={}, max_buy_qty={}",
+                                name, info.ord_psbl_cash, info.nrcvb_buy_amt, info.nrcvb_buy_qty, info.max_buy_amt, info.max_buy_qty);
+                            info!("{}: 현재가 {}원, 주문가능수량 {}주",
+                                name, price, api_qty);
                             api_qty
                         }
                         Err(e) => {
@@ -350,6 +363,9 @@ impl StrategyManager {
             runner = runner.with_ws_candles(Arc::clone(candles));
         }
         runner = runner.with_position_lock(Arc::clone(&self.active_position_lock));
+        if let Some(ref el) = self.event_logger {
+            runner = runner.with_event_logger(Arc::clone(el));
+        }
 
         let stop_notify = runner.stop_notify();
         let runner_state = runner.state.clone();
@@ -366,6 +382,7 @@ impl StrategyManager {
 
         // 백그라운드 태스크로 러너 실행
         let code_cleanup = code.to_string();
+        let db_for_report = self.db_store.clone();
         tokio::spawn(async move {
             let mut runner = runner;
             match runner.run().await {
@@ -393,6 +410,17 @@ impl StrategyManager {
             }
             // 러너 종료 후 핸들 제거 (재시작 허용)
             runners_cleanup.write().await.remove(&code_cleanup);
+
+            // 모든 러너 종료 시 일일 결산 리포트 자동 생성 (비동기, fire-and-forget)
+            if runners_cleanup.read().await.is_empty() {
+                if let Some(store) = db_for_report {
+                    let today = chrono::Local::now().date_naive();
+                    let reporter = crate::infrastructure::monitoring::daily_report::DailyReportGenerator::new(
+                        store.pool().clone(),
+                    );
+                    tokio::spawn(async move { reporter.generate(today).await });
+                }
+            }
         });
 
         // 상태 업데이트 태스크 (3초마다 러너 상태 → 웹 상태 동기화)
@@ -431,6 +459,35 @@ impl StrategyManager {
             handle.stop_notify.notify_waiters(); // sleep 즉시 깨움
         }
     }
+
+    /// 모든 러너에 중지 신호 전송 — 체결 대기 루프/신호 탐색 sleep 즉시 탈출.
+    /// Graceful shutdown 경로에서 호출된다.
+    pub async fn stop_all(&self) {
+        let runners = self.runners.read().await;
+        for (code, handle) in runners.iter() {
+            info!("{}: graceful shutdown — stop 신호 전송", code);
+            handle.stop_flag.store(true, Ordering::Relaxed);
+            handle.stop_notify.notify_waiters();
+        }
+    }
+
+    /// 모든 러너가 종료될 때까지 대기 (러너가 runners 맵에서 제거되는 것 기준).
+    /// 타임아웃 도달 시 경고 후 반환.
+    pub async fn wait_all_stopped(&self, timeout: std::time::Duration) {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let remaining_count = self.runners.read().await.len();
+            if remaining_count == 0 {
+                info!("graceful shutdown — 모든 러너 정상 종료");
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                warn!("graceful shutdown timeout — {}개 러너 종료 대기 포기", remaining_count);
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -446,10 +503,12 @@ async fn get_status(State(state): State<AppState>) -> Json<Vec<StrategyStatus>> 
     };
     list.sort_by(|a, b| b.code.cmp(&a.code));
 
-    // aggregator로부터 실효 출처 덮어쓰기
+    // aggregator로부터 실효 출처 + OR 교체 실패 상태 덮어쓰기
     if let Some(ref agg) = state.strategy_manager.candle_aggregator {
+        let failures = agg.or_refresh_failures().await;
         for status in list.iter_mut() {
             status.or_source = agg.effective_source(&status.code).await;
+            status.or_refresh_warnings = failures.clone();
         }
     }
 
@@ -525,7 +584,7 @@ async fn start_strategy(
         code: req.code, name: String::new(), active: false,
         state: "오류".to_string(), today_trades: 0, today_pnl: 0.0,
         message: "종목 없음".to_string(),
-        or_high: None, or_low: None, or_stages: Vec::new(), or_source: None,
+        or_high: None, or_low: None, or_stages: Vec::new(), or_source: None, or_refresh_warnings: Vec::new(),
         params: StrategyParams {
             rr_ratio: cfg.rr_ratio, trailing_r: cfg.trailing_r,
             breakeven_r: cfg.breakeven_r, max_daily_trades: cfg.max_daily_trades,
@@ -553,7 +612,7 @@ async fn stop_strategy(
             code: req.code, name: String::new(), active: false,
             state: "오류".to_string(), today_trades: 0, today_pnl: 0.0,
             message: "종목 없음".to_string(),
-            or_high: None, or_low: None, or_stages: Vec::new(), or_source: None,
+            or_high: None, or_low: None, or_stages: Vec::new(), or_source: None, or_refresh_warnings: Vec::new(),
             params: StrategyParams {
                 rr_ratio: cfg.rr_ratio, trailing_r: cfg.trailing_r,
                 breakeven_r: cfg.breakeven_r, max_daily_trades: cfg.max_daily_trades,
