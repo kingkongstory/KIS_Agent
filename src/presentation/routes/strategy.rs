@@ -657,12 +657,178 @@ async fn get_trades(State(state): State<AppState>) -> Json<Vec<TradeRow>> {
     Json(rows)
 }
 
+/// 당일 FVG 요약 (웹 패널용).
+/// `event_log` 의 `entry_signal` / `abort_entry` / `drift_rejected` 이벤트를 집계하여
+/// 각 FVG(= unique `b_time` 기준) 의 최종 상태와 FVG 품질 메타데이터를 반환한다.
+#[derive(Debug, Clone, Serialize)]
+pub struct FvgSummary {
+    pub stock_code: String,
+    pub stage: String,
+    pub side: String,
+    pub b_time: String,
+    pub signal_time: String,
+    pub gap_top: i64,
+    pub gap_bottom: i64,
+    pub gap_size_pct: f64,
+    pub b_body_ratio: f64,
+    pub or_breakout_pct: f64,
+    pub b_volume: i64,
+    /// 진입 가격 (지정가). Long=gap.top, Short=gap.bottom.
+    pub entry_price: i64,
+    pub stop_loss: i64,
+    pub take_profit: i64,
+    /// 최종 상태: pending / aborted / drift_rejected / filled
+    pub state: String,
+    /// abort_entry 의 reason (fill_timeout_or_cutoff / drift_exceeded / preempted / price_fetch_failed / vi_halted / api_error_retry_failed)
+    pub reason: Option<String>,
+    /// drift_rejected 이벤트의 drift %
+    pub drift_pct: Option<f64>,
+    /// 신호 시점 현재가 (drift 가드 활성 시 기록됨)
+    pub current_price_at_signal: Option<i64>,
+    /// 이벤트 수신 수 (동일 FVG 가 몇 번 abort 시도됐는지)
+    pub event_count: i64,
+    /// 가장 최근 이벤트 시각
+    pub latest_event_at: chrono::DateTime<chrono::Local>,
+}
+
+/// GET /api/v1/strategy/fvgs?date=YYYY-MM-DD — 당일(또는 지정일) FVG 요약 목록
+async fn get_fvgs(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Json<Vec<FvgSummary>> {
+    let Some(ref pool) = state.db_pool else {
+        return Json(Vec::new());
+    };
+
+    // date 파라미터 (기본: 오늘)
+    let date_filter = params
+        .get("date")
+        .cloned()
+        .unwrap_or_else(|| chrono::Local::now().format("%Y-%m-%d").to_string());
+
+    // event_log 에서 FVG 관련 이벤트를 b_time 으로 그룹화.
+    // 동일 FVG(b_time) 에 대해 여러 이벤트(entry_signal 반복, drift_rejected, abort_entry)가 있을 수 있음.
+    // 최신 이벤트의 metadata 를 대표로 사용하되 상태는 우선순위로 결정.
+    // 상태 우선순위: drift_rejected > aborted(abort_entry 의 fill_timeout 등) > pending(entry_signal 만)
+    let rows: Vec<(
+        String,                                         // stock_code
+        String,                                         // event_type
+        String,                                         // severity
+        serde_json::Value,                              // metadata
+        chrono::DateTime<chrono::Local>,                // event_time
+    )> = sqlx::query_as(
+        "SELECT stock_code, event_type, severity, metadata, event_time
+         FROM event_log
+         WHERE event_time::date = $1::date
+           AND event_type IN ('entry_signal', 'abort_entry', 'drift_rejected')
+         ORDER BY event_time ASC",
+    )
+    .bind(&date_filter)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    // (stock_code, b_time) 키로 그룹화
+    let mut groups: std::collections::HashMap<(String, String), Vec<(String, String, serde_json::Value, chrono::DateTime<chrono::Local>)>> =
+        std::collections::HashMap::new();
+
+    for (stock_code, event_type, severity, metadata, event_time) in rows {
+        let b_time = metadata
+            .get("b_time")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if b_time.is_empty() {
+            continue;
+        }
+        groups
+            .entry((stock_code.clone(), b_time))
+            .or_default()
+            .push((event_type, severity, metadata, event_time));
+    }
+
+    // 그룹별로 FvgSummary 생성
+    let mut summaries: Vec<FvgSummary> = Vec::new();
+    for ((stock_code, _), events) in groups.iter() {
+        // 마지막 이벤트의 metadata 를 기준으로 필드 채움 (signal_time 등은 동일)
+        let Some((_, _, latest_meta, latest_time)) = events.last() else {
+            continue;
+        };
+
+        // 상태 결정 (우선순위: drift_rejected > abort_entry > entry_signal)
+        let has_drift = events.iter().any(|(et, _, _, _)| et == "drift_rejected");
+        let has_abort = events.iter().any(|(et, _, _, _)| et == "abort_entry");
+
+        let state = if has_drift {
+            "drift_rejected".to_string()
+        } else if has_abort {
+            "aborted".to_string()
+        } else {
+            "pending".to_string()
+        };
+
+        // abort_entry 의 reason (마지막 abort 기준)
+        let reason = events
+            .iter()
+            .rev()
+            .find(|(et, _, _, _)| et == "abort_entry")
+            .and_then(|(_, _, m, _)| m.get("reason").and_then(|r| r.as_str()).map(String::from));
+
+        // drift_pct (drift_rejected 이벤트가 있으면 그 metadata 사용)
+        let drift_pct = events
+            .iter()
+            .rev()
+            .find(|(et, _, _, _)| et == "drift_rejected")
+            .and_then(|(_, _, m, _)| m.get("drift").and_then(|v| v.as_f64()))
+            .map(|v| v * 100.0);
+
+        let as_i64 = |k: &str| latest_meta.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
+        let as_f64 = |k: &str| latest_meta.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let as_str = |k: &str| {
+            latest_meta
+                .get(k)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        let as_opt_i64 = |k: &str| latest_meta.get(k).and_then(|v| v.as_i64());
+
+        summaries.push(FvgSummary {
+            stock_code: stock_code.clone(),
+            stage: as_str("stage"),
+            side: as_str("side"),
+            b_time: as_str("b_time"),
+            signal_time: as_str("signal_time"),
+            gap_top: as_i64("gap_top"),
+            gap_bottom: as_i64("gap_bottom"),
+            gap_size_pct: as_f64("gap_size_pct") * 100.0,
+            b_body_ratio: as_f64("b_body_ratio"),
+            or_breakout_pct: as_f64("or_breakout_pct") * 100.0,
+            b_volume: as_i64("b_volume"),
+            entry_price: as_i64("entry"),
+            stop_loss: as_i64("sl"),
+            take_profit: as_i64("tp"),
+            state,
+            reason,
+            drift_pct,
+            current_price_at_signal: as_opt_i64("current_price"),
+            event_count: events.len() as i64,
+            latest_event_at: *latest_time,
+        });
+    }
+
+    // 최신 이벤트 기준 내림차순
+    summaries.sort_by(|a, b| b.latest_event_at.cmp(&a.latest_event_at));
+    Json(summaries)
+}
+
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/v1/strategy/status", get(get_status))
         .route("/api/v1/strategy/start", post(start_strategy))
         .route("/api/v1/strategy/stop", post(stop_strategy))
         .route("/api/v1/strategy/trades", get(get_trades))
+        .route("/api/v1/strategy/fvgs", get(get_fvgs))
         .route(
             "/api/v1/strategy/refresh-or-backfill",
             post(refresh_or_backfill),

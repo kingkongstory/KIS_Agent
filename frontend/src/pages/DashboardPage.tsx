@@ -3,6 +3,7 @@ import { MinuteCandleChart } from '../components/chart/MinuteCandleChart';
 import { StockPriceCard } from '../components/stock/StockPriceCard';
 import { StrategyPanel } from '../components/strategy/StrategyPanel';
 import { TradeLog } from '../components/strategy/TradeLog';
+import { FVGPanel } from '../components/strategy/FVGPanel';
 import { AccountSummary } from '../components/account/AccountSummary';
 import { useStockStore, STOCK_CODES } from '../stores/stockStore';
 import { useWsStore } from '../stores/wsStore';
@@ -53,6 +54,8 @@ export function DashboardPage() {
         <StrategyPanel />
         <TradeLog />
       </div>
+      {/* FVG 탐지 현황 (신호/중단/drift 이탈 실시간 요약) */}
+      <FVGPanel />
       {/* 두 종목 가격 카드 */}
       <div className="grid grid-cols-2 gap-4">
         <StockPriceCard index={0} />
