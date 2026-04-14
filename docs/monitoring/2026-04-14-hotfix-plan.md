@@ -1,5 +1,51 @@
 # 2026-04-14 라이브 러너 거래 0건 사고 — 대응 계획 (v2, 리뷰 반영)
 
+## 진행 상태 요약 (업데이트: 2026-04-15)
+
+### ✅ 완료
+
+| 날짜 | 커밋 | 내용 |
+|---|---|---|
+| 2026-04-14 | `3dcae15` | 장중 대규모 변경 (지정가 매수 전환, 2단계 포지션 잠금, 모니터링 UI) |
+| 2026-04-14 밤 | `89a3911` | **1차 핫픽스** — P0 `search_after` 전진 / `abort_entry` 헬퍼 / 반복 발주 안전장치 / `KisError::Preempted` variant / `LiveRunnerConfig` + P1 placeholder |
+| 2026-04-15 새벽 | `f0a7cde` | **2차 핫픽스** — `BestSignal` FVG 메타데이터 확장 (gap_top/bottom, gap_size_pct, b_body_ratio, or_breakout_pct, b_volume, b_close, a_range, b_time) / `abort_entry` 시그니처 변경(`&BestSignal` 받음) / `ws_reconnect` 실제 로깅 (`KisWebSocketClient.with_event_logger`) / `api_error` 실제 로깅 (`KisHttpClient.set_event_logger` OnceLock) / `save_trade`·`save_active_position` 3회 재시도 + 실패 시 critical 이벤트 raw 덤프 |
+| 2026-04-15 새벽 | `b2e9b5c` | **FVG 실시간 패널** — `GET /api/v1/strategy/fvgs` 엔드포인트 + 프론트엔드 `FVGPanel.tsx` (상태별 배지, 10s polling, WS 현재가 연동 drift 실시간 계산). DashboardPage 상단 3칸 아래 배치 |
+
+### 🔄 진행 중 / 대기
+
+- **Day+1 (내일 거래일, 2026-04-16)** — 새 바이너리 + 패널 실전 관찰
+  - 관찰 지표: `entry_signal` 누적 수, `abort_entry` 사유별 분포, 동일 FVG 반복 발주 0 확인, FVG 메타데이터 JSON 확인
+  - `repeated_order` critical 이벤트 **발동 없음** (없어야 정상)
+- **Day+2** — `LiveRunnerConfig.max_entry_drift_pct = Some(0.005)` 활성화 판단 (관찰 결과 기반)
+- **Day+7** — P2 WebSocket backfill 재설계 (TPS 고려: 60~90s 쓰로틀, 1 페이지, aggregator 주입)
+
+### 📋 후속 티켓 (Day+30+)
+
+| 티켓 | 작업 |
+|---|---|
+| A | `query_execution` 재시도 2~3회 + 500ms backoff |
+| B | P3 단기 — 잔고 API 교차검증 (A 완료 후 `inquire-balance` 안정성 데이터 수집 후) |
+| C | P3 장기 — AES 핸드셰이크 (approval_key 응답 파싱·저장·복호) |
+| D | 백테스트 `scan_and_trade` 보수화 (zone × body 교집합) |
+| E | 지정가 정책 재검토 (mid_price 기본 + zone 이탈 시 IOC slippage 하이브리드) |
+| F | FVG 상태 머신 + tick-driven entry v2 엔진 |
+| G | Regression test harness (2026-04-14 replay assert) |
+| H | `/monitoring` 라우트에 daily event 카운트 UI |
+
+### 🆕 신규 제안 (2026-04-15 KIS WebSocket 조사 결과)
+
+현재 전역 WS 구독 7건/41건 한도. 여유 34건.
+
+**수익 분석 관점 상위 3개 TR 추가 (각 2종목 × 1~2건)**:
+
+1. **KOSPI 200 지수 실시간 체결** — 122630(KOSPI 2배 레버리지) 방향성 필터. "지수 역행 FVG 감지" 기록 → 실패 FVG의 공통 특성 검증.
+2. **장시작 예상체결가 (08:30~09:00)** — 당일 갭 조기 파악. 전일 종가 기반 백필의 한계 보완.
+3. **프로그램매매 실시간** — 기관 매도 쇄도 구간의 FVG = 가짜 신호 가능성 높음. `event_log` 보조 플래그.
+
+**선행 작업**: 공식 KIS Excel 명세(`apiportal.koreainvestment.com`)에서 **정확한 TR ID 확정** 필요. Python 예제 기반 TR ID는 추정치.
+
+---
+
 ## Context
 
 2026-04-14 장에서 122630(KODEX 레버리지)가 OR 상향 돌파 후 +2.9%까지 상승한 추세장이었으나 **거래 0건**. 동일 FVG(gap [94,300, 94,460])에 대해 `entry=94,465` 지정가가 **282회** 발주·미체결·취소 반복. 현재가 95,520원(괴리 1,055원) 상태에서도 같은 지정가를 발주한 구조 결함.
