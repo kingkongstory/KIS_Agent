@@ -571,15 +571,31 @@ async fn run_server(config: AppConfig) {
     // 실시간 데이터 채널
     let (realtime_tx, _) = broadcast::channel::<RealtimeData>(1024);
 
+    // 운영 이벤트 로거 (fire-and-forget 비동기 DB 저장).
+    // WebSocket 재연결, API 에러 등 system 이벤트를 기록하려면 이 시점에 먼저 만들어야 함.
+    let event_logger = pg_store.as_ref().map(|store| {
+        Arc::new(kis_agent::infrastructure::monitoring::event_logger::EventLogger::new(
+            store.pool().clone(),
+        ))
+    });
+    // HTTP 클라이언트에 사후 주입 (api_error 이벤트 기록 활성화)
+    if let Some(ref el) = event_logger {
+        http_client.set_event_logger(Arc::clone(el));
+    }
+
     // KIS WebSocket 실시간 스트리밍 (체결 + 호가)
     {
         use kis_agent::infrastructure::websocket::connection::KisWebSocketClient;
 
-        let ws_client = Arc::new(KisWebSocketClient::new(
+        let mut ws_client = KisWebSocketClient::new(
             Arc::clone(&token_manager),
             config.environment,
             realtime_tx.clone(),
-        ));
+        );
+        if let Some(ref el) = event_logger {
+            ws_client = ws_client.with_event_logger(Arc::clone(el));
+        }
+        let ws_client = Arc::new(ws_client);
 
         // 대상 종목 구독 등록 (연결 시 자동 전송)
         let sub_mgr = ws_client.subscription_manager();
@@ -626,13 +642,6 @@ async fn run_server(config: AppConfig) {
         (candles, aggregator)
     };
     let (ws_candles, candle_aggregator) = ws_candles;
-
-    // 운영 이벤트 로거 (fire-and-forget 비동기 DB 저장)
-    let event_logger = pg_store.as_ref().map(|store| {
-        Arc::new(kis_agent::infrastructure::monitoring::event_logger::EventLogger::new(
-            store.pool().clone(),
-        ))
-    });
 
     // 전략 관리자 (스케줄러와 AppState 공유)
     let strategy_manager = {

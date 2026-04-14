@@ -141,6 +141,10 @@ pub struct LiveRunnerConfig {
 ///
 /// `signal_time` 은 FVG 리트레이스가 확인된 5분봉 시각(`c5.time`).
 /// `abort_entry` 로 진입 포기 시 search_after 를 이 시각으로 전진하여 같은 FVG 재감지를 차단한다.
+///
+/// FVG 메타데이터는 수익 분석용:
+/// - 어떤 gap 크기/돌파 강도/거래량의 FVG가 체결·수익을 냈는지 `trades` 와 조인하여 분석.
+/// - `abort_entry` 이벤트에도 같은 메타데이터를 붙여, 버려진 FVG의 가상 성과 사후 계산에 활용.
 #[derive(Debug, Clone)]
 struct BestSignal {
     side: PositionSide,
@@ -149,6 +153,40 @@ struct BestSignal {
     take_profit: i64,
     stage_name: &'static str,
     signal_time: NaiveTime,
+    // FVG 품질 지표
+    gap_top: i64,
+    gap_bottom: i64,
+    gap_size_pct: f64,      // (top - bottom) / bottom
+    b_body_ratio: f64,      // b.body_size() / a.range()
+    or_breakout_pct: f64,   // (b.close - or_high) / or_high (Long) / (or_low - b.close) / or_low (Short)
+    b_volume: u64,
+    b_close: i64,
+    a_range: i64,
+    b_time: NaiveTime,      // FVG 형성 B 캔들 시각
+}
+
+impl BestSignal {
+    /// entry_signal / abort_entry 이벤트의 공통 metadata JSON.
+    fn to_event_metadata(&self, current_price: Option<i64>) -> serde_json::Value {
+        serde_json::json!({
+            "stage": self.stage_name,
+            "side": format!("{:?}", self.side),
+            "entry": self.entry_price,
+            "sl": self.stop_loss,
+            "tp": self.take_profit,
+            "signal_time": self.signal_time.to_string(),
+            "b_time": self.b_time.to_string(),
+            "gap_top": self.gap_top,
+            "gap_bottom": self.gap_bottom,
+            "gap_size_pct": self.gap_size_pct,
+            "b_body_ratio": self.b_body_ratio,
+            "or_breakout_pct": self.or_breakout_pct,
+            "b_volume": self.b_volume,
+            "b_close": self.b_close,
+            "a_range": self.a_range,
+            "current_price": current_price,
+        })
+    }
 }
 
 impl LiveRunner {
@@ -914,7 +952,17 @@ impl LiveRunner {
     ///
     /// lock 순서: `signal_state` write → drop → `position_lock` write.
     /// 두 락을 동시에 보유하지 않아 향후 다른 경로와 데드락 위험 없음.
-    async fn abort_entry(&self, signal_time: NaiveTime, advance_search: bool, reason: &str) {
+    ///
+    /// `sig` 의 FVG 메타데이터는 event_log 에 함께 기록되어 "버려진 FVG 의 사후 분석"
+    /// (가상 성과 계산, 진입 실패 원인별 품질 차이 등) 에 사용된다.
+    async fn abort_entry(
+        &self,
+        sig: &BestSignal,
+        advance_search: bool,
+        reason: &str,
+        current_price: Option<i64>,
+    ) {
+        let signal_time = sig.signal_time;
         if advance_search {
             let mut ss = self.signal_state.write().await;
             let new_after = ss.search_after.map_or(signal_time, |t| t.max(signal_time));
@@ -928,16 +976,18 @@ impl LiveRunner {
             self.stock_name, reason, advance_search
         );
         if let Some(ref el) = self.event_logger {
+            let mut meta = sig.to_event_metadata(current_price);
+            if let Some(obj) = meta.as_object_mut() {
+                obj.insert("advance_search".into(), serde_json::json!(advance_search));
+                obj.insert("reason".into(), serde_json::json!(reason));
+            }
             el.log_event(
                 self.stock_code.as_str(),
                 "strategy",
                 "abort_entry",
                 "info",
                 reason,
-                serde_json::json!({
-                    "signal_time": signal_time.to_string(),
-                    "advance_search": advance_search,
-                }),
+                meta,
             );
         }
     }
@@ -1080,6 +1130,10 @@ impl LiveRunner {
             let mut pending_fvg: Option<FairValueGap> = None;
             let mut fvg_side: Option<PositionSide> = None;
             let mut fvg_formed_idx: usize = 0;
+            // FVG 생성 시점에 캡처된 메타데이터 (수익 분석용).
+            // BestSignal 로 넘기기 전에 리트레이스 확정 순간까지 보존.
+            let mut fvg_meta: Option<(u64, f64, f64, i64, i64, NaiveTime)> = None;
+            // (b_volume, b_body_ratio, or_breakout_pct, b_close, a_range, b_time)
 
             for (idx, c5) in candles_5m.iter().enumerate() {
                 if c5.time >= cfg.entry_cutoff { break; }
@@ -1087,13 +1141,15 @@ impl LiveRunner {
                 if pending_fvg.is_some() && idx - fvg_formed_idx > cfg.fvg_expiry_candles {
                     pending_fvg = None;
                     fvg_side = None;
+                    fvg_meta = None;
                 }
 
                 if pending_fvg.is_none() && idx >= 2 {
                     let a = &candles_5m[idx - 2];
                     let b = &candles_5m[idx - 1];
                     let c = c5;
-                    let a_range = a.range().max(1);
+                    let a_range_raw = a.range();
+                    let a_range = a_range_raw.max(1);
 
                     if b.is_bullish() && a.high < c.low && b.body_size() * 100 >= a_range * 30 {
                         let or_ok = !require_or_breakout || b.close > *or_high;
@@ -1106,6 +1162,19 @@ impl LiveRunner {
                             });
                             fvg_side = Some(PositionSide::Long);
                             fvg_formed_idx = idx;
+                            // FVG 메타데이터 캡처
+                            let b_body_ratio = b.body_size() as f64 / a_range as f64;
+                            let or_breakout_pct = if *or_high > 0 {
+                                (b.close - *or_high) as f64 / *or_high as f64
+                            } else { 0.0 };
+                            fvg_meta = Some((
+                                b.volume,
+                                b_body_ratio,
+                                or_breakout_pct,
+                                b.close,
+                                a_range_raw,
+                                b.time,
+                            ));
                         }
                     }
                 }
@@ -1138,6 +1207,11 @@ impl LiveRunner {
 
                         // 선착순: 이미 다른 단계가 신호를 냈으면 스킵
                         if best_signal.is_none() {
+                            let gap_size_pct = if gap.bottom > 0 {
+                                (gap.top - gap.bottom) as f64 / gap.bottom as f64
+                            } else { 0.0 };
+                            let (b_volume, b_body_ratio, or_breakout_pct, b_close, a_range, b_time) =
+                                fvg_meta.unwrap_or((0u64, 0.0, 0.0, 0i64, 0i64, c5.time));
                             best_signal = Some(BestSignal {
                                 side,
                                 entry_price,
@@ -1145,6 +1219,15 @@ impl LiveRunner {
                                 take_profit,
                                 stage_name,
                                 signal_time: c5.time,
+                                gap_top: gap.top,
+                                gap_bottom: gap.bottom,
+                                gap_size_pct,
+                                b_body_ratio,
+                                or_breakout_pct,
+                                b_volume,
+                                b_close,
+                                a_range,
+                                b_time,
                             });
                         }
                         break; // 이 단계에서 첫 신호 찾으면 종료
@@ -1155,7 +1238,14 @@ impl LiveRunner {
 
         // 선착순으로 선택된 신호로 진입
         if let Some(sig) = best_signal {
-            let BestSignal { side, entry_price, stop_loss, take_profit, stage_name, signal_time } = sig;
+            // 필드 참조 (sig 자체는 abort_entry 에 전달할 수 있도록 scope 유지)
+            let side = sig.side;
+            let entry_price = sig.entry_price;
+            let stop_loss = sig.stop_loss;
+            let take_profit = sig.take_profit;
+            let stage_name = sig.stage_name;
+            let signal_time = sig.signal_time;
+            let _ = signal_time; // (사용 없음 — abort_entry 가 sig.signal_time 사용)
 
             // 공유 포지션 잠금 (2단계: Pending → Held)
             if let Some(ref lock) = self.position_lock {
@@ -1196,14 +1286,19 @@ impl LiveRunner {
             if self.state.read().await.market_halted {
                 warn!("{}: VI 발동 중 — 진입 보류", self.stock_name);
                 // FVG 자체는 유효 — search_after 전진 금지
-                self.abort_entry(signal_time, false, "vi_halted").await;
+                self.abort_entry(&sig, false, "vi_halted", None).await;
                 return Ok(false);
             }
+
+            // 신호 시점 현재가 (entry_signal 이벤트 및 drift 가드 공통 사용).
+            // drift 가드가 켜졌으면 확보됨, 꺼졌으면 None.
+            let mut current_price_at_signal: Option<i64> = None;
 
             // P1: FVG zone 이탈 가드 (Day+0 배포 시 max_entry_drift_pct=None 이면 스킵)
             if let Some(threshold) = self.live_cfg.max_entry_drift_pct {
                 match self.get_current_price().await {
                     Ok(cur) => {
+                        current_price_at_signal = Some(cur);
                         let drift = match side {
                             PositionSide::Long => (cur - entry_price) as f64 / entry_price as f64,
                             PositionSide::Short => (entry_price - cur) as f64 / entry_price as f64,
@@ -1214,17 +1309,18 @@ impl LiveRunner {
                                 self.stock_name, cur, entry_price, drift * 100.0, threshold * 100.0
                             );
                             if let Some(ref el) = self.event_logger {
+                                let mut meta = sig.to_event_metadata(Some(cur));
+                                if let Some(obj) = meta.as_object_mut() {
+                                    obj.insert("drift".into(), serde_json::json!(drift));
+                                    obj.insert("threshold".into(), serde_json::json!(threshold));
+                                }
                                 el.log_event(
                                     self.stock_code.as_str(), "strategy", "drift_rejected", "warn",
                                     &format!("drift={:.3}% > {:.3}%", drift * 100.0, threshold * 100.0),
-                                    serde_json::json!({
-                                        "current": cur, "entry": entry_price,
-                                        "drift": drift, "threshold": threshold,
-                                        "stage": stage_name,
-                                    }),
+                                    meta,
                                 );
                             }
-                            self.abort_entry(signal_time, true, "drift_exceeded").await;
+                            self.abort_entry(&sig, true, "drift_exceeded", Some(cur)).await;
                             return Ok(false);
                         }
                     }
@@ -1232,7 +1328,7 @@ impl LiveRunner {
                         // fail-close: 현재가 모르면 지정가 발주 자체가 위험.
                         // 단, 일시 장애이므로 search_after 전진은 안 함.
                         warn!("{}: 현재가 조회 실패 — 진입 포기: {e}", self.stock_name);
-                        self.abort_entry(signal_time, false, "price_fetch_failed").await;
+                        self.abort_entry(&sig, false, "price_fetch_failed", None).await;
                         return Ok(false);
                     }
                 }
@@ -1241,9 +1337,11 @@ impl LiveRunner {
             info!("{}: [{}] {:?} 진입 신호 — entry={}, SL={}, TP={}",
                 self.stock_name, stage_name, side, entry_price, stop_loss, take_profit);
             if let Some(ref el) = self.event_logger {
-                el.log_event(self.stock_code.as_str(), "strategy", "entry_signal", "info",
+                el.log_event(
+                    self.stock_code.as_str(), "strategy", "entry_signal", "info",
                     &format!("[{}] {:?} entry={}, SL={}, TP={}", stage_name, side, entry_price, stop_loss, take_profit),
-                    serde_json::json!({"stage": stage_name, "side": format!("{:?}", side), "entry": entry_price, "sl": stop_loss, "tp": take_profit}));
+                    sig.to_event_metadata(current_price_at_signal),
+                );
             }
 
             // 주문 실행 (API 에러만 재시도, 미체결은 재시도 불필요)
@@ -1251,7 +1349,7 @@ impl LiveRunner {
                 Ok(_) => return Ok(true),
                 Err(KisError::Preempted) => {
                     // 다른 종목 선점 요청으로 양보. FVG 자체는 유효 → search_after 전진 금지.
-                    self.abort_entry(signal_time, false, "preempted").await;
+                    self.abort_entry(&sig, false, "preempted", current_price_at_signal).await;
                     return Ok(false);
                 }
                 Err(e) if e.is_retryable() => {
@@ -1262,13 +1360,13 @@ impl LiveRunner {
                     match self.execute_entry(side, entry_price, stop_loss, take_profit).await {
                         Ok(_) => return Ok(true),
                         Err(KisError::Preempted) => {
-                            self.abort_entry(signal_time, false, "preempted_on_retry").await;
+                            self.abort_entry(&sig, false, "preempted_on_retry", current_price_at_signal).await;
                             return Ok(false);
                         }
                         Err(e2) => {
                             error!("{}: 재시도 실패 — 잠금 해제: {e2}", self.stock_name);
                             // API 일시 장애 — search_after 전진 금지 (다음 사이클 자연 재시도)
-                            self.abort_entry(signal_time, false, "api_error_retry_failed").await;
+                            self.abort_entry(&sig, false, "api_error_retry_failed", current_price_at_signal).await;
                             return Ok(false);
                         }
                     }
@@ -1276,7 +1374,7 @@ impl LiveRunner {
                 Err(e) => {
                     // 미체결 취소, 진입 마감 임박 등 — 이 FVG 는 포기 (search_after 전진)
                     info!("{}: 진입 미성사 — 잠금 해제: {e}", self.stock_name);
-                    self.abort_entry(signal_time, true, "fill_timeout_or_cutoff").await;
+                    self.abort_entry(&sig, true, "fill_timeout_or_cutoff", current_price_at_signal).await;
                     return Ok(false);
                 }
             }
@@ -1833,12 +1931,60 @@ impl LiveRunner {
             })
         }; // write lock dropped here
 
-        // DB save (lock 해제 후)
+        // DB save (lock 해제 후) — 3회 재시도.
+        // 이 저장이 실패하면 재시작 시 포지션을 복구할 수 없어 SL/TP 미발동 → 실제 돈 손실 위험.
         if let (Some(store), Some(ap)) = (self.db_store.as_ref(), ap_to_save) {
-            if let Err(e) = store.save_active_position(&ap).await {
-                error!("{}: 활성 포지션 DB 저장 실패 — 재시작 시 복구 불가: {e}", self.stock_name);
-            } else {
-                info!("{}: 활성 포지션 DB 저장 완료", self.stock_name);
+            let mut last_err: Option<String> = None;
+            let mut saved = false;
+            for attempt in 0..3u32 {
+                match store.save_active_position(&ap).await {
+                    Ok(_) => {
+                        info!(
+                            "{}: 활성 포지션 DB 저장 완료{}",
+                            self.stock_name,
+                            if attempt > 0 { format!(" — {}회 재시도 후 성공", attempt) } else { String::new() }
+                        );
+                        saved = true;
+                        break;
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        warn!("{}: 활성 포지션 DB 저장 실패 (시도 {}/3): {msg}", self.stock_name, attempt + 1);
+                        last_err = Some(msg);
+                        if attempt < 2 {
+                            let delay = 500u64 * (1u64 << attempt);
+                            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                        }
+                    }
+                }
+            }
+            if !saved {
+                let err_msg = last_err.unwrap_or_else(|| "unknown".into());
+                error!(
+                    "{}: 활성 포지션 DB 저장 최종 실패 — 재시작 시 복구 불가: {err_msg}",
+                    self.stock_name
+                );
+                if let Some(ref el) = self.event_logger {
+                    el.log_event(
+                        self.stock_code.as_str(),
+                        "storage",
+                        "save_active_position_failed",
+                        "critical",
+                        &format!("활성 포지션 저장 3회 실패: {err_msg}"),
+                        serde_json::json!({
+                            "error": err_msg,
+                            "position": {
+                                "side": ap.side,
+                                "entry_price": ap.entry_price,
+                                "stop_loss": ap.stop_loss,
+                                "take_profit": ap.take_profit,
+                                "quantity": ap.quantity,
+                                "tp_order_no": ap.tp_order_no,
+                                "entry_time": ap.entry_time.to_string(),
+                            }
+                        }),
+                    );
+                }
             }
         }
 
@@ -2036,10 +2182,62 @@ impl LiveRunner {
             exit_slippage: 0, // TP 지정가는 슬리피지 0, SL 시장가는 별도 측정 어려움
             order_to_fill_ms: result.order_to_fill_ms,
         };
-        if let Err(e) = store.save_trade(&record).await {
-            error!("{}: 거래 DB 저장 실패: {e}", self.stock_name);
-        } else {
-            info!("{}: 거래 DB 저장 완료 ({:?} {:.2}%)", self.stock_name, result.exit_reason, result.pnl_pct());
+        // 3회 재시도 (500ms → 1s → 2s).
+        // 거래 기록은 수익 분석의 근본 데이터 — 손실 시 최소한 raw 를 event_log 에 덤프.
+        let mut last_err: Option<String> = None;
+        for attempt in 0..3u32 {
+            match store.save_trade(&record).await {
+                Ok(_) => {
+                    info!(
+                        "{}: 거래 DB 저장 완료 ({:?} {:.2}%){}",
+                        self.stock_name, result.exit_reason, result.pnl_pct(),
+                        if attempt > 0 { format!(" — {}회 재시도 후 성공", attempt) } else { String::new() }
+                    );
+                    return;
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    warn!(
+                        "{}: 거래 DB 저장 실패 (시도 {}/3): {msg}",
+                        self.stock_name, attempt + 1
+                    );
+                    last_err = Some(msg);
+                    if attempt < 2 {
+                        let delay = 500u64 * (1u64 << attempt);
+                        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    }
+                }
+            }
+        }
+        // 3회 실패 — raw data 를 event_log 에 critical 로 덤프 (최후의 복원 수단)
+        let err_msg = last_err.unwrap_or_else(|| "unknown".into());
+        error!("{}: 거래 DB 저장 최종 실패: {err_msg} — event_log 에 raw 덤프", self.stock_name);
+        if let Some(ref el) = self.event_logger {
+            el.log_event(
+                self.stock_code.as_str(),
+                "storage",
+                "save_trade_failed",
+                "critical",
+                &format!("거래 저장 3회 실패: {err_msg}"),
+                serde_json::json!({
+                    "error": err_msg,
+                    "record": {
+                        "side": record.side,
+                        "quantity": record.quantity,
+                        "entry_price": record.entry_price,
+                        "exit_price": record.exit_price,
+                        "stop_loss": record.stop_loss,
+                        "take_profit": record.take_profit,
+                        "entry_time": record.entry_time.to_string(),
+                        "exit_time": record.exit_time.to_string(),
+                        "exit_reason": record.exit_reason,
+                        "pnl_pct": record.pnl_pct,
+                        "intended_entry_price": record.intended_entry_price,
+                        "entry_slippage": record.entry_slippage,
+                        "order_to_fill_ms": record.order_to_fill_ms,
+                    }
+                }),
+            );
         }
     }
 

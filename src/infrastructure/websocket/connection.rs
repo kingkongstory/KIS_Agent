@@ -12,6 +12,7 @@ use crate::domain::error::KisError;
 use crate::domain::ports::realtime::RealtimeData;
 use crate::domain::types::Environment;
 use crate::infrastructure::kis_client::auth::TokenManager;
+use crate::infrastructure::monitoring::event_logger::EventLogger;
 
 /// KIS WebSocket 클라이언트
 pub struct KisWebSocketClient {
@@ -23,6 +24,8 @@ pub struct KisWebSocketClient {
     aes_key: Arc<RwLock<Option<String>>>,
     /// 체결통보 AES 복호화 IV (구독 응답에서 수신)
     aes_iv: Arc<RwLock<Option<String>>>,
+    /// 운영 이벤트 로거 (ws_reconnect 기록용). 주입 안 하면 로깅 생략.
+    event_logger: Option<Arc<EventLogger>>,
 }
 
 impl KisWebSocketClient {
@@ -38,7 +41,14 @@ impl KisWebSocketClient {
             data_tx,
             aes_key: Arc::new(RwLock::new(None)),
             aes_iv: Arc::new(RwLock::new(None)),
+            event_logger: None,
         }
+    }
+
+    /// 이벤트 로거 주입 (`ws_reconnect` 등 system 이벤트를 DB 에 기록).
+    pub fn with_event_logger(mut self, logger: Arc<EventLogger>) -> Self {
+        self.event_logger = Some(logger);
+        self
     }
 
     pub fn subscription_manager(&self) -> Arc<SubscriptionManager> {
@@ -60,6 +70,17 @@ impl KisWebSocketClient {
                     retry_count += 1;
                     if retry_count > max_retries {
                         error!("WebSocket 최대 재시도 횟수 초과: {e}");
+                        if let Some(ref el) = self.event_logger {
+                            el.log_event(
+                                "", "system", "ws_reconnect", "critical",
+                                &format!("최대 재시도 횟수 초과 — 종료: {e}"),
+                                serde_json::json!({
+                                    "retry_count": retry_count,
+                                    "max_retries": max_retries,
+                                    "terminated": true,
+                                }),
+                            );
+                        }
                         break;
                     }
 
@@ -67,6 +88,18 @@ impl KisWebSocketClient {
                     warn!(
                         "WebSocket 연결 실패 (시도 {retry_count}/{max_retries}): {e}, {delay:?} 후 재연결"
                     );
+                    if let Some(ref el) = self.event_logger {
+                        el.log_event(
+                            "", "system", "ws_reconnect", "warn",
+                            &format!("WS 재연결 (시도 {retry_count}/{max_retries}): {e}"),
+                            serde_json::json!({
+                                "retry_count": retry_count,
+                                "max_retries": max_retries,
+                                "delay_ms": delay.as_millis() as u64,
+                                "error": e.to_string(),
+                            }),
+                        );
+                    }
                     sleep(delay).await;
                 }
             }

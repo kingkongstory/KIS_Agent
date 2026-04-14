@@ -117,6 +117,9 @@ pub struct KisHttpClient {
     environment: Environment,
     account_no: String,
     account_product_code: String,
+    /// 운영 이벤트 로거 (api_error 기록용).
+    /// `KisHttpClient` 는 `pg_store` 보다 먼저 생성되는 경우가 있어 `OnceLock` 으로 사후 주입.
+    event_logger: std::sync::OnceLock<Arc<crate::infrastructure::monitoring::event_logger::EventLogger>>,
 }
 
 impl KisHttpClient {
@@ -134,7 +137,16 @@ impl KisHttpClient {
             environment,
             account_no,
             account_product_code,
+            event_logger: std::sync::OnceLock::new(),
         }
+    }
+
+    /// 이벤트 로거 사후 주입. 이미 설정돼 있으면 무시.
+    pub fn set_event_logger(
+        &self,
+        logger: Arc<crate::infrastructure::monitoring::event_logger::EventLogger>,
+    ) {
+        let _ = self.event_logger.set(logger);
     }
 
     /// API 호출 실행 (재시도 포함, 최대 3회)
@@ -162,9 +174,43 @@ impl KisHttpClient {
                         attempt + 1,
                         max_retries
                     );
+                    if let Some(el) = self.event_logger.get() {
+                        el.log_event(
+                            "", "system", "api_error", "warn",
+                            &format!("{:?} {} 실패: {e} (재시도 {}/{})", method, path, attempt + 1, max_retries),
+                            serde_json::json!({
+                                "path": path,
+                                "tr_id": format!("{:?}", tr_id),
+                                "attempt": attempt + 1,
+                                "max_retries": max_retries,
+                                "delay_ms": delay,
+                                "error": e.to_string(),
+                                "retryable": true,
+                            }),
+                        );
+                    }
                     tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    // 재시도 불가 또는 마지막 시도 실패 — 최종 에러로 기록
+                    if let Some(el) = self.event_logger.get() {
+                        let severity = if e.is_retryable() { "error" } else { "warn" };
+                        el.log_event(
+                            "", "system", "api_error", severity,
+                            &format!("{:?} {} 최종 실패: {e}", method, path),
+                            serde_json::json!({
+                                "path": path,
+                                "tr_id": format!("{:?}", tr_id),
+                                "attempt": attempt + 1,
+                                "max_retries": max_retries,
+                                "error": e.to_string(),
+                                "retryable": e.is_retryable(),
+                                "terminal": true,
+                            }),
+                        );
+                    }
+                    return Err(e);
+                }
             }
         }
 
