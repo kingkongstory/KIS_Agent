@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use tracing::info;
@@ -11,11 +13,26 @@ pub struct PostgresStore {
 }
 
 impl PostgresStore {
+    /// 기본 설정으로 연결. 2026-04-16 production-readiness 계획서에 따라 acquire_timeout
+    /// 과 max_connections 를 명시한다. 실전에서 DB 이상 상황이 장시간 대기로 이어지는
+    /// 것을 막고, 풀 고갈로 러너가 뭉치는 것을 방지한다.
     pub async fn new(database_url: &str) -> Result<Self, KisError> {
+        Self::with_pool_options(database_url, 10, Duration::from_secs(5)).await
+    }
+
+    /// 풀 파라미터를 지정해서 연결. 테스트나 운영 튜닝에서 호출.
+    pub async fn with_pool_options(
+        database_url: &str,
+        max_connections: u32,
+        acquire_timeout: Duration,
+    ) -> Result<Self, KisError> {
         // 모든 새 연결에 KST 세션 timezone 강제.
         // sqlx가 NaiveDateTime을 timestamp(naive)로 인코딩 → timestamptz와 비교 시 세션 TZ 사용.
         // 한국 시각 데이터를 다루므로 명시적으로 Asia/Seoul로 고정해야 함.
         let pool = PgPoolOptions::new()
+            .max_connections(max_connections)
+            .acquire_timeout(acquire_timeout)
+            .test_before_acquire(true)
             .after_connect(|conn, _meta| {
                 Box::pin(async move {
                     sqlx::query("SET TIME ZONE 'Asia/Seoul'")
@@ -30,7 +47,10 @@ impl PostgresStore {
 
         let store = Self { pool };
         store.migrate().await?;
-        info!("PostgreSQL 연결 완료");
+        info!(
+            "PostgreSQL 연결 완료 (max_connections={}, acquire_timeout={:?})",
+            max_connections, acquire_timeout
+        );
         Ok(store)
     }
 
@@ -174,6 +194,12 @@ impl PostgresStore {
                 original_sl BIGINT DEFAULT 0,
                 reached_1r BOOLEAN DEFAULT FALSE,
                 best_price BIGINT DEFAULT 0,
+                or_high BIGINT,
+                or_low BIGINT,
+                or_source VARCHAR(10),
+                trigger_price BIGINT,
+                original_risk BIGINT,
+                entry_mode VARCHAR(20),
                 updated_at TIMESTAMPTZ DEFAULT NOW()
             )",
         )
@@ -185,6 +211,12 @@ impl PostgresStore {
         for col_sql in [
             "ALTER TABLE active_positions ADD COLUMN IF NOT EXISTS reached_1r BOOLEAN DEFAULT FALSE",
             "ALTER TABLE active_positions ADD COLUMN IF NOT EXISTS best_price BIGINT DEFAULT 0",
+            "ALTER TABLE active_positions ADD COLUMN IF NOT EXISTS or_high BIGINT",
+            "ALTER TABLE active_positions ADD COLUMN IF NOT EXISTS or_low BIGINT",
+            "ALTER TABLE active_positions ADD COLUMN IF NOT EXISTS or_source VARCHAR(10)",
+            "ALTER TABLE active_positions ADD COLUMN IF NOT EXISTS trigger_price BIGINT",
+            "ALTER TABLE active_positions ADD COLUMN IF NOT EXISTS original_risk BIGINT",
+            "ALTER TABLE active_positions ADD COLUMN IF NOT EXISTS entry_mode VARCHAR(20)",
         ] {
             let _ = sqlx::query(col_sql).execute(&self.pool).await;
         }
@@ -678,10 +710,10 @@ impl PostgresStore {
     /// 활성 포지션 저장/갱신
     pub async fn save_active_position(&self, pos: &ActivePosition) -> Result<(), KisError> {
         sqlx::query(
-            "INSERT INTO active_positions (stock_code, side, entry_price, stop_loss, take_profit, quantity, tp_order_no, tp_krx_orgno, entry_time, original_sl, reached_1r, best_price)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            "INSERT INTO active_positions (stock_code, side, entry_price, stop_loss, take_profit, quantity, tp_order_no, tp_krx_orgno, entry_time, original_sl, reached_1r, best_price, or_high, or_low, or_source, trigger_price, original_risk, entry_mode)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
              ON CONFLICT (stock_code) DO UPDATE
-             SET side=$2, entry_price=$3, stop_loss=$4, take_profit=$5, quantity=$6, tp_order_no=$7, tp_krx_orgno=$8, entry_time=$9, original_sl=$10, reached_1r=$11, best_price=$12, updated_at=NOW()",
+             SET side=$2, entry_price=$3, stop_loss=$4, take_profit=$5, quantity=$6, tp_order_no=$7, tp_krx_orgno=$8, entry_time=$9, original_sl=$10, reached_1r=$11, best_price=$12, or_high=$13, or_low=$14, or_source=$15, trigger_price=$16, original_risk=$17, entry_mode=$18, updated_at=NOW()",
         )
         .bind(&pos.stock_code)
         .bind(&pos.side)
@@ -695,6 +727,12 @@ impl PostgresStore {
         .bind(pos.original_sl)
         .bind(pos.reached_1r)
         .bind(pos.best_price)
+        .bind(pos.or_high)
+        .bind(pos.or_low)
+        .bind(&pos.or_source)
+        .bind(pos.trigger_price)
+        .bind(pos.original_risk)
+        .bind(&pos.entry_mode)
         .execute(&self.pool)
         .await
         .map_err(|e| KisError::Internal(format!("활성 포지션 저장 실패: {e}")))?;
@@ -704,7 +742,7 @@ impl PostgresStore {
     /// 활성 포지션 조회
     pub async fn get_active_position(&self, stock_code: &str) -> Result<Option<ActivePosition>, KisError> {
         let row: Option<ActivePositionRow> = sqlx::query_as(
-            "SELECT stock_code, side, entry_price, stop_loss, take_profit, quantity, tp_order_no, tp_krx_orgno, entry_time, original_sl, reached_1r, best_price
+            "SELECT stock_code, side, entry_price, stop_loss, take_profit, quantity, tp_order_no, tp_krx_orgno, entry_time, original_sl, reached_1r, best_price, or_high, or_low, or_source, trigger_price, original_risk, entry_mode
              FROM active_positions WHERE stock_code = $1",
         )
         .bind(stock_code)
@@ -728,6 +766,12 @@ impl PostgresStore {
                 original_sl: if orig_sl != 0 { orig_sl } else { r.stop_loss },
                 reached_1r: r.reached_1r.unwrap_or(false),
                 best_price: r.best_price.unwrap_or(r.entry_price),
+                or_high: r.or_high,
+                or_low: r.or_low,
+                or_source: r.or_source,
+                trigger_price: r.trigger_price,
+                original_risk: r.original_risk,
+                entry_mode: r.entry_mode,
             }
         }))
     }
@@ -817,6 +861,18 @@ pub struct ActivePosition {
     pub reached_1r: bool,
     /// 유리한 방향 최고가 (트레일링 SL 계산 기준 복구용)
     pub best_price: i64,
+    /// 진입 시점 OR 고가 (재시작 복구 시 전략 맥락 재구성용)
+    pub or_high: Option<i64>,
+    /// 진입 시점 OR 저가
+    pub or_low: Option<i64>,
+    /// OR 데이터 출처 ("ws"/"yahoo"/"naver")
+    pub or_source: Option<String>,
+    /// 지정가 발주 기준 가격 (FVG top/bottom 등, 슬리피지 계산 기준)
+    pub trigger_price: Option<i64>,
+    /// 원래 리스크 |entry - stop_loss| (임의 0.3% 재생성을 대체하는 복구 근거)
+    pub original_risk: Option<i64>,
+    /// 진입 방식 ("limit_passive", "market_limit" 등). 이후 ExecutionPolicy 확장 대비.
+    pub entry_mode: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -836,6 +892,18 @@ struct ActivePositionRow {
     reached_1r: Option<bool>,
     #[sqlx(default)]
     best_price: Option<i64>,
+    #[sqlx(default)]
+    or_high: Option<i64>,
+    #[sqlx(default)]
+    or_low: Option<i64>,
+    #[sqlx(default)]
+    or_source: Option<String>,
+    #[sqlx(default)]
+    trigger_price: Option<i64>,
+    #[sqlx(default)]
+    original_risk: Option<i64>,
+    #[sqlx(default)]
+    entry_mode: Option<String>,
 }
 
 /// 거래 기록

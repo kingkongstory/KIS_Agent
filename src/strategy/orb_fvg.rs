@@ -2,7 +2,11 @@ use chrono::NaiveTime;
 use tracing::{debug, info};
 
 use super::candle::{self, MinuteCandle};
-use super::fvg::{FairValueGap, FvgDirection};
+use super::parity::position_manager::{
+    gap_exit_reason, is_sl_hit, is_tp_hit, open_gap_breach, sl_exit_reason,
+    time_stop_breached_by_candles, update_best_and_trailing, PositionManagerConfig,
+};
+use super::parity::signal_engine::{detect_next_fvg_signal, SignalEngineConfig};
 use super::types::*;
 
 /// ORB+FVG 전략 설정
@@ -149,7 +153,7 @@ impl OrbFvgStrategy {
 
             // 1차는 OR 돌파 필수, 이후는 FVG만
             let require_or = trade_count == 0;
-            let (trade_result, exit_idx_rel, new_side) =
+            let (trade_result, exit_idx_rel, _) =
                 self.scan_and_trade(scan_slice, or_high, or_low, require_or);
 
             match trade_result {
@@ -196,112 +200,74 @@ impl OrbFvgStrategy {
         or_low: i64,
         require_or_breakout: bool,
     ) -> (Option<TradeResult>, usize, Option<PositionSide>) {
-        let mut pending_fvg: Option<FairValueGap> = None;
-        let mut breakout_side: Option<PositionSide> = None;
-        let mut fvg_formed_idx: usize = 0;
+        // Phase 2: FVG 탐지는 parity::signal_engine 공통 pure function 사용.
+        // 진입가 산정(mid_price)과 청산 시뮬레이션은 이 함수에 그대로 남긴다.
+        let cfg = SignalEngineConfig {
+            strategy_id: "orb_fvg".into(),
+            stage_name: "legacy_single_stage".into(),
+            or_high,
+            or_low,
+            fvg_expiry_candles: self.config.fvg_expiry_candles,
+            entry_cutoff: self.config.entry_cutoff,
+            require_or_breakout,
+            long_only: self.config.long_only,
+            confirmed_side: None, // 방향 필터는 run_day 가 상위에서 처리
+        };
+        let detected = match detect_next_fvg_signal(candles_5m, &cfg) {
+            Some(d) => d,
+            None => return (None, candles_5m.len(), None),
+        };
 
-        for (idx, c5) in candles_5m.iter().enumerate() {
-            if c5.time >= self.config.entry_cutoff {
-                break;
+        let side = detected.intent.side;
+        let gap = &detected.gap;
+        let idx = detected.retrace_candle_idx;
+        let c5 = &candles_5m[idx];
+        let label = if require_or_breakout {
+            match side {
+                PositionSide::Long => "OR HIGH 돌파 + ",
+                PositionSide::Short => "OR LOW 돌파 + ",
             }
+        } else {
+            "2차 "
+        };
+        info!(
+            "{}: {label}{:?} FVG — 갭 [{}, {}], SL={}",
+            detected.intent.metadata.b_time, side, gap.bottom, gap.top, gap.stop_loss
+        );
 
-            // FVG 유효시간 체크
-            if pending_fvg.is_some() && idx - fvg_formed_idx > self.config.fvg_expiry_candles {
-                info!(
-                    "{}: FVG 유효시간 초과 ({}캔들) — 폐기, 재탐색",
-                    c5.time, self.config.fvg_expiry_candles
-                );
-                pending_fvg = None;
-                breakout_side = None;
-            }
+        // legacy 진입 가격: gap.mid_price()
+        let entry_price = gap.mid_price();
+        let stop_loss = gap.stop_loss;
+        let risk = (entry_price - stop_loss).abs();
+        let take_profit = match side {
+            PositionSide::Long => entry_price + (risk as f64 * self.config.rr_ratio) as i64,
+            PositionSide::Short => entry_price - (risk as f64 * self.config.rr_ratio) as i64,
+        };
 
-            // 1단계: FVG 감지
-            if pending_fvg.is_none() && idx >= 2 {
-                let a = &candles_5m[idx - 2];
-                let b = &candles_5m[idx - 1];
-                let c = c5;
+        info!(
+            "{}: {:?} 진입 — entry={}, SL={}, TP={} (RR=1:{:.1})",
+            c5.time, side, entry_price, stop_loss, take_profit, self.config.rr_ratio
+        );
 
-                let a_range = a.range().max(1);
+        let result = self.simulate_exit(
+            side,
+            entry_price,
+            stop_loss,
+            take_profit,
+            c5.time,
+            &candles_5m[idx + 1..],
+        );
 
-                // Bullish FVG
-                if b.is_bullish() && a.high < c.low && b.body_size() * 100 >= a_range * 30 {
-                    let or_ok = !require_or_breakout || b.close > or_high;
-                    if or_ok {
-                        let label = if require_or_breakout { "OR HIGH 돌파 + " } else { "2차 " };
-                        let gap = FairValueGap {
-                            direction: FvgDirection::Bullish,
-                            top: c.low, bottom: a.high,
-                            candle_b_idx: idx - 1, stop_loss: a.low,
-                        };
-                        info!("{}: {label}Bullish FVG — 갭 [{}, {}], SL={}",
-                            b.time, gap.bottom, gap.top, gap.stop_loss);
-                        pending_fvg = Some(gap);
-                        breakout_side = Some(PositionSide::Long);
-                        fvg_formed_idx = idx;
-                        continue;
-                    }
-                }
+        let exit_candle_idx = if let Some(ref r) = result {
+            candles_5m
+                .iter()
+                .position(|c| c.time >= r.exit_time)
+                .unwrap_or(candles_5m.len())
+        } else {
+            candles_5m.len()
+        };
 
-                // Bearish FVG (long_only=true면 무시 — 실전 동일: 공매도 불가)
-                if !self.config.long_only
-                    && b.is_bearish() && a.low > c.high && b.body_size() * 100 >= a_range * 30
-                {
-                    let or_ok = !require_or_breakout || b.close < or_low;
-                    if or_ok {
-                        let label = if require_or_breakout { "OR LOW 돌파 + " } else { "2차 " };
-                        let gap = FairValueGap {
-                            direction: FvgDirection::Bearish,
-                            top: a.low, bottom: c.high,
-                            candle_b_idx: idx - 1, stop_loss: a.high,
-                        };
-                        info!("{}: {label}Bearish FVG — 갭 [{}, {}], SL={}",
-                            b.time, gap.bottom, gap.top, gap.stop_loss);
-                        pending_fvg = Some(gap);
-                        breakout_side = Some(PositionSide::Short);
-                        fvg_formed_idx = idx;
-                        continue;
-                    }
-                }
-            }
-
-            // 2단계: FVG 리트레이스 진입
-            if let Some(ref gap) = pending_fvg {
-                let side = breakout_side.unwrap();
-                let retrace_price = match side {
-                    PositionSide::Long => c5.low,
-                    PositionSide::Short => c5.high,
-                };
-
-                if gap.contains_price(retrace_price) {
-                    let entry_price = gap.mid_price();
-                    let stop_loss = gap.stop_loss;
-                    let risk = (entry_price - stop_loss).abs();
-                    let take_profit = match side {
-                        PositionSide::Long => entry_price + (risk as f64 * self.config.rr_ratio) as i64,
-                        PositionSide::Short => entry_price - (risk as f64 * self.config.rr_ratio) as i64,
-                    };
-
-                    info!("{}: {:?} 진입 — entry={}, SL={}, TP={} (RR=1:{:.1})",
-                        c5.time, side, entry_price, stop_loss, take_profit, self.config.rr_ratio);
-
-                    let result = self.simulate_exit(
-                        side, entry_price, stop_loss, take_profit,
-                        c5.time, &candles_5m[idx + 1..],
-                    );
-
-                    let exit_candle_idx = if let Some(ref r) = result {
-                        candles_5m.iter().position(|c| c.time >= r.exit_time)
-                            .unwrap_or(candles_5m.len())
-                    } else {
-                        candles_5m.len()
-                    };
-
-                    return (result, exit_candle_idx, Some(side));
-                }
-            }
-        }
-
-        (None, candles_5m.len(), None)
+        (result, exit_candle_idx, Some(side))
     }
 
     /// 진입 후 청산 시뮬레이션 (TP 지정가 우선)
@@ -324,24 +290,22 @@ impl OrbFvgStrategy {
         entry_time: NaiveTime,
         remaining: &[MinuteCandle],
     ) -> Option<TradeResult> {
-        let risk = (entry_price - stop_loss).abs() as f64;
-        let trailing_dist = (risk * self.config.trailing_r) as i64;
+        let original_risk = (entry_price - stop_loss).abs();
+        let pm_cfg = PositionManagerConfig {
+            rr_ratio: self.config.rr_ratio,
+            trailing_r: self.config.trailing_r,
+            breakeven_r: self.config.breakeven_r,
+            time_stop_candles: self.config.time_stop_candles,
+            candle_interval_min: 5,
+        };
         let mut current_sl = stop_loss;
         let mut best_price = entry_price;
         let mut reached_1r = false;
 
         for (i, c) in remaining.iter().enumerate() {
             // ── Step 0: 시가에서 이미 SL 돌파 (갭 손절) ──
-            let open_sl_breach = match side {
-                PositionSide::Long => c.open <= current_sl,
-                PositionSide::Short => c.open >= current_sl,
-            };
-            if open_sl_breach {
-                let reason = if reached_1r {
-                    ExitReason::TrailingStop
-                } else {
-                    ExitReason::StopLoss
-                };
+            if open_gap_breach(side, current_sl, c.open) {
+                let reason = gap_exit_reason(reached_1r);
                 info!("{}: 시가 갭 {:?} — open={}, SL={}", c.time, reason, c.open, current_sl);
                 return Some(TradeResult {
                     side, entry_price, exit_price: c.open, stop_loss, take_profit,
@@ -351,11 +315,11 @@ impl OrbFvgStrategy {
             }
 
             // ── Step 1: TP 지정가 체결 (거래소 우선) ──
-            let tp_hit = match side {
-                PositionSide::Long => c.high >= take_profit,
-                PositionSide::Short => c.low <= take_profit,
+            let tp_extreme = match side {
+                PositionSide::Long => c.high,
+                PositionSide::Short => c.low,
             };
-            if tp_hit {
+            if is_tp_hit(side, take_profit, tp_extreme) {
                 info!("{}: TP 지정가 체결 — TP={}", c.time, take_profit);
                 return Some(TradeResult {
                     side, entry_price, exit_price: take_profit, stop_loss, take_profit,
@@ -369,52 +333,23 @@ impl OrbFvgStrategy {
                 PositionSide::Long => c.high,
                 PositionSide::Short => c.low,
             };
-            best_price = match side {
-                PositionSide::Long => best_price.max(favorable),
-                PositionSide::Short => best_price.min(favorable),
-            };
-
-            let profit_from_entry = match side {
-                PositionSide::Long => best_price - entry_price,
-                PositionSide::Short => entry_price - best_price,
-            };
-            let breakeven_dist = (risk * self.config.breakeven_r) as i64;
-            if !reached_1r && profit_from_entry >= breakeven_dist {
-                reached_1r = true;
-                current_sl = entry_price;
+            let update = update_best_and_trailing(
+                side, entry_price, &mut best_price, &mut current_sl,
+                &mut reached_1r, original_risk, favorable, &pm_cfg,
+            );
+            if update.reached_1r_newly {
                 info!("{}: 1R 도달 — 본전 스탑 활성화 (SL → {})", c.time, current_sl);
+            } else if update.trailing_changed {
+                debug!("{}: 트레일링 SL 갱신 → {}", c.time, current_sl);
             }
 
-            if reached_1r {
-                let new_sl = match side {
-                    PositionSide::Long => best_price - trailing_dist,
-                    PositionSide::Short => best_price + trailing_dist,
-                };
-                let improved = match side {
-                    PositionSide::Long => new_sl > current_sl,
-                    PositionSide::Short => new_sl < current_sl,
-                };
-                if improved {
-                    current_sl = new_sl;
-                    debug!("{}: 트레일링 SL 갱신 → {}", c.time, current_sl);
-                }
-            }
-
-            // ── Step 3: SL 체크 ──
-            let sl_hit = match side {
-                PositionSide::Long => c.low <= current_sl,
-                PositionSide::Short => c.high >= current_sl,
+            // ── Step 3: SL 체크 (갱신된 current_sl 기준) ──
+            let sl_extreme = match side {
+                PositionSide::Long => c.low,
+                PositionSide::Short => c.high,
             };
-            if sl_hit {
-                let reason = if reached_1r && current_sl > stop_loss {
-                    if current_sl == entry_price {
-                        ExitReason::BreakevenStop
-                    } else {
-                        ExitReason::TrailingStop
-                    }
-                } else {
-                    ExitReason::StopLoss
-                };
+            if is_sl_hit(side, current_sl, sl_extreme) {
+                let reason = sl_exit_reason(side, current_sl, stop_loss, entry_price, reached_1r);
                 info!("{}: {:?} — SL={}", c.time, reason, current_sl);
                 return Some(TradeResult {
                     side, entry_price, exit_price: current_sl, stop_loss, take_profit,
@@ -424,7 +359,7 @@ impl OrbFvgStrategy {
             }
 
             // ── Step 4: 시간 스탑 ──
-            if !reached_1r && i + 1 >= self.config.time_stop_candles {
+            if time_stop_breached_by_candles(i + 1, self.config.time_stop_candles, reached_1r) {
                 info!("{}: 시간 스탑 — {}캔들 경과, 1R 미달 (close={})",
                     c.time, self.config.time_stop_candles, c.close);
                 return Some(TradeResult {
@@ -485,75 +420,38 @@ impl OrbFvgStrategy {
             .collect();
         let candles_5m = candle::aggregate(&scan_candles, 5);
 
-        let mut breakout_side: Option<PositionSide> = None;
-        let mut pending_fvg: Option<FairValueGap> = None;
+        let cfg = SignalEngineConfig {
+            strategy_id: "orb_fvg".into(),
+            stage_name: "legacy_single_stage".into(),
+            or_high,
+            or_low,
+            fvg_expiry_candles: self.config.fvg_expiry_candles,
+            entry_cutoff: self.config.entry_cutoff,
+            require_or_breakout: true,
+            long_only: self.config.long_only,
+            confirmed_side: None,
+        };
+        if let Some(detected) = detect_next_fvg_signal(&candles_5m, &cfg) {
+            let side = detected.intent.side;
+            let gap = detected.gap;
+            let entry_price = gap.mid_price();
+            let stop_loss = gap.stop_loss;
+            let risk = (entry_price - stop_loss).abs();
+            let take_profit = match side {
+                PositionSide::Long => entry_price + (risk as f64 * self.config.rr_ratio) as i64,
+                PositionSide::Short => entry_price - (risk as f64 * self.config.rr_ratio) as i64,
+            };
 
-        for (idx, c5) in candles_5m.iter().enumerate() {
-            if c5.time >= self.config.entry_cutoff {
-                break;
-            }
-
-            // 1단계: 돌파 + FVG 동시 감지
-            if pending_fvg.is_none() && idx >= 2 {
-                let a = &candles_5m[idx - 2];
-                let b = &candles_5m[idx - 1];
-                let c = c5;
-                let a_range = a.range().max(1);
-
-                if b.is_bullish() && b.close > or_high && a.high < c.low && b.body_size() * 100 >= a_range * 30 {
-                    pending_fvg = Some(FairValueGap {
-                        direction: FvgDirection::Bullish,
-                        top: c.low,
-                        bottom: a.high,
-                        candle_b_idx: idx - 1,
-                        stop_loss: a.low,
-                    });
-                    breakout_side = Some(PositionSide::Long);
-                    continue;
-                }
-
-                if b.is_bearish() && b.close < or_low && a.low > c.high && b.body_size() * 100 >= a_range * 30 {
-                    pending_fvg = Some(FairValueGap {
-                        direction: FvgDirection::Bearish,
-                        top: a.low,
-                        bottom: c.high,
-                        candle_b_idx: idx - 1,
-                        stop_loss: a.high,
-                    });
-                    breakout_side = Some(PositionSide::Short);
-                    continue;
-                }
-            }
-
-            // 2단계: FVG 리트레이스 진입
-            if let Some(ref gap) = pending_fvg {
-                let side = breakout_side.unwrap();
-                let retrace_price = match side {
-                    PositionSide::Long => c5.low,
-                    PositionSide::Short => c5.high,
-                };
-
-                if gap.contains_price(retrace_price) {
-                    let entry_price = gap.mid_price();
-                    let stop_loss = gap.stop_loss;
-                    let risk = (entry_price - stop_loss).abs();
-                    let take_profit = match side {
-                        PositionSide::Long => entry_price + (risk as f64 * self.config.rr_ratio) as i64,
-                        PositionSide::Short => entry_price - (risk as f64 * self.config.rr_ratio) as i64,
-                    };
-
-                    return (
-                        Some(Signal {
-                            side,
-                            entry_price,
-                            stop_loss,
-                            take_profit,
-                            signal_time: c5.time,
-                        }),
-                        Some((or_high, or_low)),
-                    );
-                }
-            }
+            return (
+                Some(Signal {
+                    side,
+                    entry_price,
+                    stop_loss,
+                    take_profit,
+                    signal_time: detected.intent.signal_time,
+                }),
+                Some((or_high, or_low)),
+            );
         }
 
         (None, Some((or_high, or_low)))

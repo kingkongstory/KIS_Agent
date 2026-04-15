@@ -19,8 +19,12 @@ use crate::domain::types::{StockCode, TransactionId};
 use crate::infrastructure::kis_client::http_client::{HttpMethod, KisHttpClient, KisResponse};
 
 use super::candle::{self, MinuteCandle};
-use super::fvg::{FairValueGap, FvgDirection};
 use super::orb_fvg::{OrbFvgConfig, OrbFvgStrategy};
+use super::parity::position_manager::{
+    is_tp_hit, sl_exit_reason, time_stop_breached_by_minutes, update_best_and_trailing,
+    PositionManagerConfig,
+};
+use super::parity::signal_engine::{detect_next_fvg_signal, SignalEngineConfig};
 use super::types::*;
 
 /// KIS 분봉 응답 항목
@@ -54,6 +58,14 @@ pub struct RunnerState {
     pub or_stages: Vec<(String, i64, i64)>,
     /// 장 중단 여부 (VI 발동 또는 거래정지)
     pub market_halted: bool,
+    /// degraded 모드 — WS 체결통보 비정상 등 시스템 신뢰성 미달 시 true.
+    /// 진입 전체가 차단되며 관찰만 허용된다. (2026-04-16 P0)
+    pub degraded: bool,
+    /// 사람 개입 필요 — 재시작 복구 시 메타 부족으로 포지션을 임의 재구성할 수 없을 때 true.
+    /// 자동매매가 자기 자신을 중단하고 운영자의 HTS 수동 확인을 요구한다. (2026-04-16 P0)
+    pub manual_intervention_required: bool,
+    /// manual/degraded 사유 (UI/로그용)
+    pub degraded_reason: Option<String>,
 }
 
 /// 실시간 트레이딩 러너
@@ -126,15 +138,95 @@ pub(crate) struct LiveSignalState {
     search_after: Option<NaiveTime>,
 }
 
+/// `trigger_manual_intervention` 호출 시 공유 포지션 잠금 처리 방식.
+///
+/// 2026-04-15 Codex review #3/#4 대응. manual_intervention 전환은
+/// 종목별 상태(`RunnerState.manual_intervention_required`)뿐 아니라
+/// dual-locked 환경의 shared `PositionLockState` 도 함께 관리해야,
+/// 다른 종목 러너가 이 종목의 숨은 live position 과 중첩 노출되지 않는다.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ManualInterventionMode {
+    /// shared lock 을 `Held(self_code)` 로 고정 유지.
+    /// safe_orphan_cleanup 의 보유 감지 / cancel_verify_failed 경로 기본값.
+    KeepLock,
+}
+
 /// 라이브 러너 고유 설정 (백테스트와 분리).
 ///
 /// `OrbFvgConfig` 는 백테스트/라이브 공용이라 백테스트 결과에 영향을 주지 않으려는
 /// 라이브 전용 가드는 이곳에 둔다.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct LiveRunnerConfig {
     /// 진입 지정가 대비 현재가 이탈 허용 한계 (Long: (cur - entry) / entry).
     /// `None` 이면 가드 비활성 (Day+0 기본). `Some(0.005)` 는 0.5%.
     pub max_entry_drift_pct: Option<f64>,
+    /// 진입 허용 OR stage 목록. `None` 이면 모든 stage(5m/15m/30m) 허용 — 모의 기본.
+    /// `Some(vec!["15m"])` 실전 기본 — 원리 그대로의 15분 OR 하나만 진입 자격으로 사용.
+    /// 리스트에 없는 stage 의 신호는 entry 경로에서 건너뛴다 (UI 에는 여전히 표시).
+    pub allowed_stages: Option<Vec<String>>,
+    /// 일일 최대 거래 횟수 override. `None` 이면 `OrbFvgConfig.max_daily_trades` 사용.
+    /// 실전 기본 `Some(1)` — 하루 1회만 진입하고, 결과와 무관하게 같은 날 재진입 금지.
+    pub max_daily_trades_override: Option<usize>,
+    /// 신규 진입 마감 시각 override. `None` 이면 `OrbFvgConfig.entry_cutoff` 사용.
+    /// 실전 기본 15:00 — 오후 약한 신호를 차단하고 관리/청산 시간을 여유있게 확보.
+    pub entry_cutoff_override: Option<NaiveTime>,
+    /// 실전 주문 경로 명시 opt-in. `false` 이면 실제 진입/TP/시장가 경로를 전부 차단한다.
+    /// `AppConfig.is_real_mode() && !AppConfig.enable_real_trading` 조합에서 `false`.
+    /// 기본 `true` (모의투자 기본 동작 유지).
+    pub enable_real_orders: bool,
+    /// 실전 식별 플래그. 로그/trade.environment 필드에 사용.
+    pub real_mode: bool,
+}
+
+impl Default for LiveRunnerConfig {
+    fn default() -> Self {
+        Self {
+            max_entry_drift_pct: None,
+            allowed_stages: None,
+            max_daily_trades_override: None,
+            entry_cutoff_override: None,
+            // 기본은 주문 허용(모의). 실전에서 차단하려면 명시적으로 false.
+            enable_real_orders: true,
+            real_mode: false,
+        }
+    }
+}
+
+impl LiveRunnerConfig {
+    /// 실전 플래그를 반영해 환경변수 기반 보수적 기본값으로 구성.
+    pub fn for_real_mode(
+        allowed_stages: Vec<String>,
+        max_trades_total: usize,
+        entry_cutoff: NaiveTime,
+        enable_real_orders: bool,
+    ) -> Self {
+        Self {
+            max_entry_drift_pct: Some(0.005),
+            allowed_stages: Some(allowed_stages),
+            max_daily_trades_override: Some(max_trades_total),
+            entry_cutoff_override: Some(entry_cutoff),
+            enable_real_orders,
+            real_mode: true,
+        }
+    }
+
+    /// 실전 또는 모의 환경에서 허용 stage 인지 판정.
+    pub fn is_stage_allowed(&self, stage_name: &str) -> bool {
+        match &self.allowed_stages {
+            None => true,
+            Some(list) => list.iter().any(|s| s == stage_name),
+        }
+    }
+
+    /// max_daily_trades 실효값 — override 가 있으면 그 값을, 없으면 주어진 기본값 사용.
+    pub fn effective_max_daily_trades(&self, default_value: usize) -> usize {
+        self.max_daily_trades_override.unwrap_or(default_value)
+    }
+
+    /// entry_cutoff 실효값 — override 가 있으면 그 값을, 없으면 주어진 기본값 사용.
+    pub fn effective_entry_cutoff(&self, default_value: NaiveTime) -> NaiveTime {
+        self.entry_cutoff_override.unwrap_or(default_value)
+    }
 }
 
 /// Multi-stage OR 탐색에서 선착순으로 확정된 진입 신호.
@@ -213,6 +305,9 @@ impl LiveRunner {
                 or_low: None,
                 or_stages: Vec::new(),
                 market_halted: false,
+                degraded: false,
+                manual_intervention_required: false,
+                degraded_reason: None,
             })),
             trade_tx: None,
             realtime_rx: None,
@@ -254,8 +349,17 @@ impl LiveRunner {
         self
     }
 
-    /// 미체결 주문 전체 취소 (서버 재시작 시 이전 TP 지정가 등 정리)
-    async fn cancel_all_pending_orders(&self) {
+    /// 미체결 주문 전체 취소 — 이 종목에 한정.
+    ///
+    /// 반환: 취소 성공한 건수 (0 = 미체결이 없거나 전부 실패).
+    /// 조회/취소 중 API 오류 발생 시 `Err`. 호출자는 `Err` 를 "미체결이 남아있을 수도 있음" 으로
+    /// 간주하고 후속 경로(balance 재검증 등)로 방어해야 한다.
+    ///
+    /// `label` — event_log / tracing 라벨 구분용.
+    /// - `"orphan_cleanup"`: 재시작 시 DB 에 active position 없는데 KIS 에 잔존한 주문 정리
+    /// - `"entry_cancel_fallback"`: `execute_entry` 에서 cancel_tp_order 3회 실패 후 fallback
+    /// - `"manual"`: 기타 호출 경로
+    async fn cancel_all_pending_orders(&self, label: &str) -> Result<usize, KisError> {
         let query = [
             ("CANO", self.client.account_no()),
             ("ACNT_PRDT_CD", self.client.account_product_code()),
@@ -265,73 +369,122 @@ impl LiveRunner {
             ("INQR_DVSN_2", ""),
         ];
 
-        let resp: Result<KisResponse<Vec<serde_json::Value>>, _> = self.client
-            .execute(HttpMethod::Get,
+        let resp: KisResponse<Vec<serde_json::Value>> = self
+            .client
+            .execute(
+                HttpMethod::Get,
                 "/uapi/domestic-stock/v1/trading/inquire-psbl-rvsecncl",
                 &TransactionId::InquirePsblOrder,
-                Some(&query), None)
-            .await;
+                Some(&query),
+                None,
+            )
+            .await?;
 
-        if let Ok(r) = resp {
-            let items = r.output.or(r.output1).unwrap_or_default();
-            let mut cancelled = 0;
-            for item in &items {
-                let code = item.get("pdno").and_then(|v| v.as_str()).unwrap_or("");
-                if code != self.stock_code.as_str() { continue; }
-
-                let order_no = item.get("odno").and_then(|v| v.as_str()).unwrap_or("");
-                let _krx_orgno = item.get("orgn_odno").and_then(|v| v.as_str()).unwrap_or("");
-                let qty_str = item.get("psbl_qty").and_then(|v| v.as_str()).unwrap_or("0");
-
-                if order_no.is_empty() { continue; }
-
-                // 취소 요청
-                let cancel_body = serde_json::json!({
-                    "CANO": self.client.account_no(),
-                    "ACNT_PRDT_CD": self.client.account_product_code(),
-                    "KRX_FWDG_ORD_ORGNO": "",
-                    "ORGN_ODNO": order_no,
-                    "ORD_DVSN": "00",
-                    "RVSE_CNCL_DVSN_CD": "02",
-                    "ORD_QTY": qty_str,
-                    "ORD_UNPR": "0",
-                    "QTY_ALL_ORD_YN": "Y",
-                });
-
-                let cancel_resp: Result<KisResponse<serde_json::Value>, _> = self.client
-                    .execute(HttpMethod::Post, "/uapi/domestic-stock/v1/trading/order-rvsecncl",
-                        &TransactionId::OrderCancel, None, Some(&cancel_body))
-                    .await;
-
-                match cancel_resp {
-                    Ok(cr) if cr.rt_cd == "0" => {
-                        cancelled += 1;
-                        info!("{}: 미체결 주문 취소 — 주문번호={}", self.stock_name, order_no);
-                    }
-                    Ok(cr) => {
-                        warn!("{}: 미체결 주문 취소 실패 — {}: {}", self.stock_name, order_no, cr.msg1);
-                    }
-                    Err(e) => {
-                        warn!("{}: 미체결 주문 취소 에러 — {}: {e}", self.stock_name, order_no);
-                    }
-                }
-
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let items = resp.output.or(resp.output1).unwrap_or_default();
+        let mut cancelled = 0usize;
+        let mut failures = 0usize;
+        for item in &items {
+            let code = item.get("pdno").and_then(|v| v.as_str()).unwrap_or("");
+            if code != self.stock_code.as_str() {
+                continue;
             }
 
-            if cancelled > 0 {
-                info!("{}: 미체결 주문 {}건 취소 완료", self.stock_name, cancelled);
-                // 취소 후 잔고 반영 대기
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            let order_no = item.get("odno").and_then(|v| v.as_str()).unwrap_or("");
+            let qty_str = item.get("psbl_qty").and_then(|v| v.as_str()).unwrap_or("0");
+
+            if order_no.is_empty() {
+                continue;
+            }
+
+            let cancel_body = serde_json::json!({
+                "CANO": self.client.account_no(),
+                "ACNT_PRDT_CD": self.client.account_product_code(),
+                "KRX_FWDG_ORD_ORGNO": "",
+                "ORGN_ODNO": order_no,
+                "ORD_DVSN": "00",
+                "RVSE_CNCL_DVSN_CD": "02",
+                "ORD_QTY": qty_str,
+                "ORD_UNPR": "0",
+                "QTY_ALL_ORD_YN": "Y",
+            });
+
+            let cancel_resp: Result<KisResponse<serde_json::Value>, _> = self
+                .client
+                .execute(
+                    HttpMethod::Post,
+                    "/uapi/domestic-stock/v1/trading/order-rvsecncl",
+                    &TransactionId::OrderCancel,
+                    None,
+                    Some(&cancel_body),
+                )
+                .await;
+
+            match cancel_resp {
+                Ok(cr) if cr.rt_cd == "0" => {
+                    cancelled += 1;
+                    info!(
+                        "{}: [{}] 미체결 주문 취소 — 주문번호={}",
+                        self.stock_name, label, order_no
+                    );
+                }
+                Ok(cr) => {
+                    failures += 1;
+                    warn!(
+                        "{}: [{}] 미체결 주문 취소 실패 — {}: {}",
+                        self.stock_name, label, order_no, cr.msg1
+                    );
+                }
+                Err(e) => {
+                    failures += 1;
+                    warn!(
+                        "{}: [{}] 미체결 주문 취소 에러 — {}: {e}",
+                        self.stock_name, label, order_no
+                    );
+                }
+            }
+
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+
+        if cancelled > 0 || failures > 0 {
+            info!(
+                "{}: [{}] cancel_all 완료 — 성공 {}건 / 실패 {}건",
+                self.stock_name, label, cancelled, failures
+            );
+            if let Some(ref el) = self.event_logger {
+                el.log_event(
+                    self.stock_code.as_str(),
+                    "order",
+                    "cancel_all_pending",
+                    if failures > 0 { "warn" } else { "info" },
+                    &format!(
+                        "[{}] 취소 성공 {}건 / 실패 {}건",
+                        label, cancelled, failures
+                    ),
+                    serde_json::json!({
+                        "label": label,
+                        "cancelled": cancelled,
+                        "failures": failures,
+                    }),
+                );
             }
         }
+
+        if cancelled > 0 {
+            // 취소 후 잔고 반영 대기
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+        Ok(cancelled)
     }
 
     /// DB에서 활성 포지션 복구 (TP 주문번호 포함)
     async fn check_and_restore_position(&self) {
         let Some(ref store) = self.db_store else {
-            // DB 없으면 잔고 API로 fallback
-            self.check_and_restore_from_balance().await;
+            // DB 없으면 balance-first orphan cleanup 으로 fallback.
+            // 2026-04-15 Codex review #3: 과거의 `check_and_restore_from_balance`
+            // (cancel 먼저 + 보유 있으면 0.3% 임의 재구성) 경로를 `safe_orphan_cleanup`
+            // 으로 교체하여 live TP 가 삭제되는 회귀를 차단한다.
+            self.safe_orphan_cleanup("restore_fallback").await;
             return;
         };
 
@@ -428,26 +581,36 @@ impl LiveRunner {
                 return;
             }
             Ok(None) => {
-                info!("{}: DB에 활성 포지션 없음 — orphan 주문 사전 정리", self.stock_name);
-                // DB에 포지션이 없다는 것은 정상 TP 지정가도 없다는 뜻.
-                // KIS에 남아있는 미체결 주문은 모두 orphan(프로세스 이상 종료 잔재) → 취소 안전.
-                // 이 방어가 taskkill /F, SIGKILL, 패닉 등 모든 비정상 종료를 커버한다.
-                self.cancel_all_pending_orders().await;
+                info!("{}: DB에 활성 포지션 없음 — balance-first orphan cleanup", self.stock_name);
+                // 2026-04-15 Codex review #3 대응: 기존에는 `cancel_all_pending_orders`
+                // 를 먼저 부르는 순서였으나, DB save 실패 후 재시작 시나리오에서
+                // 실제 보유 중인 live position 의 broker-side TP 까지 함께 삭제돼
+                // 보호 없는 포지션을 남기는 회귀가 있었다. `safe_orphan_cleanup` 은
+                // 잔고 조회를 먼저 하여 정상 포지션이 있으면 cancel 을 스킵한다.
+                self.safe_orphan_cleanup("orphan_cleanup").await;
                 return;
             }
             Err(e) => warn!("{}: DB 포지션 조회 실패: {e}", self.stock_name),
         }
 
-        // DB 조회 실패 시에만 잔고 API로 fallback
-        self.check_and_restore_from_balance().await;
+        // DB 조회 실패 시에만 잔고 API 경로로 fallback (balance-first).
+        self.safe_orphan_cleanup("restore_fallback").await;
     }
 
-    /// 잔고 API로 보유 확인 → 포지션 복구 (DB에 없을 때 fallback)
-    async fn check_and_restore_from_balance(&self) {
-        // 미체결 주문 취소 시도
-        self.cancel_all_pending_orders().await;
-
-        // 잔고 API로 해당 종목 보유 여부 확인
+    /// 이 종목의 현재 보유 스냅샷 (qty + avg_opt).
+    ///
+    /// 2026-04-15 Codex review #3 대응. `safe_orphan_cleanup` / cancel-fill race
+    /// 재검증 / 진입 전 스냅샷 — 세 경로 모두 avg 제공 여부에 관계없이 qty>0 만으로
+    /// 보유를 판정해야 한다. 모의투자나 특수 상태(avg=0 응답)에서도 live position 을
+    /// orphan 으로 오분류하면 안 되기 때문이다.
+    ///
+    /// 성공:
+    /// - `Ok(Some((qty, Some(avg))))`: 보유 + 평균매입가 조회됨
+    /// - `Ok(Some((qty, None)))`: 보유 (qty>0) 인데 avg 가 0 이거나 파싱 불가
+    /// - `Ok(None)`: 미보유 (응답에 해당 종목 없거나 qty=0)
+    ///
+    /// 실패 (`Err`): API 장애 — 호출자 fail-safe 처리 필요.
+    async fn fetch_holding_snapshot(&self) -> Result<Option<(u64, Option<i64>)>, KisError> {
         let query = [
             ("CANO", self.client.account_no()),
             ("ACNT_PRDT_CD", self.client.account_product_code()),
@@ -461,87 +624,126 @@ impl LiveRunner {
             ("CTX_AREA_FK100", ""),
             ("CTX_AREA_NK100", ""),
         ];
-
-        let resp: Result<KisResponse<Vec<serde_json::Value>>, _> = self.client
-            .execute(HttpMethod::Get,
+        let resp: KisResponse<Vec<serde_json::Value>> = self
+            .client
+            .execute(
+                HttpMethod::Get,
                 "/uapi/domestic-stock/v1/trading/inquire-balance",
                 &TransactionId::InquireBalance,
-                Some(&query), None)
-            .await;
+                Some(&query),
+                None,
+            )
+            .await?;
+        let items = resp.output.or(resp.output1).unwrap_or_default();
+        Ok(parse_holding_snapshot(&items, self.stock_code.as_str()))
+    }
 
-        if let Ok(r) = resp {
-            let items = r.output.or(r.output1).unwrap_or_default();
-            if !items.is_empty() {
-                for item in &items {
-                    let code = item.get("pdno").and_then(|v| v.as_str()).unwrap_or("");
-                    if code != self.stock_code.as_str() { continue; }
-
-                    let qty: u64 = item.get("hldg_qty")
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(0);
-                    let avg: i64 = item.get("pchs_avg_pric")
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| s.parse::<f64>().ok())
-                        .map(|f| f as i64)
-                        .unwrap_or(0);
-
-                    if qty > 0 && avg > 0 {
-                        info!("{}: 잔존 포지션 감지 — {}주 @ {}원, 복구 중", self.stock_name, qty, avg);
-                        self.restore_position(avg, qty).await;
-                        return;
-                    }
+    /// Balance-first orphan cleanup.
+    ///
+    /// 실제 잔고를 먼저 확인하여, 정상 포지션이 있으면 절대 미체결 주문을 건드리지 않는다.
+    /// 2026-04-15 Codex review #3 대응 — 기존 `cancel_all_pending_orders` 선호출 경로가
+    /// DB 메타 부재 상황에서 live position 의 broker-side TP 지정가까지 함께 삭제해버리던
+    /// 회귀를 차단한다.
+    ///
+    /// 분기:
+    /// - 잔고 0 주: cancel_all 안전 수행 (기존 orphan_cleanup 동작)
+    /// - 잔고 > 0 주: cancel 스킵 + `trigger_manual_intervention(KeepLock)` — 기존 TP 보존
+    /// - 조회 실패: cancel 스킵 + `trigger_manual_intervention(KeepLock)` — fail-safe
+    ///
+    /// `label` — 호출 지점 태그 (`orphan_cleanup` / `restore_fallback`).
+    async fn safe_orphan_cleanup(&self, label: &str) {
+        match self.fetch_holding_snapshot().await {
+            Ok(None) => {
+                // 잔고 없음 — orphan 취소 안전
+                if let Err(e) = self.cancel_all_pending_orders(label).await {
+                    warn!(
+                        "{}: [{}] orphan cancel_all 실패 — 재시작 복구 잠재 위험: {e}",
+                        self.stock_name, label
+                    );
                 }
+            }
+            Ok(Some((qty, avg_opt))) => {
+                // 잔고 있음 — 기존 미체결 주문(특히 broker-side TP)을 보존하고
+                // 자동 운영을 중단하여 운영자 개입을 유도한다.
+                warn!(
+                    "{}: [{}] 잔고 {}주 감지 — 기존 미체결 주문 보존 + 수동 개입 전환",
+                    self.stock_name, label, qty
+                );
+                let reason = format!(
+                    "재시작 복구: 잔고 {}주{} — DB 메타 부재. KIS 기존 TP 확인 필수.",
+                    qty,
+                    avg_opt
+                        .map(|avg| format!(" @ {}원", avg))
+                        .unwrap_or_default(),
+                );
+                let metadata = serde_json::json!({
+                    "label": label,
+                    "quantity": qty,
+                    "avg_price": avg_opt,
+                    "tp_cancelled": false,
+                    "trigger": "safe_orphan_cleanup_holding_detected",
+                });
+                self.trigger_manual_intervention(reason, metadata, ManualInterventionMode::KeepLock)
+                    .await;
+            }
+            Err(e) => {
+                // 상태 불명 — fail-safe: 미체결 주문에 손대지 않음.
+                error!(
+                    "{}: [{}] balance 조회 실패 — orphan cleanup 스킵, 수동 개입 전환: {e}",
+                    self.stock_name, label
+                );
+                let reason = format!("재시작 복구: balance 조회 실패 ({})", e);
+                let metadata = serde_json::json!({
+                    "label": label,
+                    "error": e.to_string(),
+                    "trigger": "safe_orphan_cleanup_balance_error",
+                });
+                self.trigger_manual_intervention(reason, metadata, ManualInterventionMode::KeepLock)
+                    .await;
             }
         }
     }
 
-    /// 기존 보유 포지션 복구 (서버 재시작 시)
-    async fn restore_position(&self, avg_price: i64, quantity: u64) {
-        let cfg = &self.strategy.config;
-        // OR 범위 기반 SL/TP 재계산은 불가 → 진입가 기준 고정 비율 사용
-        let risk = (avg_price as f64 * 0.003) as i64; // 0.3% 리스크
-        let stop_loss = avg_price - risk;
-        let take_profit = avg_price + (risk as f64 * cfg.rr_ratio) as i64;
-
-        // TP 지정가 매도 발주
-        let (tp_order_no, tp_krx_orgno, tp_limit_price) =
-            if let Some((no, orgno, placed_price)) = self.place_tp_limit_order(take_profit, quantity).await {
-                (Some(no), Some(orgno), Some(placed_price))
-            } else {
-                (None, None, None)
-            };
-
-        let mut state = self.state.write().await;
-        state.current_position = Some(Position {
-            side: PositionSide::Long,
-            entry_price: avg_price,
-            stop_loss,
-            take_profit,
-            entry_time: Local::now().time(),
-            quantity,
-            tp_order_no,
-            tp_krx_orgno,
-            tp_limit_price,
-            reached_1r: false,
-            best_price: avg_price,
-            original_sl: stop_loss,
-            sl_triggered_tick: false,
-            intended_entry_price: avg_price,
-            order_to_fill_ms: 0,
-        });
-        state.phase = "포지션 보유 (복구)".to_string();
-
-        // DB에서 OR 값 로드
-        if let Some(ref store) = self.db_store {
-            let today = Local::now().date_naive();
-            if let Ok(Some((h, l))) = store.get_or_range(self.stock_code.as_str(), today).await {
-                state.or_high = Some(h);
-                state.or_low = Some(l);
+    /// `manual_intervention_required` 공통 설정 경로.
+    ///
+    /// state / event_log / stop_flag / stop_notify / shared position_lock 을 한 번에 처리.
+    /// `mode=KeepLock` 은 shared `position_lock` 을 `Held(self_code)` 로 고정하여,
+    /// 다른 종목 러너가 같은 사이클에서 새 진입을 시도하지 못하게 한다.
+    ///
+    /// 2026-04-15 Codex review #3/#4 대응. 기존 산재된 manual_intervention 로직
+    /// (`restore_position`, `cancel_verify_failed` 분기 등)을 이 헬퍼로 일원화.
+    async fn trigger_manual_intervention(
+        &self,
+        reason: String,
+        metadata: serde_json::Value,
+        mode: ManualInterventionMode,
+    ) {
+        error!("{}: 수동 개입 필요 — {}", self.stock_name, reason);
+        {
+            let mut state = self.state.write().await;
+            state.phase = "수동 개입 필요".to_string();
+            state.manual_intervention_required = true;
+            state.degraded = true;
+            state.degraded_reason = Some(reason.clone());
+        }
+        if let Some(ref el) = self.event_logger {
+            el.log_event(
+                self.stock_code.as_str(),
+                "position",
+                "manual_intervention_required",
+                "critical",
+                &reason,
+                metadata,
+            );
+        }
+        if matches!(mode, ManualInterventionMode::KeepLock) {
+            if let Some(ref lock) = self.position_lock {
+                *lock.write().await =
+                    PositionLockState::Held(self.stock_code.as_str().to_string());
             }
         }
-
-        info!("포지션 복구: {}주 @ {}원, SL={}, TP={}", quantity, avg_price, stop_loss, take_profit);
+        self.stop_flag.store(true, Ordering::Relaxed);
+        self.stop_notify.notify_waiters();
     }
 
     /// 외부 중지 알림 핸들 (StrategyManager에서 사용)
@@ -771,10 +973,9 @@ impl LiveRunner {
             }
         }
 
-        // Multi-Stage OR: 5분 OR(09:05)부터 시작, 15분(09:15), 30분(09:30) 점진 추가
+        // Multi-Stage OR: 5분 OR(09:05)부터 시작, 15분/30분은 poll_and_enter 안에서
+        // available_stages 로 직접 계산하므로 여기선 5분 경계만 필요.
         let or_5m_end = NaiveTime::from_hms_opt(9, 5, 0).unwrap();
-        let or_15m_end = NaiveTime::from_hms_opt(9, 15, 0).unwrap();
-        let or_30m_end = NaiveTime::from_hms_opt(9, 30, 0).unwrap();
 
         self.update_phase("OR 수집 중 (5분)").await;
         self.wait_until(or_5m_end).await;
@@ -834,11 +1035,19 @@ impl LiveRunner {
                 break;
             }
 
-            // 진입 마감
-            if now >= cfg.entry_cutoff {
+            // 진입 마감 — 실전 모드에서 LiveRunnerConfig 의 entry_cutoff_override 가
+            // 있으면 OrbFvgConfig.entry_cutoff 보다 이른 시각으로 마감한다 (Task 4).
+            let effective_cutoff = self
+                .live_cfg
+                .effective_entry_cutoff(cfg.entry_cutoff);
+            if now >= effective_cutoff {
                 let state = self.state.read().await;
                 if state.current_position.is_none() {
-                    info!("{}: 진입 마감 (15:20)", self.stock_name);
+                    info!(
+                        "{}: 진입 마감 ({})",
+                        self.stock_name,
+                        effective_cutoff.format("%H:%M")
+                    );
                     break;
                 }
                 drop(state);
@@ -867,9 +1076,17 @@ impl LiveRunner {
 
                         let cumulative_pnl: f64 = all_trades.iter().map(|t| t.pnl_pct()).sum();
 
-                        // 일일 최대 거래 횟수
-                        if trade_count >= cfg.max_daily_trades {
-                            info!("{}: 최대 거래 횟수 도달 ({}회)", self.stock_name, cfg.max_daily_trades);
+                        // 일일 최대 거래 횟수 — LiveRunnerConfig 의 override 가 우선.
+                        // 실전 모드에서는 max_daily_trades_override=Some(1) 이 기본이라
+                        // 하루 1회 진입 후 결과와 관계없이 러너가 멈춘다 (Task 4).
+                        let effective_max = self
+                            .live_cfg
+                            .effective_max_daily_trades(cfg.max_daily_trades);
+                        if trade_count >= effective_max {
+                            info!(
+                                "{}: 최대 거래 횟수 도달 ({}회, real_mode={})",
+                                self.stock_name, effective_max, self.live_cfg.real_mode
+                            );
                             break;
                         }
 
@@ -928,7 +1145,19 @@ impl LiveRunner {
             }
         }
 
-        self.update_phase("종료").await;
+        // 2026-04-15 Codex re-review: manual_intervention 상태면 phase 를 "종료" 로
+        // 덮어쓰지 않는다. 운영자에게 가장 보여줘야 할 "수동 개입 필요" 상태가 러너 종료
+        // 시점에 약화되지 않도록 한다 (status 동기화 태스크와 러너 종료 후처리가 이
+        // phase 를 그대로 UI 로 노출한다).
+        let is_manual = self.state.read().await.manual_intervention_required;
+        if !is_manual {
+            self.update_phase("종료").await;
+        } else {
+            info!(
+                "{}: manual_intervention 유지 — 종료 phase 전환 스킵",
+                self.stock_name
+            );
+        }
         self.update_pnl(&all_trades).await;
 
         for (i, t) in all_trades.iter().enumerate() {
@@ -1114,6 +1343,19 @@ impl LiveRunner {
         let search_after = self.signal_state.read().await.search_after;
 
         for (stage_name, or_high, or_low, or_end) in &available_stages {
+            // 이미 다른 stage 에서 최초 신호가 나왔으면 이 stage 는 건너뛴다.
+            // 기존 루프가 `best_signal.is_none()` 체크로 overwrite 만 막던 것과 동치.
+            if best_signal.is_some() {
+                break;
+            }
+
+            // 2026-04-16 Task 4: 실전 안전 모드 — allowed_stages 가 지정된 경우
+            // 허용 목록에 없는 stage 는 진입 경로에서 제외한다. UI/상태(or_stages)
+            // 에는 그대로 노출하므로 관찰은 계속 가능.
+            if !self.live_cfg.is_stage_allowed(stage_name) {
+                continue;
+            }
+
             let scan: Vec<_> = realtime_candles.iter()
                 .filter(|c| c.time >= *or_end)
                 .cloned()
@@ -1126,114 +1368,59 @@ impl LiveRunner {
             };
             if candles_5m.len() < 3 { continue; }
 
-            // FVG 탐색 (백테스트 scan_and_trade 동일 로직)
-            let mut pending_fvg: Option<FairValueGap> = None;
-            let mut fvg_side: Option<PositionSide> = None;
-            let mut fvg_formed_idx: usize = 0;
-            // FVG 생성 시점에 캡처된 메타데이터 (수익 분석용).
-            // BestSignal 로 넘기기 전에 리트레이스 확정 순간까지 보존.
-            let mut fvg_meta: Option<(u64, f64, f64, i64, i64, NaiveTime)> = None;
-            // (b_volume, b_body_ratio, or_breakout_pct, b_close, a_range, b_time)
+            // Phase 2: 백테스트와 공유하는 공통 SignalEngine pure function 호출.
+            // 탐지/리트레이스 확정 규칙은 여기서 한 번만 유지하고, 진입 가격 산정과
+            // BestSignal 매핑만 라이브가 추가 처리한다.
+            let engine_cfg = SignalEngineConfig {
+                strategy_id: "orb_fvg".to_string(),
+                stage_name: (*stage_name).to_string(),
+                or_high: *or_high,
+                or_low: *or_low,
+                fvg_expiry_candles: cfg.fvg_expiry_candles,
+                entry_cutoff: cfg.entry_cutoff,
+                require_or_breakout,
+                long_only: cfg.long_only,
+                confirmed_side,
+            };
+            let detected = match detect_next_fvg_signal(&candles_5m, &engine_cfg) {
+                Some(d) => d,
+                None => continue,
+            };
 
-            for (idx, c5) in candles_5m.iter().enumerate() {
-                if c5.time >= cfg.entry_cutoff { break; }
+            let side = detected.intent.side;
+            let gap = &detected.gap;
+            // 라이브 진입가: zone 진입 즉시 체결되도록 가장 먼 경계로 지정가 설정.
+            // Bullish FVG (Long): 가격이 위→아래로 내려오므로 top에서 먼저 체결.
+            // Bearish FVG (Short): 가격이 아래→위로 올라오므로 bottom에서 먼저 체결.
+            let entry_price = match side {
+                PositionSide::Long => gap.top,
+                PositionSide::Short => gap.bottom,
+            };
+            let stop_loss = gap.stop_loss;
+            let risk = (entry_price - stop_loss).abs();
+            let take_profit = match side {
+                PositionSide::Long => entry_price + (risk as f64 * cfg.rr_ratio) as i64,
+                PositionSide::Short => entry_price - (risk as f64 * cfg.rr_ratio) as i64,
+            };
 
-                if pending_fvg.is_some() && idx - fvg_formed_idx > cfg.fvg_expiry_candles {
-                    pending_fvg = None;
-                    fvg_side = None;
-                    fvg_meta = None;
-                }
-
-                if pending_fvg.is_none() && idx >= 2 {
-                    let a = &candles_5m[idx - 2];
-                    let b = &candles_5m[idx - 1];
-                    let c = c5;
-                    let a_range_raw = a.range();
-                    let a_range = a_range_raw.max(1);
-
-                    if b.is_bullish() && a.high < c.low && b.body_size() * 100 >= a_range * 30 {
-                        let or_ok = !require_or_breakout || b.close > *or_high;
-                        let side_ok = confirmed_side.map_or(true, |s| s == PositionSide::Long);
-                        if or_ok && side_ok {
-                            pending_fvg = Some(FairValueGap {
-                                direction: FvgDirection::Bullish,
-                                top: c.low, bottom: a.high,
-                                candle_b_idx: idx - 1, stop_loss: a.low,
-                            });
-                            fvg_side = Some(PositionSide::Long);
-                            fvg_formed_idx = idx;
-                            // FVG 메타데이터 캡처
-                            let b_body_ratio = b.body_size() as f64 / a_range as f64;
-                            let or_breakout_pct = if *or_high > 0 {
-                                (b.close - *or_high) as f64 / *or_high as f64
-                            } else { 0.0 };
-                            fvg_meta = Some((
-                                b.volume,
-                                b_body_ratio,
-                                or_breakout_pct,
-                                b.close,
-                                a_range_raw,
-                                b.time,
-                            ));
-                        }
-                    }
-                }
-
-                // 리트레이스 진입 확인
-                if let Some(ref gap) = pending_fvg {
-                    let side = fvg_side.unwrap();
-                    let retrace = match side {
-                        PositionSide::Long => c5.low,
-                        PositionSide::Short => c5.high,
-                    };
-
-                    if gap.contains_price(retrace) {
-                        // FVG zone 진입 즉시 체결되도록 가장 먼 경계로 지정가 설정.
-                        // Bullish FVG (Long): 가격이 위→아래로 내려오므로 top에서 먼저 체결.
-                        // Bearish FVG (Short): 가격이 아래→위로 올라오므로 bottom에서 먼저 체결.
-                        // 백테스트는 zone 터치만으로 mid_price 체결을 가정하는데,
-                        // 라이브 지정가를 top/bottom으로 하면 zone 진입 즉시 체결되어
-                        // 백테스트의 "zone 터치 진입"과 구조적으로 일치한다.
-                        let entry_price = match side {
-                            PositionSide::Long => gap.top,
-                            PositionSide::Short => gap.bottom,
-                        };
-                        let stop_loss = gap.stop_loss;
-                        let risk = (entry_price - stop_loss).abs();
-                        let take_profit = match side {
-                            PositionSide::Long => entry_price + (risk as f64 * cfg.rr_ratio) as i64,
-                            PositionSide::Short => entry_price - (risk as f64 * cfg.rr_ratio) as i64,
-                        };
-
-                        // 선착순: 이미 다른 단계가 신호를 냈으면 스킵
-                        if best_signal.is_none() {
-                            let gap_size_pct = if gap.bottom > 0 {
-                                (gap.top - gap.bottom) as f64 / gap.bottom as f64
-                            } else { 0.0 };
-                            let (b_volume, b_body_ratio, or_breakout_pct, b_close, a_range, b_time) =
-                                fvg_meta.unwrap_or((0u64, 0.0, 0.0, 0i64, 0i64, c5.time));
-                            best_signal = Some(BestSignal {
-                                side,
-                                entry_price,
-                                stop_loss,
-                                take_profit,
-                                stage_name,
-                                signal_time: c5.time,
-                                gap_top: gap.top,
-                                gap_bottom: gap.bottom,
-                                gap_size_pct,
-                                b_body_ratio,
-                                or_breakout_pct,
-                                b_volume,
-                                b_close,
-                                a_range,
-                                b_time,
-                            });
-                        }
-                        break; // 이 단계에서 첫 신호 찾으면 종료
-                    }
-                }
-            }
+            let meta = &detected.intent.metadata;
+            best_signal = Some(BestSignal {
+                side,
+                entry_price,
+                stop_loss,
+                take_profit,
+                stage_name,
+                signal_time: detected.intent.signal_time,
+                gap_top: gap.top,
+                gap_bottom: gap.bottom,
+                gap_size_pct: meta.gap_size_pct,
+                b_body_ratio: meta.b_body_ratio,
+                or_breakout_pct: meta.or_breakout_pct,
+                b_volume: meta.b_volume,
+                b_close: meta.b_close,
+                a_range: meta.a_range,
+                b_time: meta.b_time,
+            });
         }
 
         // 선착순으로 선택된 신호로 진입
@@ -1347,6 +1534,15 @@ impl LiveRunner {
             // 주문 실행 (API 에러만 재시도, 미체결은 재시도 불필요)
             match self.execute_entry(side, entry_price, stop_loss, take_profit).await {
                 Ok(_) => return Ok(true),
+                Err(KisError::ManualIntervention(msg)) => {
+                    // 2026-04-15 Codex review #4 대응: manual_intervention 전용 경로.
+                    // abort_entry 를 부르지 않아 shared position_lock 이 `Held(self)` 그대로
+                    // 유지되고, signal_state.search_after 도 건드리지 않는다.
+                    // trigger_manual_intervention 이 이미 stop_flag 를 세웠으므로
+                    // 상위 run() 루프는 다음 is_stopped 체크에서 탈출한다.
+                    error!("{}: manual_intervention 경로 — {}", self.stock_name, msg);
+                    return Err(KisError::ManualIntervention(msg));
+                }
                 Err(KisError::Preempted) => {
                     // 다른 종목 선점 요청으로 양보. FVG 자체는 유효 → search_after 전진 금지.
                     self.abort_entry(&sig, false, "preempted", current_price_at_signal).await;
@@ -1359,6 +1555,13 @@ impl LiveRunner {
                     tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                     match self.execute_entry(side, entry_price, stop_loss, take_profit).await {
                         Ok(_) => return Ok(true),
+                        Err(KisError::ManualIntervention(msg)) => {
+                            error!(
+                                "{}: 재시도 중 manual_intervention 경로 — {}",
+                                self.stock_name, msg
+                            );
+                            return Err(KisError::ManualIntervention(msg));
+                        }
                         Err(KisError::Preempted) => {
                             self.abort_entry(&sig, false, "preempted_on_retry", current_price_at_signal).await;
                             return Ok(false);
@@ -1407,16 +1610,17 @@ impl LiveRunner {
             None => return Ok(None),
         };
 
-        let risk = (pos.entry_price - pos.original_sl).abs() as f64;
-        let breakeven_dist = (risk * cfg.breakeven_r) as i64;
-        let trailing_dist = (risk * cfg.trailing_r) as i64;
+        let original_risk = (pos.entry_price - pos.original_sl).abs();
+        let pm_cfg = PositionManagerConfig {
+            rr_ratio: cfg.rr_ratio,
+            trailing_r: cfg.trailing_r,
+            breakeven_r: cfg.breakeven_r,
+            time_stop_candles: cfg.time_stop_candles,
+            candle_interval_min: 5,
+        };
 
         // ── Step 1: TP 지정가 체결 체크 (거래소 우선, SL보다 먼저) ──
-        let tp_hit = match pos.side {
-            PositionSide::Long => current >= pos.take_profit,
-            PositionSide::Short => current <= pos.take_profit,
-        };
-        if tp_hit {
+        if is_tp_hit(pos.side, pos.take_profit, current) {
             if let Some(ref tp_no) = pos.tp_order_no {
                 // TP 지정가 체결 확인 (내부에서 폴링 재시도)
                 let tp_no = tp_no.clone();
@@ -1494,55 +1698,52 @@ impl LiveRunner {
             return Ok(None);
         }
 
-        // ── Step 2: best_price 갱신 + 1R 본전스탑 + 트레일링 (백테스트 동일) ──
-        pos.best_price = match pos.side {
-            PositionSide::Long => pos.best_price.max(current),
-            PositionSide::Short => pos.best_price.min(current),
-        };
-
-        let profit_from_entry = match pos.side {
-            PositionSide::Long => pos.best_price - pos.entry_price,
-            PositionSide::Short => pos.entry_price - pos.best_price,
-        };
-
-        let mut trailing_changed = false;
-        if !pos.reached_1r && profit_from_entry >= breakeven_dist {
-            pos.reached_1r = true;
-            pos.stop_loss = pos.entry_price; // 본전스탑 (백테스트 동일)
-            info!("{}: 1R 도달 — 본전 스탑 활성화 (SL → {})", self.stock_name, pos.stop_loss);
+        // ── Step 2: best_price 갱신 + 1R 본전스탑 + 트레일링 (공통 helper) ──
+        let prev_sl = pos.stop_loss;
+        let update = update_best_and_trailing(
+            pos.side,
+            pos.entry_price,
+            &mut pos.best_price,
+            &mut pos.stop_loss,
+            &mut pos.reached_1r,
+            original_risk,
+            current,
+            &pm_cfg,
+        );
+        if update.reached_1r_newly {
+            info!(
+                "{}: 1R 도달 — 본전 스탑 활성화 (SL → {})",
+                self.stock_name, pos.stop_loss
+            );
             if let Some(ref el) = self.event_logger {
-                el.log_event(self.stock_code.as_str(), "position", "breakeven_activated", "info",
+                el.log_event(
+                    self.stock_code.as_str(),
+                    "position",
+                    "breakeven_activated",
+                    "info",
                     &format!("1R 도달 — SL → {}", pos.stop_loss),
-                    serde_json::json!({"price": current, "new_sl": pos.stop_loss, "best_price": pos.best_price}));
+                    serde_json::json!({
+                        "price": current,
+                        "new_sl": pos.stop_loss,
+                        "best_price": pos.best_price
+                    }),
+                );
             }
-            trailing_changed = true;
-        }
-
-        if pos.reached_1r {
-            let new_sl = match pos.side {
-                PositionSide::Long => pos.best_price - trailing_dist,
-                PositionSide::Short => pos.best_price + trailing_dist,
-            };
-            let improved = match pos.side {
-                PositionSide::Long => new_sl > pos.stop_loss,
-                PositionSide::Short => new_sl < pos.stop_loss,
-            };
-            if improved {
-                debug!("{}: 트레일링 SL 갱신 {} → {}", self.stock_name, pos.stop_loss, new_sl);
-                pos.stop_loss = new_sl;
-                trailing_changed = true;
-            }
+        } else if update.trailing_changed {
+            debug!(
+                "{}: 트레일링 SL 갱신 {} → {}",
+                self.stock_name, prev_sl, pos.stop_loss
+            );
         }
 
         // 트레일링 상태 변경 시 DB에 저장 (재시작 복구용)
-        if trailing_changed {
+        if update.trailing_changed {
             if let Some(ref store) = self.db_store {
                 let code = self.stock_code.as_str().to_string();
                 let sl = pos.stop_loss;
                 let r1r = pos.reached_1r;
                 let bp = pos.best_price;
                 let store = Arc::clone(store);
-                // 비동기 저장 (메인 루프 블로킹 방지)
                 tokio::spawn(async move {
                     let _ = store.update_position_trailing(&code, sl, r1r, bp).await;
                 });
@@ -1550,33 +1751,23 @@ impl LiveRunner {
         }
 
         // ── Step 3: SL 체크 ──
-        // WS 틱 리스너가 이미 감지한 경우(`sl_triggered_tick=true`)를 우선 존중하고,
-        // 그 외에는 REST 폴백/최신 캐시 `current` 기준으로 한 번 더 판정(안전망).
-        // 백테스트 Step 3과 동일하게 갱신된 `pos.stop_loss` 기준으로 비교.
-        let sl_hit = pos.sl_triggered_tick
+        // WS 틱 리스너가 이미 감지한 경우(`sl_triggered_tick=true`) 는 우선 존중하고,
+        // 그 외에는 REST 폴백/최신 캐시 `current` 로 판정.
+        let sl_breached = pos.sl_triggered_tick
             || match pos.side {
                 PositionSide::Long => current <= pos.stop_loss,
                 PositionSide::Short => current >= pos.stop_loss,
             };
-        if sl_hit {
-            let reason = if pos.reached_1r && pos.stop_loss > pos.original_sl {
-                if pos.stop_loss == pos.entry_price {
-                    ExitReason::BreakevenStop
-                } else {
-                    ExitReason::TrailingStop
-                }
-            } else {
-                ExitReason::StopLoss
-            };
+        if sl_breached {
+            let reason =
+                sl_exit_reason(pos.side, pos.stop_loss, pos.original_sl, pos.entry_price, pos.reached_1r);
             drop(state);
             let result = self.close_position_market(reason).await?;
             return Ok(Some(result));
         }
 
-        // ── Step 4: 시간스탑 (백테스트 동일: !reached_1r && 경과시간 초과) ──
-        let elapsed_min = (now - pos.entry_time).num_minutes();
-        let time_limit = cfg.time_stop_candles as i64 * 5;
-        if !pos.reached_1r && elapsed_min >= time_limit {
+        // ── Step 4: 시간스탑 (백테스트와 공통 helper) ──
+        if time_stop_breached_by_minutes(pos.entry_time, now, &pm_cfg, pos.reached_1r) {
             drop(state);
             let result = self.close_position_market(ExitReason::TimeStop).await?;
             return Ok(Some(result));
@@ -1585,7 +1776,7 @@ impl LiveRunner {
         Ok(None)
     }
 
-    /// 지정가 진입 주문 (FVG mid_price 지정가 → 슬리피지 0)
+    /// 지정가 진입 주문 (현행 live 정책: zone edge 패시브 지정가)
     async fn execute_entry(
         &self,
         side: PositionSide,
@@ -1606,7 +1797,7 @@ impl LiveRunner {
             return Err(KisError::Internal("진입 마감 임박".into()));
         }
 
-        // 지정가 = FVG mid_price를 호가단위로 정렬
+        // 지정가 = poll_and_enter 가 계산한 zone edge intended entry 를 호가단위로 정렬
         let limit_price = round_to_etf_tick(entry_price);
 
         // 주문 직전 매수가능수량 실시간 조회 (가용금액 변동 반영)
@@ -1672,6 +1863,32 @@ impl LiveRunner {
         if actual_qty == 0 {
             return Err(KisError::InsufficientBalance("매수가능수량 0주".into()));
         }
+
+        // cancel/fill race 방어용 진입 전 보유 수량 스냅샷 (2026-04-15 사고 대응).
+        // balance 조회 실패 시 race 감지 불가 → fail-close 로 진입 포기.
+        // 2026-04-15 Codex re-review: avg=0/미제공이어도 qty>0 이면 보유로 간주해야
+        // 이후 cancel 재검증이 "미보유" 로 오판되지 않는다 — `fetch_holding_snapshot` 사용.
+        let holding_before: u64 = match self.fetch_holding_snapshot().await {
+            Ok(Some((qty, _avg_opt))) => qty,
+            Ok(None) => 0,
+            Err(e) => {
+                warn!(
+                    "{}: 진입 전 잔고 조회 실패 — race 방어 불가로 진입 포기: {e}",
+                    self.stock_name
+                );
+                if let Some(ref el) = self.event_logger {
+                    el.log_event(
+                        self.stock_code.as_str(),
+                        "order",
+                        "entry_aborted_no_balance",
+                        "warn",
+                        "진입 전 잔고 조회 실패",
+                        serde_json::json!({"error": e.to_string()}),
+                    );
+                }
+                return Err(KisError::Internal(format!("진입 전 잔고 조회 실패: {e}")));
+            }
+        };
 
         let body = serde_json::json!({
             "CANO": self.client.account_no(),
@@ -1791,7 +2008,9 @@ impl LiveRunner {
                         &format!("주문 {} cancel 실패 → cancel_all_pending_orders 실행", order_no),
                         serde_json::json!({"order_no": &order_no}));
                 }
-                self.cancel_all_pending_orders().await;
+                if let Err(e) = self.cancel_all_pending_orders("entry_cancel_fallback").await {
+                    warn!("{}: entry_cancel_fallback 실패: {e}", self.stock_name);
+                }
             }
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
@@ -1802,29 +2021,139 @@ impl LiveRunner {
             }
 
             if filled_qty == 0 {
-                // 최종 미체결 확정
-                let cancel_reason = if was_preempted { "선점으로 미체결 취소" } else { "지정가 매수 미체결 확정" };
-                info!("{}: {} — 주문 {} 취소 완료", self.stock_name, cancel_reason, order_no);
-                if let Some(ref store) = self.db_store {
-                    store.save_order_log(
-                        self.stock_code.as_str(), "진입", &side_str,
-                        actual_qty as i64, limit_price, &order_no, "미체결취소", "",
-                    ).await;
+                // ── balance 재검증 (2026-04-15 사고 대응) ──
+                // query_execution 이 0을 반환해도 실제로는 체결된 후 cancel 이 된 상황 가능.
+                // inquire-balance 로 보유 수량 증가를 직접 확인하여 유령 포지션을 방지한다.
+                //
+                // 2026-04-15 Codex re-review: qty>0 이면 avg 제공 여부와 관계없이
+                // race 로 판정해야 한다 (과거 `fetch_holding_qty` 가 avg>0 까지 요구해
+                // 이 경로를 블라인드 스팟으로 남겼음 — `fetch_holding_snapshot` 으로 일원화).
+                match self.fetch_holding_snapshot().await {
+                    Ok(Some((qty_after, avg_opt))) if qty_after > holding_before => {
+                        let gained = qty_after - holding_before;
+                        // avg 미제공 시 지정가를 fallback 체결가로 사용 (슬리피지 0 가정).
+                        let fill_price_resolved = avg_opt.unwrap_or(limit_price);
+                        error!(
+                            "{}: ⚠ cancel/fill race 감지 — filled_qty=0 이지만 보유 {}주 증가 (before={}, after={}, avg={})",
+                            self.stock_name,
+                            gained,
+                            holding_before,
+                            qty_after,
+                            avg_opt
+                                .map(|v| format!("{}원", v))
+                                .unwrap_or_else(|| "미제공".to_string())
+                        );
+                        if let Some(ref el) = self.event_logger {
+                            el.log_event(
+                                self.stock_code.as_str(),
+                                "order",
+                                "cancel_fill_race_detected",
+                                "critical",
+                                &format!(
+                                    "cancel 후 보유 증가 — {}주 (before={}, after={})",
+                                    gained, holding_before, qty_after
+                                ),
+                                serde_json::json!({
+                                    "order_no": &order_no,
+                                    "limit_price": limit_price,
+                                    "holding_before": holding_before,
+                                    "holding_after": qty_after,
+                                    "gained": gained,
+                                    "avg_price": avg_opt,
+                                    "fill_price_resolved": fill_price_resolved,
+                                }),
+                            );
+                        }
+                        // 실제 체결된 것으로 처리 → 체결 확정 경로로 fall-through.
+                        filled_qty = gained.min(actual_qty);
+                        fill_price = fill_price_resolved;
+                        // 아래 "체결 확정" 블록으로 진행
+                    }
+                    Ok(_) => {
+                        // 잔고 증가 없음 → 정상 미체결
+                        let cancel_reason = if was_preempted {
+                            "선점으로 미체결 취소"
+                        } else {
+                            "지정가 매수 미체결 확정"
+                        };
+                        info!(
+                            "{}: {} — 주문 {} 취소 완료",
+                            self.stock_name, cancel_reason, order_no
+                        );
+                        if let Some(ref store) = self.db_store {
+                            store
+                                .save_order_log(
+                                    self.stock_code.as_str(),
+                                    "진입",
+                                    &side_str,
+                                    actual_qty as i64,
+                                    limit_price,
+                                    &order_no,
+                                    "미체결취소",
+                                    "",
+                                )
+                                .await;
+                        }
+                        if let Some(ref el) = self.event_logger {
+                            el.log_event(
+                                self.stock_code.as_str(),
+                                "order",
+                                "entry_cancelled",
+                                "info",
+                                &format!("{} — {}원 {}주", cancel_reason, limit_price, actual_qty),
+                                serde_json::json!({
+                                    "order_no": &order_no,
+                                    "limit_price": limit_price,
+                                    "quantity": actual_qty,
+                                    "preempted": was_preempted,
+                                    "holding_verified": true,
+                                }),
+                            );
+                        }
+                        if was_preempted {
+                            return Err(KisError::Preempted);
+                        }
+                        return Err(KisError::Internal("지정가 매수 미체결".into()));
+                    }
+                    Err(e) => {
+                        // balance 조회 실패 → 실제 보유 여부 모름 → manual_intervention.
+                        // 2026-04-15 Codex review #4 대응: `KisError::ManualIntervention` 로
+                        // 반환해 상위 `poll_and_enter` 가 일반 진입 실패로 abort_entry 호출 +
+                        // shared lock 해제하는 회귀를 차단한다.
+                        let reason = format!(
+                            "cancel_verify_failed: order_no={} limit={} qty={} error={}",
+                            order_no, limit_price, actual_qty, e
+                        );
+                        if let Some(ref el) = self.event_logger {
+                            el.log_event(
+                                self.stock_code.as_str(),
+                                "order",
+                                "cancel_verify_failed",
+                                "critical",
+                                "cancel 후 balance 조회 실패 — 유령 포지션 가능",
+                                serde_json::json!({
+                                    "order_no": &order_no,
+                                    "limit_price": limit_price,
+                                    "quantity": actual_qty,
+                                    "error": e.to_string(),
+                                }),
+                            );
+                        }
+                        self.trigger_manual_intervention(
+                            reason.clone(),
+                            serde_json::json!({
+                                "trigger": "cancel_verify_failed",
+                                "order_no": &order_no,
+                                "limit_price": limit_price,
+                                "quantity": actual_qty,
+                                "error": e.to_string(),
+                            }),
+                            ManualInterventionMode::KeepLock,
+                        )
+                        .await;
+                        return Err(KisError::ManualIntervention(reason));
+                    }
                 }
-                if let Some(ref el) = self.event_logger {
-                    el.log_event(self.stock_code.as_str(), "order", "entry_cancelled", "info",
-                        &format!("{} — {}원 {}주", cancel_reason, limit_price, actual_qty),
-                        serde_json::json!({
-                            "order_no": &order_no, "limit_price": limit_price,
-                            "quantity": actual_qty, "preempted": was_preempted,
-                        }));
-                }
-                // preempt 는 FVG 자체 무효가 아니므로 전용 variant 로 반환
-                // (poll_and_enter 의 `abort_entry(advance_search=false)` 경로로 수렴)
-                if was_preempted {
-                    return Err(KisError::Preempted);
-                }
-                return Err(KisError::Internal("지정가 매수 미체결".into()));
             }
         }
 
@@ -1896,6 +2225,9 @@ impl LiveRunner {
         // 같은 task에서 read+write를 동시에 잡으면 tokio RwLock에서 deadlock 발생.
         let ap_to_save = {
             let mut state = self.state.write().await;
+            // 재시작 복구 근거 메타 (임의 0.3% 리스크 재생성 제거의 전제)
+            let or_high = state.or_high;
+            let or_low = state.or_low;
             state.current_position = Some(Position {
                 side,
                 entry_price: actual_entry,
@@ -1928,6 +2260,12 @@ impl LiveRunner {
                 original_sl: actual_sl,
                 reached_1r: false,
                 best_price: actual_entry,
+                or_high,
+                or_low,
+                or_source: None,
+                trigger_price: Some(entry_price),
+                original_risk: Some(theoretical_risk),
+                entry_mode: Some("limit_passive".to_string()),
             })
         }; // write lock dropped here
 
@@ -2828,6 +3166,43 @@ impl LiveRunner {
     }
 }
 
+/// `inquire-balance` 응답 items 에서 이 종목의 보유 스냅샷 추출 (순수 파싱).
+///
+/// 2026-04-15 Codex re-review 대응 — `fetch_holding_snapshot` 의 판정 규칙을 테스트
+/// 가능한 순수 함수로 분리. 핵심 원칙:
+/// - qty == 0 인 항목은 스킵 (다음 항목으로 진행)
+/// - qty > 0 이면 보유로 확정, avg 는 파싱 가능하고 >0 이면 `Some` 아니면 `None`
+/// - 같은 종목이 중복되면 먼저 발견한 "qty > 0" 항목 사용
+///
+/// 반환:
+/// - `Some((qty, Some(avg)))`: 보유 + 평균매입가 확보
+/// - `Some((qty, None))`: 보유 (qty>0) 이지만 avg 가 0/미제공/파싱 불가
+/// - `None`: 응답에 해당 종목 없거나 qty=0 만 있음
+fn parse_holding_snapshot(items: &[serde_json::Value], stock_code: &str) -> Option<(u64, Option<i64>)> {
+    for item in items {
+        let code = item.get("pdno").and_then(|v| v.as_str()).unwrap_or("");
+        if code != stock_code {
+            continue;
+        }
+        let qty: u64 = item
+            .get("hldg_qty")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        if qty == 0 {
+            continue;
+        }
+        let avg_opt: Option<i64> = item
+            .get("pchs_avg_pric")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<f64>().ok())
+            .map(|f| f as i64)
+            .filter(|&v| v > 0);
+        return Some((qty, avg_opt));
+    }
+    None
+}
+
 /// KRX ETF 호가단위로 round-nearest (2023년 KRX 호가단위 개편 후).
 /// - 5,000원 미만: 1원 단위 (round 불필요)
 /// - 5,000원 이상: 5원 단위
@@ -2963,5 +3338,201 @@ mod tick_tests {
         assert_eq!(round_to_etf_tick(92_792), 92_790);
         assert_eq!(round_to_etf_tick(91_525), 91_525); // 이미 정렬됨
         assert_eq!(round_to_etf_tick(92_102), 92_100); // 92102 → 92100
+    }
+}
+
+/// 2026-04-15 Codex re-review #3 대응 테스트.
+///
+/// `parse_holding_snapshot` 의 qty>0 판정 규칙을 고정한다. avg=0/미제공 블라인드
+/// 스팟이 재발하면 cancel/fill race 방어와 safe_orphan_cleanup 두 경로가 동시에
+/// 뚫리므로, 이 규칙만은 회귀 테스트로 계속 감시한다.
+#[cfg(test)]
+mod holding_snapshot_tests {
+    use super::parse_holding_snapshot;
+    use serde_json::json;
+
+    #[test]
+    fn qty_gt_zero_with_valid_avg_returns_both() {
+        let items = vec![json!({
+            "pdno": "122630",
+            "hldg_qty": "54",
+            "pchs_avg_pric": "92450.5",
+        })];
+        let snap = parse_holding_snapshot(&items, "122630");
+        assert_eq!(snap, Some((54u64, Some(92_450i64))));
+    }
+
+    #[test]
+    fn qty_gt_zero_with_zero_avg_still_treated_as_holding() {
+        // avg=0 인데 qty>0 인 케이스 — 모의투자나 일부 특수 상태에서 발생.
+        // 반드시 Some 을 반환해야 cancel/fill race / orphan_cleanup 이 오판하지 않는다.
+        let items = vec![json!({
+            "pdno": "122630",
+            "hldg_qty": "54",
+            "pchs_avg_pric": "0",
+        })];
+        let snap = parse_holding_snapshot(&items, "122630");
+        assert_eq!(snap, Some((54u64, None)));
+    }
+
+    #[test]
+    fn qty_gt_zero_with_missing_avg_still_treated_as_holding() {
+        // pchs_avg_pric 필드 자체 부재.
+        let items = vec![json!({
+            "pdno": "122630",
+            "hldg_qty": "3",
+        })];
+        let snap = parse_holding_snapshot(&items, "122630");
+        assert_eq!(snap, Some((3u64, None)));
+    }
+
+    #[test]
+    fn qty_gt_zero_with_unparseable_avg_returns_none_avg() {
+        let items = vec![json!({
+            "pdno": "122630",
+            "hldg_qty": "10",
+            "pchs_avg_pric": "N/A",
+        })];
+        let snap = parse_holding_snapshot(&items, "122630");
+        assert_eq!(snap, Some((10u64, None)));
+    }
+
+    #[test]
+    fn qty_zero_skipped_other_items_considered() {
+        // 잔고 응답에 qty=0 잔재가 먼저 나와도 실제 보유 항목을 찾아야 한다.
+        let items = vec![
+            json!({ "pdno": "122630", "hldg_qty": "0", "pchs_avg_pric": "91000" }),
+            json!({ "pdno": "122630", "hldg_qty": "7", "pchs_avg_pric": "91500" }),
+        ];
+        let snap = parse_holding_snapshot(&items, "122630");
+        assert_eq!(snap, Some((7u64, Some(91_500i64))));
+    }
+
+    #[test]
+    fn other_stock_codes_ignored() {
+        let items = vec![
+            json!({ "pdno": "114800", "hldg_qty": "20", "pchs_avg_pric": "1500" }),
+            json!({ "pdno": "005930", "hldg_qty": "50", "pchs_avg_pric": "70000" }),
+        ];
+        let snap = parse_holding_snapshot(&items, "122630");
+        assert_eq!(snap, None);
+    }
+
+    #[test]
+    fn empty_items_returns_none() {
+        let snap = parse_holding_snapshot(&[], "122630");
+        assert_eq!(snap, None);
+    }
+}
+
+/// 2026-04-15 Codex re-review #4 대응 테스트.
+///
+/// `trigger_manual_intervention(KeepLock)` 호출 시 shared `PositionLockState` 가
+/// `Held(self_code)` 로 고정되는지, state 의 manual 플래그 / stop_flag / phase 가
+/// 일관되게 세팅되는지 확인한다. KisHttpClient 실제 요청 없이 검증하기 위해
+/// LiveRunner 에 dummy 로 StockCode 와 shared lock 만 주입하는 테스트 빌더 사용.
+#[cfg(test)]
+mod manual_intervention_tests {
+    use super::*;
+    use crate::domain::types::{Environment, StockCode};
+    use crate::infrastructure::kis_client::auth::TokenManager;
+    use crate::infrastructure::kis_client::http_client::KisHttpClient;
+    use crate::infrastructure::kis_client::rate_limiter::KisRateLimiter;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn dummy_http_client() -> Arc<KisHttpClient> {
+        // 실제 HTTP 요청은 발생하지 않음 — LiveRunner::new 타입 충족용 dummy.
+        let env = Environment::Paper;
+        let tm = Arc::new(TokenManager::new(
+            "test_appkey".to_string(),
+            "test_appsecret".to_string(),
+            env,
+        ));
+        let rl = Arc::new(KisRateLimiter::new(env));
+        Arc::new(KisHttpClient::new(
+            tm,
+            rl,
+            env,
+            "00000000-00".to_string(),
+            "01".to_string(),
+        ))
+    }
+
+    fn build_runner(code: &str) -> (LiveRunner, Arc<RwLock<PositionLockState>>) {
+        let stock_code = StockCode::new(code).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let lock = Arc::new(RwLock::new(PositionLockState::Free));
+        let runner = LiveRunner::new(
+            dummy_http_client(),
+            stock_code,
+            format!("테스트{}", code),
+            1,
+            stop,
+        )
+        .with_position_lock(Arc::clone(&lock));
+        (runner, lock)
+    }
+
+    #[tokio::test]
+    async fn trigger_manual_intervention_keeps_lock_as_held_self() {
+        let (runner, lock) = build_runner("122630");
+        runner
+            .trigger_manual_intervention(
+                "test reason".to_string(),
+                serde_json::json!({}),
+                ManualInterventionMode::KeepLock,
+            )
+            .await;
+
+        let guard = lock.read().await;
+        match &*guard {
+            PositionLockState::Held(c) => assert_eq!(c, "122630"),
+            other => panic!("expected Held(\"122630\"), got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn trigger_manual_intervention_sets_state_flags() {
+        let (runner, _lock) = build_runner("122630");
+        runner
+            .trigger_manual_intervention(
+                "state flags test".to_string(),
+                serde_json::json!({}),
+                ManualInterventionMode::KeepLock,
+            )
+            .await;
+
+        let state = runner.state.read().await;
+        assert!(state.manual_intervention_required);
+        assert!(state.degraded);
+        assert_eq!(state.phase, "수동 개입 필요");
+        assert_eq!(state.degraded_reason.as_deref(), Some("state flags test"));
+        assert!(runner.stop_flag.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn trigger_manual_intervention_overwrites_prior_lock_with_self_held() {
+        // 다른 종목이 Pending lock 을 잡고 있어도, 이 종목이 manual_intervention 으로
+        // 진입하면 shared lock 을 self Held 로 고정해야 한다 — 상대 종목의 새 진입을
+        // 끌려 들어가게 하지 않기 위함.
+        let (runner, lock) = build_runner("122630");
+        *lock.write().await = PositionLockState::Pending {
+            code: "114800".to_string(),
+            preempted: false,
+        };
+
+        runner
+            .trigger_manual_intervention(
+                "override test".to_string(),
+                serde_json::json!({}),
+                ManualInterventionMode::KeepLock,
+            )
+            .await;
+
+        let guard = lock.read().await;
+        match &*guard {
+            PositionLockState::Held(c) => assert_eq!(c, "122630"),
+            other => panic!("expected Held(\"122630\"), got {:?}", other),
+        }
     }
 }

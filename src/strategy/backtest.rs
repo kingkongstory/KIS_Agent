@@ -8,6 +8,7 @@ use crate::infrastructure::cache::postgres_store::PostgresStore;
 
 use super::candle::MinuteCandle;
 use super::orb_fvg::OrbFvgStrategy;
+use super::parity::types::StageDef;
 use super::types::{PositionSide, TradeResult};
 
 /// 종목별 incremental 시뮬레이션 상태 (run_dual_locked 전용)
@@ -18,6 +19,15 @@ struct StockState {
     cumulative_pnl: f64,
     confirmed_side: Option<PositionSide>,
 }
+
+/// 백테스트 실행 버전 태그.
+///
+/// `docs/strategy/backtest-live-parity-architecture.md` §5 "legacy baseline 보존"
+/// 에 따라 보고서가 어떤 전략/실행 모델로 산출됐는지 식별한다.
+/// parity/replay 가 추가되면 같은 `stock_code`·`days` 에 대해 다른 값을 찍는다.
+pub const LEGACY_STRATEGY_VERSION: &str = "legacy_orb_fvg";
+pub const LEGACY_EXECUTION_VERSION: &str = "mid_price_zone_touch";
+pub const LEGACY_SIMULATION_MODE: &str = "legacy_backtest";
 
 /// 백테스트 보고서
 #[derive(Debug)]
@@ -31,6 +41,14 @@ pub struct BacktestReport {
     pub win_rate: f64,
     pub total_pnl_pct: f64,
     pub avg_rr: f64,
+    /// 전략 식별자. 현재 경로는 모두 `legacy_orb_fvg`. Phase 7 이후 새 전략이
+    /// 추가되면 `orb_vwap_pullback` 등으로 분기.
+    pub strategy_version: String,
+    /// 실행 모델 식별자. legacy 경로는 `mid_price_zone_touch`, parity 경로는
+    /// `passive_top_bottom_timeout_30s` 등으로 Phase 4 이후 분기.
+    pub execution_version: String,
+    /// 시뮬레이션 모드: `legacy_backtest` | `parity_backtest` | `replay`.
+    pub simulation_mode: String,
 }
 
 impl std::fmt::Display for BacktestReport {
@@ -38,6 +56,11 @@ impl std::fmt::Display for BacktestReport {
         writeln!(f, "\n{}", "=".repeat(60))?;
         writeln!(f, "  ORB+FVG 백테스트 결과 — {}", self.stock_code)?;
         writeln!(f, "{}", "=".repeat(60))?;
+        writeln!(
+            f,
+            "  버전: strategy={} / execution={} / mode={}",
+            self.strategy_version, self.execution_version, self.simulation_mode
+        )?;
         writeln!(f, "  테스트 기간: {}일", self.days_tested)?;
         writeln!(f, "  총 거래: {}회", self.total_trades)?;
         writeln!(f, "  승리: {}회 / 패배: {}회", self.wins, self.losses)?;
@@ -399,7 +422,77 @@ impl BacktestEngine {
             trades, total_trades: total, wins, losses,
             win_rate: if total > 0 { wins as f64 / total as f64 * 100.0 } else { 0.0 },
             total_pnl_pct: total_pnl, avg_rr,
+            strategy_version: LEGACY_STRATEGY_VERSION.to_string(),
+            execution_version: LEGACY_EXECUTION_VERSION.to_string(),
+            simulation_mode: LEGACY_SIMULATION_MODE.to_string(),
         }
+    }
+
+    fn live_stage_defs(&self) -> Vec<StageDef> {
+        let or_start = self.strategy.config.or_start;
+        vec![
+            StageDef {
+                name: "5m".into(),
+                or_start,
+                or_end: NaiveTime::from_hms_opt(9, 5, 0).unwrap(),
+            },
+            StageDef {
+                name: "15m".into(),
+                or_start,
+                or_end: NaiveTime::from_hms_opt(9, 15, 0).unwrap(),
+            },
+            StageDef {
+                name: "30m".into(),
+                or_start,
+                or_end: NaiveTime::from_hms_opt(9, 30, 0).unwrap(),
+            },
+        ]
+    }
+
+    async fn fetch_day_candles_with_interval(
+        &self,
+        stock_code: &str,
+        date: NaiveDate,
+        interval_min: i16,
+    ) -> Result<Vec<MinuteCandle>, KisError> {
+        let start = NaiveDateTime::new(date, NaiveTime::from_hms_opt(9, 0, 0).unwrap());
+        let end = NaiveDateTime::new(date, NaiveTime::from_hms_opt(15, 30, 0).unwrap());
+
+        let db_candles = self
+            .store
+            .get_minute_ohlcv(stock_code, start, end, interval_min)
+            .await?;
+
+        Ok(db_candles
+            .into_iter()
+            .map(|c| MinuteCandle {
+                date: c.datetime.date(),
+                time: c.datetime.time(),
+                open: c.open,
+                high: c.high,
+                low: c.low,
+                close: c.close,
+                volume: c.volume as u64,
+            })
+            .collect())
+    }
+
+    async fn fetch_day_candles_prefer_1m(
+        &self,
+        stock_code: &str,
+        date: NaiveDate,
+    ) -> Result<(Vec<MinuteCandle>, i16), KisError> {
+        if self.source_interval != 1 {
+            let candles_1m = self.fetch_day_candles_with_interval(stock_code, date, 1).await?;
+            if !candles_1m.is_empty() {
+                return Ok((candles_1m, 1));
+            }
+        }
+
+        let candles = self
+            .fetch_day_candles_with_interval(stock_code, date, self.source_interval)
+            .await?;
+        Ok((candles, self.source_interval))
     }
 
     /// Multi-Stage ORB 백테스트: 5분/15분/30분 OR을 동시 추적 (선착순)
@@ -488,6 +581,9 @@ impl BacktestEngine {
             win_rate: if total > 0 { wins as f64 / total as f64 * 100.0 } else { 0.0 },
             total_pnl_pct: total_pnl,
             avg_rr,
+            strategy_version: LEGACY_STRATEGY_VERSION.to_string(),
+            execution_version: LEGACY_EXECUTION_VERSION.to_string(),
+            simulation_mode: LEGACY_SIMULATION_MODE.to_string(),
         })
     }
 
@@ -575,6 +671,9 @@ impl BacktestEngine {
             win_rate: if total > 0 { wins as f64 / total as f64 * 100.0 } else { 0.0 },
             total_pnl_pct: total_pnl,
             avg_rr,
+            strategy_version: LEGACY_STRATEGY_VERSION.to_string(),
+            execution_version: LEGACY_EXECUTION_VERSION.to_string(),
+            simulation_mode: LEGACY_SIMULATION_MODE.to_string(),
         })
     }
 
@@ -650,6 +749,9 @@ impl BacktestEngine {
             },
             total_pnl_pct: total_pnl,
             avg_rr,
+            strategy_version: LEGACY_STRATEGY_VERSION.to_string(),
+            execution_version: LEGACY_EXECUTION_VERSION.to_string(),
+            simulation_mode: LEGACY_SIMULATION_MODE.to_string(),
         })
     }
 
@@ -756,6 +858,250 @@ impl BacktestEngine {
             win_rate: if total > 0 { wins as f64 / total as f64 * 100.0 } else { 0.0 },
             total_pnl_pct: total_pnl,
             avg_rr,
+            strategy_version: LEGACY_STRATEGY_VERSION.to_string(),
+            execution_version: LEGACY_EXECUTION_VERSION.to_string(),
+            simulation_mode: LEGACY_SIMULATION_MODE.to_string(),
+        })
+    }
+
+    /// Parity 백테스트: `SignalEngine + ExecutionPolicy + PositionManager` 조합.
+    ///
+    /// `policy_id` 에 따라 분기:
+    /// - "passive" (기본): `PassiveTopBottomTimeout30s` — 현재 라이브 규칙 재현.
+    /// - "legacy": `LegacyMidPriceSim` — 기존 legacy baseline 과 동일한 mid_price 진입.
+    ///
+    /// 보고서의 `execution_version` / `simulation_mode` 가 legacy 경로와
+    /// 다르게 찍히므로 같은 날짜에 대해 legacy vs parity 비교가 가능하다.
+    pub async fn run_parity(
+        &self,
+        stock_code: &str,
+        days: usize,
+        policy_id: &str,
+    ) -> Result<BacktestReport, KisError> {
+        use super::parity::{
+            execution_policy::{LegacyMidPriceSim, PassiveTopBottomTimeout30s},
+            parity_backtest::ParityDayRunner,
+            position_manager::PositionManagerConfig,
+            signal_engine::OrbFvgSignalEngine,
+        };
+
+        let dates = self.fetch_available_dates(stock_code, days).await?;
+        if dates.is_empty() {
+            return Err(KisError::Internal(format!(
+                "{stock_code}: DB에 분봉 데이터가 없습니다."
+            )));
+        }
+
+        info!(
+            "parity 백테스트 대상: {}일 ({} ~ {}), policy={}",
+            dates.len(),
+            dates.first().unwrap(),
+            dates.last().unwrap(),
+            policy_id
+        );
+
+        let cfg = &self.strategy.config;
+        let pm_config = PositionManagerConfig {
+            rr_ratio: cfg.rr_ratio,
+            trailing_r: cfg.trailing_r,
+            breakeven_r: cfg.breakeven_r,
+            time_stop_candles: cfg.time_stop_candles,
+            candle_interval_min: 5,
+        };
+
+        let (execution_version, simulation_mode) = match policy_id {
+            "legacy" => ("mid_price_zone_touch", "parity_backtest_legacy"),
+            _ => ("passive_top_bottom_timeout_30s", "parity_backtest_passive"),
+        };
+
+        let stage_defs = self.live_stage_defs();
+        let mut trades = Vec::new();
+        for date in &dates {
+            let (candles, interval_used) = self.fetch_day_candles_prefer_1m(stock_code, *date).await?;
+            if candles.is_empty() {
+                warn!("{date}: 분봉 데이터 없음, 건너뜀");
+                continue;
+            }
+            if interval_used != 1 {
+                warn!(
+                    "{date}: 1분봉 없음 — parity를 {}분 입력으로 근사 실행",
+                    interval_used
+                );
+            }
+
+            info!("{date}: {}개 캔들 로드 (parity)", candles.len());
+            let day_results: Vec<TradeResult> = match policy_id {
+                "legacy" => {
+                    let runner = ParityDayRunner {
+                        signal_engine: OrbFvgSignalEngine,
+                        policy: LegacyMidPriceSim,
+                        strategy_id: "orb_fvg".into(),
+                        stage_name: "parity_single_stage".into(),
+                        or_start: cfg.or_start,
+                        or_end: cfg.or_end,
+                        entry_cutoff: cfg.entry_cutoff,
+                        force_exit: cfg.force_exit,
+                        pm_config,
+                        fvg_expiry_candles: cfg.fvg_expiry_candles,
+                        long_only: cfg.long_only,
+                        rr_ratio: cfg.rr_ratio,
+                        max_entry_drift_pct: None,
+                        max_daily_trades: cfg.max_daily_trades,
+                        max_daily_loss_pct: cfg.max_daily_loss_pct,
+                    };
+                    runner.run_day_live_like(&candles, &stage_defs)
+                }
+                _ => {
+                    let runner = ParityDayRunner {
+                        signal_engine: OrbFvgSignalEngine,
+                        policy: PassiveTopBottomTimeout30s,
+                        strategy_id: "orb_fvg".into(),
+                        stage_name: "parity_single_stage".into(),
+                        or_start: cfg.or_start,
+                        or_end: cfg.or_end,
+                        entry_cutoff: cfg.entry_cutoff,
+                        force_exit: cfg.force_exit,
+                        pm_config,
+                        fvg_expiry_candles: cfg.fvg_expiry_candles,
+                        long_only: cfg.long_only,
+                        rr_ratio: cfg.rr_ratio,
+                        max_entry_drift_pct: None,
+                        max_daily_trades: cfg.max_daily_trades,
+                        max_daily_loss_pct: cfg.max_daily_loss_pct,
+                    };
+                    runner.run_day_live_like(&candles, &stage_defs)
+                }
+            };
+            for result in day_results {
+                trades.push((*date, result));
+            }
+        }
+
+        let total = trades.len();
+        let wins = trades.iter().filter(|(_, t)| t.is_win()).count();
+        let losses = total - wins;
+        let total_pnl: f64 = trades.iter().map(|(_, t)| t.pnl_pct()).sum();
+        let avg_rr = if total > 0 {
+            trades.iter().map(|(_, t)| t.realized_rr()).sum::<f64>() / total as f64
+        } else {
+            0.0
+        };
+
+        Ok(BacktestReport {
+            stock_code: stock_code.to_string(),
+            days_tested: dates.len(),
+            trades,
+            total_trades: total,
+            wins,
+            losses,
+            win_rate: if total > 0 { wins as f64 / total as f64 * 100.0 } else { 0.0 },
+            total_pnl_pct: total_pnl,
+            avg_rr,
+            strategy_version: LEGACY_STRATEGY_VERSION.to_string(),
+            execution_version: execution_version.to_string(),
+            simulation_mode: simulation_mode.to_string(),
+        })
+    }
+
+    /// Candle replay comparison — 단일 날짜에 대해 legacy / parity-legacy /
+    /// parity-passive 세 경로를 실행하여 결과를 나란히 반환.
+    ///
+    /// `docs/strategy/backtest-live-parity-architecture.md` §12.3 / §14.3.
+    pub async fn replay_day(
+        &self,
+        stock_code: &str,
+        date: NaiveDate,
+    ) -> Result<super::parity::replay::ReplayDayReport, KisError> {
+        use super::parity::{
+            execution_policy::{LegacyMidPriceSim, PassiveTopBottomTimeout30s},
+            parity_backtest::ParityDayRunner,
+            position_manager::PositionManagerConfig,
+            replay::ReplayDayReport,
+            signal_engine::OrbFvgSignalEngine,
+        };
+
+        let candles = self.fetch_day_candles(stock_code, date).await?;
+        if candles.is_empty() {
+            return Err(KisError::Internal(format!(
+                "{stock_code} / {date}: DB에 분봉 데이터가 없습니다."
+            )));
+        }
+        let (parity_candles, interval_used) = self.fetch_day_candles_prefer_1m(stock_code, date).await?;
+        if parity_candles.is_empty() {
+            return Err(KisError::Internal(format!(
+                "{stock_code} / {date}: parity 실행용 분봉 데이터가 없습니다."
+            )));
+        }
+        if interval_used != 1 {
+            warn!(
+                "{stock_code} / {date}: 1분봉 없음 — replay parity를 {}분 입력으로 근사 실행",
+                interval_used
+            );
+        }
+
+        let stages = self.live_stage_defs();
+        let stage_tuples = [
+            ("5분OR", NaiveTime::from_hms_opt(9, 0, 0).unwrap(), NaiveTime::from_hms_opt(9, 5, 0).unwrap()),
+            ("15분OR", NaiveTime::from_hms_opt(9, 0, 0).unwrap(), NaiveTime::from_hms_opt(9, 15, 0).unwrap()),
+            ("30분OR", NaiveTime::from_hms_opt(9, 0, 0).unwrap(), NaiveTime::from_hms_opt(9, 30, 0).unwrap()),
+        ];
+
+        let legacy = self.run_day_multi_stage(&candles, &stage_tuples);
+
+        let cfg = &self.strategy.config;
+        let pm_config = PositionManagerConfig {
+            rr_ratio: cfg.rr_ratio,
+            trailing_r: cfg.trailing_r,
+            breakeven_r: cfg.breakeven_r,
+            time_stop_candles: cfg.time_stop_candles,
+            candle_interval_min: 5,
+        };
+
+        let runner_legacy_policy = ParityDayRunner {
+            signal_engine: OrbFvgSignalEngine,
+            policy: LegacyMidPriceSim,
+            strategy_id: "orb_fvg".into(),
+            stage_name: "parity_single_stage".into(),
+            or_start: cfg.or_start,
+            or_end: cfg.or_end,
+            entry_cutoff: cfg.entry_cutoff,
+            force_exit: cfg.force_exit,
+            pm_config,
+            fvg_expiry_candles: cfg.fvg_expiry_candles,
+            long_only: cfg.long_only,
+            rr_ratio: cfg.rr_ratio,
+            max_entry_drift_pct: None,
+            max_daily_trades: cfg.max_daily_trades,
+            max_daily_loss_pct: cfg.max_daily_loss_pct,
+        };
+        let parity_legacy = runner_legacy_policy.run_day_live_like(&parity_candles, &stages);
+
+        let runner_passive = ParityDayRunner {
+            signal_engine: OrbFvgSignalEngine,
+            policy: PassiveTopBottomTimeout30s,
+            strategy_id: "orb_fvg".into(),
+            stage_name: "parity_single_stage".into(),
+            or_start: cfg.or_start,
+            or_end: cfg.or_end,
+            entry_cutoff: cfg.entry_cutoff,
+            force_exit: cfg.force_exit,
+            pm_config,
+            fvg_expiry_candles: cfg.fvg_expiry_candles,
+            long_only: cfg.long_only,
+            rr_ratio: cfg.rr_ratio,
+            max_entry_drift_pct: None,
+            max_daily_trades: cfg.max_daily_trades,
+            max_daily_loss_pct: cfg.max_daily_loss_pct,
+        };
+        let parity_passive = runner_passive.run_day_live_like(&parity_candles, &stages);
+
+        Ok(ReplayDayReport {
+            date,
+            stock_code: stock_code.to_string(),
+            legacy,
+            parity_legacy,
+            parity_passive,
+            source_interval_used: interval_used,
         })
     }
 
@@ -789,25 +1135,7 @@ impl BacktestEngine {
         stock_code: &str,
         date: NaiveDate,
     ) -> Result<Vec<MinuteCandle>, KisError> {
-        let start = NaiveDateTime::new(date, NaiveTime::from_hms_opt(9, 0, 0).unwrap());
-        let end = NaiveDateTime::new(date, NaiveTime::from_hms_opt(15, 30, 0).unwrap());
-
-        let db_candles = self
-            .store
-            .get_minute_ohlcv(stock_code, start, end, self.source_interval)
-            .await?;
-
-        Ok(db_candles
-            .into_iter()
-            .map(|c| MinuteCandle {
-                date: c.datetime.date(),
-                time: c.datetime.time(),
-                open: c.open,
-                high: c.high,
-                low: c.low,
-                close: c.close,
-                volume: c.volume as u64,
-            })
-            .collect())
+        self.fetch_day_candles_with_interval(stock_code, date, self.source_interval)
+            .await
     }
 }

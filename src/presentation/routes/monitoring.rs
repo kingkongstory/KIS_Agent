@@ -63,6 +63,11 @@ pub struct HealthResponse {
     pub active_runners: Vec<String>,
     pub event_logger_fail_count: u64,
     pub today_event_summary: EventSummary,
+    /// 2026-04-16 Task 2: WS 상태 스냅샷 (tick/message age, retry_count, terminated).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ws: Option<crate::infrastructure::websocket::connection::WsHealthSnapshot>,
+    /// WS tick 경과 시간이 임계 초과인지 여부. UI 경고 표시용.
+    pub ws_tick_stale: bool,
 }
 
 #[derive(Serialize)]
@@ -171,11 +176,34 @@ async fn get_health(State(state): State<AppState>) -> Json<HealthResponse> {
         EventSummary { ws_reconnect: 0, api_error: 0, ws_tick_gap: 0, entry_executed: 0, exit_tp: 0, exit_market: 0 }
     };
 
+    // WS 상태 스냅샷. AppState 에 ws_client 가 주입된 경우에만 채워진다.
+    // tick 임계는 기본 120초 — `KIS_WS_STALE_SECS` 환경변수와 동일한 판정이나
+    // watchdog 이 장중에만 fatal 을 띄우므로 여기서도 장외는 stale 로 보지 않는다.
+    let (ws_snapshot, ws_tick_stale) = if let Some(ref ws) = state.ws_client {
+        let snap = ws.health_snapshot().await;
+        let now_t = chrono::Local::now().time();
+        let in_market = now_t >= chrono::NaiveTime::from_hms_opt(9, 0, 0).unwrap()
+            && now_t <= chrono::NaiveTime::from_hms_opt(15, 35, 0).unwrap();
+        let threshold = std::env::var("KIS_WS_STALE_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(120);
+        let tick_stale = match snap.tick_age_secs() {
+            Some(age) => in_market && age > threshold,
+            None => in_market && (now_t - chrono::NaiveTime::from_hms_opt(9, 10, 0).unwrap()).num_seconds() > 0,
+        };
+        (Some(snap), tick_stale)
+    } else {
+        (None, false)
+    };
+
     Json(HealthResponse {
         db_connected,
         active_runners,
         event_logger_fail_count,
         today_event_summary,
+        ws: ws_snapshot,
+        ws_tick_stale,
     })
 }
 

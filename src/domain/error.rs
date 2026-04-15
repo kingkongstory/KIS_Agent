@@ -65,6 +65,15 @@ pub enum KisError {
     /// 단순히 이번 사이클 lock 경쟁에 양보하는 의미.
     #[error("다른 종목 선점 요청으로 진입 포기")]
     Preempted,
+
+    /// 수동 개입 필요 — 상위에서 일반 진입 실패와 분리 처리해야 함.
+    ///
+    /// 2026-04-15 Codex review #4 대응. cancel_verify_failed / safe_orphan_cleanup 의
+    /// 보유 감지 경로 등 "상태 불명 또는 DB 메타 부재" 상황에서 사용.
+    /// 상위(`poll_and_enter`)는 이 variant 수신 시 `abort_entry` 를 호출하지 않고
+    /// shared `position_lock` 을 그대로 유지하여 다른 종목 진입을 차단한다.
+    #[error("수동 개입 필요: {0}")]
+    ManualIntervention(String),
 }
 
 impl KisError {
