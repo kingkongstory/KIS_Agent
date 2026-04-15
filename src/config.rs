@@ -138,12 +138,22 @@ impl AppConfig {
         matches!(self.environment, Environment::Real) || self.enable_real_trading
     }
 
-    /// 자동매매에 허용된 종목 목록. 빈 allowed_codes 는 기본 2종목을 의미한다.
+    /// 자동매매에 허용된 종목 목록.
+    ///
+    /// 비어있는 경우:
+    /// - 실전 모드: `["122630"]` 단일 종목으로 안전 기본값 적용. 2026-04-16 Go 조건 #2 에
+    ///   따라 실전 첫날 운용 원칙과 일치한다 (하루 1회, 단일 종목, 수동 시작).
+    /// - 모의 모드: 기존대로 2종목 `["122630", "114800"]` 허용.
+    ///
+    /// 명시적으로 `KIS_ALLOWED_CODES=` 로 값을 지정하면 그 목록이 우선한다.
     pub fn effective_allowed_codes(&self) -> Vec<String> {
-        if self.allowed_codes.is_empty() {
-            vec!["122630".to_string(), "114800".to_string()]
+        if !self.allowed_codes.is_empty() {
+            return self.allowed_codes.clone();
+        }
+        if self.is_real_mode() {
+            vec!["122630".to_string()]
         } else {
-            self.allowed_codes.clone()
+            vec!["122630".to_string(), "114800".to_string()]
         }
     }
 }

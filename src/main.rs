@@ -862,16 +862,26 @@ async fn run_server(config: AppConfig) {
             .set_allowed_codes(allowed_codes.clone())
             .await;
 
+        // 실전 Go 조건 #2 — 시스템 전체 일일 거래 한도 공유 게이트.
+        // 모든 러너가 같은 Arc 를 참조해 entry 전/후 체크·기록을 한다.
+        use kis_agent::strategy::live_runner::{GlobalTradeGate, LiveRunnerConfig};
+        let global_trade_gate = std::sync::Arc::new(tokio::sync::RwLock::new(
+            GlobalTradeGate::new(config.max_daily_trades_total.max(1)),
+        ));
+
         let live_cfg = if config.is_real_mode() {
-            use kis_agent::strategy::live_runner::LiveRunnerConfig;
             LiveRunnerConfig::for_real_mode(
                 config.real_or_stages.clone(),
-                config.max_daily_trades_total.max(1),
                 config.entry_cutoff_real,
                 config.enable_real_trading,
+                Some(Arc::clone(&global_trade_gate)),
             )
         } else {
-            kis_agent::strategy::live_runner::LiveRunnerConfig::default()
+            // 모의 모드도 전역 가드는 동일하게 적용 (burn-in 검증을 위해).
+            // 원치 않으면 `KIS_MAX_DAILY_TRADES_TOTAL=5` 이상으로 풀어두면 실질 비활성.
+            let mut cfg = LiveRunnerConfig::default();
+            cfg.global_trade_gate = Some(Arc::clone(&global_trade_gate));
+            cfg
         };
         info!(
             "LiveRunnerConfig — real_mode={}, enable_real_orders={}, allowed_stages={:?}, max_daily_trades_override={:?}, entry_cutoff_override={:?}",

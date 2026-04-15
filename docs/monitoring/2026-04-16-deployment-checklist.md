@@ -3,6 +3,20 @@
 본 문서는 `docs/monitoring/2026-04-16-production-readiness-plan.md` Phase 3 / Task 7 산출물이다.
 운영자는 **이 문서만 보고** 장 시작 전 기동, 장중 모니터링, 장 종료 후 검증, 롤백 절차를 수행할 수 있어야 한다.
 
+## 0. 투입 전략 확정
+
+**실전 첫날 전략: `orb_fvg_safe` 운영 모드** — 기존 `orb_fvg`(src/strategy/orb_fvg.rs) 에
+2026-04-16 production-readiness 계획서의 실전 가드(single 15m stage · 시스템 전역 1회 · 수동 시작 ·
+단일 종목 · 보수 cutoff 15:00)를 적용한 것이다. 별도의 새 파일은 없고, `LiveRunnerConfig::for_real_mode`
+로 주입된 런타임 설정이 `orb_fvg_safe` 를 정의한다.
+
+`orb_vwap_pullback` (src/strategy/orb_vwap_pullback.rs) 은 현 시점 **스켈레톤**이다.
+`SignalEngine::detect_next` 가 `None` 만 반환 — 실제 VWAP 계산 · 방향 확인 상태 머신 · armed 상태 ·
+1분 반전 확인 로직이 없어 투입 시 거래가 한 건도 발생하지 않는다. 계획서(`strategy-redesign-plan.md`)
+기준 PR2/PR3 범위로, 2026-04-16 실전 대상에서는 **제외**한다.
+
+즉 Go 조건 #3 은 **`orb_fvg_safe` 로 확정**, `orb_vwap_pullback` 은 다음 스프린트로 이월.
+
 ## 1. 기준
 
 - 배포 시각: 2026-04-16 08:55 KST (장 시작 5분 전)
@@ -25,7 +39,7 @@ KIS_HTS_ID=<HTS 로그인 ID — 체결통보 필수>
 # 2026-04-16 가드
 KIS_AUTO_START=false
 KIS_ALLOWED_CODES=122630
-KIS_MAX_DAILY_TRADES_TOTAL=1
+KIS_MAX_DAILY_TRADES_TOTAL=1          # 시스템 전역 하루 1회 (종목별 1회와 별개, AND 조건)
 KIS_REQUIRE_DB_IN_REAL=true
 KIS_WS_STALE_SECS=120
 KIS_WS_STALE_MESSAGE_SECS=240
@@ -35,6 +49,10 @@ KIS_REAL_OR_STAGES=15m
 
 DATABASE_URL=postgres://postgres@localhost:5433/kis_agent
 ```
+
+중요:
+- `KIS_ALLOWED_CODES` 를 비워두면 **실전 모드는 자동으로 `["122630"]` 단일 종목으로 축소**된다. 모의 모드는 기존 2종목 유지.
+- `KIS_MAX_DAILY_TRADES_TOTAL` 은 `GlobalTradeGate` 에 주입되어 시스템 전역에서 N회 체결 초과 시 `execute_entry` 진입부에서 `global_trade_gate_blocked` 이벤트를 남기고 거부한다. 종목별 `max_daily_trades_override=1` 과 **AND** 관계 — 둘 중 먼저 도달한 쪽이 차단.
 
 모의 burn-in 단계에서는 `KIS_ENVIRONMENT=paper`, `KIS_ENABLE_REAL_TRADING=false` 로 두고 나머지 가드는 동일.
 
@@ -121,13 +139,26 @@ cargo build --release --bin kis_agent
 
 ## 10. Go / No-Go 최종 판단 플로우
 
+### 2026-04-16 Go 조건 (사용자 합의 3건)
+
+1. **PostgreSQL 복구 + replay/parity 검증 통과**: DB 기동 후 `replay 122630 --date 2026-04-15`,
+   `replay 114800 --date 2026-04-15`, `backtest 122630 --days 5 --parity passive --multi-stage`
+   세 명령이 panic 없이 완료. `parity_backtest_legacy`·`parity_backtest_passive` 거래수가 출력되면 통과.
+2. **전역 1회 거래 가드 적용**: `KIS_MAX_DAILY_TRADES_TOTAL=1` + `GlobalTradeGate`.
+   `KIS_ALLOWED_CODES=122630` 로 단일 종목 강제 (또는 빈 값으로 실전 모드 fallback 이용).
+3. **투입 전략 확정**: `orb_fvg_safe` (기존 orb_fvg + 런타임 실전 가드). `orb_vwap_pullback` 은
+   스켈레톤 상태라 투입 제외.
+
+### 공통 Go 판단 체크
+
 - Phase 1~3 모두 완료?
-- `cargo test --lib` 전부 통과?
+- `cargo test --lib` 전부 통과 (현재 150 pass)?
 - 모의투자 3영업일 연속 무사고? (`critical` 이벤트 0건, `balance_reconcile_mismatch` 0건)
 - 본 문서 §4 코드 검증 통과?
 - 배포 SHA 고정 커밋 완료?
 
-위 5개가 전부 Yes 면 **Go**. 하나라도 아니면 당일은 **수동 관찰 모드**로 운영하고 PR2/PR3 일정과 함께 재조정.
+위 Go 조건 3건 + 공통 체크 5개가 모두 Yes 면 **Go**. 하나라도 아니면 당일은
+**수동 관찰 모드**로 운영하고 PR2/PR3 일정과 함께 재조정.
 
 ## 11. 연락/보고 체크
 

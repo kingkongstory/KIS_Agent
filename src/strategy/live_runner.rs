@@ -151,6 +151,65 @@ enum ManualInterventionMode {
     KeepLock,
 }
 
+/// 시스템 전체 일일 거래 카운터.
+///
+/// 2026-04-16 실전 Go 조건 #2 대응 — 종목별 `max_daily_trades_override`(기본 1) 와
+/// 독립적으로 "시스템 전체 기준 하루 N회"를 강제한다. 122630/114800 두 러너가 각자
+/// 1회 진입해서 총 2회가 되는 것을 막는 유일한 안전장치.
+///
+/// 사용 흐름:
+/// 1. `main.rs` 가 `KIS_MAX_DAILY_TRADES_TOTAL` 값으로 `new()` 호출 → Arc<RwLock<_>> 로 포장
+/// 2. 모든 `LiveRunner` 가 같은 Arc 를 공유 (`LiveRunnerConfig.global_trade_gate`)
+/// 3. 진입 직전 `can_enter(today)` 체크 → false 면 해당 진입 skip
+/// 4. 체결 완료 후 `record_trade(today)` 로 카운트 증가
+///
+/// 날짜 전환은 첫 호출 시 자동 리셋. 자정 이후에도 서버가 돌면 새 날짜의 count 0 으로 시작.
+#[derive(Debug, Default)]
+pub struct GlobalTradeGate {
+    /// 마지막으로 기록된 날짜. `None` 이면 아직 기록 없음.
+    pub date: Option<chrono::NaiveDate>,
+    /// 해당 날짜에 누적된 거래 수.
+    pub count: usize,
+    /// 시스템 전체 하루 허용 한도.
+    pub max: usize,
+}
+
+impl GlobalTradeGate {
+    pub fn new(max: usize) -> Self {
+        Self {
+            date: None,
+            count: 0,
+            max: max.max(1),
+        }
+    }
+
+    /// 날짜 전환 감지 및 필요 시 카운터 리셋. 이후 현재 count 반환.
+    fn roll_and_count(&mut self, today: chrono::NaiveDate) -> usize {
+        if self.date != Some(today) {
+            self.date = Some(today);
+            self.count = 0;
+        }
+        self.count
+    }
+
+    /// 오늘 진입을 허용하는지. true 면 호출자는 이어서 진입을 시도하고,
+    /// 체결 확정 후 `record_trade` 를 호출해야 한다.
+    pub fn can_enter(&mut self, today: chrono::NaiveDate) -> bool {
+        self.roll_and_count(today) < self.max
+    }
+
+    /// 거래 1건 기록. `can_enter` 가 true 를 반환한 뒤 체결 확정 시점에만 호출.
+    pub fn record_trade(&mut self, today: chrono::NaiveDate) {
+        self.roll_and_count(today);
+        self.count += 1;
+    }
+
+    /// 오늘 현재 count / max (UI / 로그용).
+    pub fn snapshot(&mut self, today: chrono::NaiveDate) -> (usize, usize) {
+        (self.roll_and_count(today), self.max)
+    }
+}
+
 /// 라이브 러너 고유 설정 (백테스트와 분리).
 ///
 /// `OrbFvgConfig` 는 백테스트/라이브 공용이라 백테스트 결과에 영향을 주지 않으려는
@@ -176,6 +235,59 @@ pub struct LiveRunnerConfig {
     pub enable_real_orders: bool,
     /// 실전 식별 플래그. 로그/trade.environment 필드에 사용.
     pub real_mode: bool,
+    /// 시스템 전체 일일 거래 카운터 공유 핸들. `None` 이면 전역 가드 비활성.
+    /// 2026-04-16 실전 Go 조건 #2 — 두 러너가 각자 1회씩 총 2회 진입되는 것을 막는다.
+    pub global_trade_gate: Option<Arc<RwLock<GlobalTradeGate>>>,
+}
+
+#[cfg(test)]
+mod global_trade_gate_tests {
+    use super::GlobalTradeGate;
+    use chrono::NaiveDate;
+
+    #[test]
+    fn new_sets_max_with_floor_of_one() {
+        let g = GlobalTradeGate::new(0);
+        assert_eq!(g.max, 1, "max 는 최소 1로 보정되어야 함");
+    }
+
+    #[test]
+    fn can_enter_returns_true_until_limit_reached() {
+        let mut g = GlobalTradeGate::new(2);
+        let today = NaiveDate::from_ymd_opt(2026, 4, 16).unwrap();
+        assert!(g.can_enter(today));
+        g.record_trade(today);
+        assert!(g.can_enter(today));
+        g.record_trade(today);
+        assert!(!g.can_enter(today), "한도 도달 후엔 거부");
+    }
+
+    #[test]
+    fn rolls_counter_on_date_change() {
+        let mut g = GlobalTradeGate::new(1);
+        let d1 = NaiveDate::from_ymd_opt(2026, 4, 16).unwrap();
+        let d2 = NaiveDate::from_ymd_opt(2026, 4, 17).unwrap();
+        g.record_trade(d1);
+        assert!(!g.can_enter(d1));
+        assert!(g.can_enter(d2), "새 날짜면 카운터 리셋 후 허용");
+        assert_eq!(g.snapshot(d2).0, 0);
+    }
+
+    #[test]
+    fn record_trade_increments_count() {
+        let mut g = GlobalTradeGate::new(3);
+        let today = NaiveDate::from_ymd_opt(2026, 4, 16).unwrap();
+        g.record_trade(today);
+        g.record_trade(today);
+        assert_eq!(g.snapshot(today), (2, 3));
+    }
+
+    #[test]
+    fn snapshot_initial_state_returns_zero() {
+        let mut g = GlobalTradeGate::new(1);
+        let today = NaiveDate::from_ymd_opt(2026, 4, 16).unwrap();
+        assert_eq!(g.snapshot(today), (0, 1));
+    }
 }
 
 impl Default for LiveRunnerConfig {
@@ -188,25 +300,30 @@ impl Default for LiveRunnerConfig {
             // 기본은 주문 허용(모의). 실전에서 차단하려면 명시적으로 false.
             enable_real_orders: true,
             real_mode: false,
+            global_trade_gate: None,
         }
     }
 }
 
 impl LiveRunnerConfig {
     /// 실전 플래그를 반영해 환경변수 기반 보수적 기본값으로 구성.
+    ///
+    /// 전역 1회 거래 가드는 `global_trade_gate` 가 수행한다. 종목별 1회(`max_daily_trades_override=1`)
+    /// 는 시스템 전체 한도와 별개의 2차 방어선 — 예컨대 전역 한도가 2 라도 한 종목이 2회 연속 진입하는 것을 막는다.
     pub fn for_real_mode(
         allowed_stages: Vec<String>,
-        max_trades_total: usize,
         entry_cutoff: NaiveTime,
         enable_real_orders: bool,
+        global_trade_gate: Option<Arc<RwLock<GlobalTradeGate>>>,
     ) -> Self {
         Self {
             max_entry_drift_pct: Some(0.005),
             allowed_stages: Some(allowed_stages),
-            max_daily_trades_override: Some(max_trades_total),
+            max_daily_trades_override: Some(1),
             entry_cutoff_override: Some(entry_cutoff),
             enable_real_orders,
             real_mode: true,
+            global_trade_gate,
         }
     }
 
@@ -1789,6 +1906,39 @@ impl LiveRunner {
             PositionSide::Short => OrderSide::Sell,
         };
 
+        // ── 2026-04-16 실전 Go 조건 #2: 전역 일일 거래 한도 체크 ──
+        // 종목별 max_daily_trades_override(실전 1) 와 별개로 시스템 전체 한도를 강제한다.
+        // 두 러너가 각자 1회씩 진입해 총 2회가 되는 경로를 차단.
+        // 주의: 실제 체결 완료 후에만 record_trade 를 호출하므로, 여기서 can_enter 가 true 라도
+        // 체결 실패 시 카운트는 늘지 않는다. 동일 시점 두 러너가 병렬로 can_enter 를 통과할 수
+        // 있으나, 공유 `position_lock` 이 Pending/Held 로 한 종목만 진행시키므로 실제 record 는
+        // 순차적이다.
+        if let Some(ref gate) = self.live_cfg.global_trade_gate {
+            let today = Local::now().date_naive();
+            let mut g = gate.write().await;
+            let (count, max) = g.snapshot(today);
+            if count >= max {
+                warn!(
+                    "{}: 전역 일일 거래 한도 도달 ({}/{}) — 진입 차단",
+                    self.stock_name, count, max
+                );
+                if let Some(ref el) = self.event_logger {
+                    el.log_event(
+                        self.stock_code.as_str(),
+                        "strategy",
+                        "global_trade_gate_blocked",
+                        "warn",
+                        &format!("전역 한도 도달 {}/{} — 진입 거부", count, max),
+                        serde_json::json!({ "count": count, "max": max }),
+                    );
+                }
+                return Err(KisError::Internal(format!(
+                    "전역 일일 거래 한도 도달 ({}/{})",
+                    count, max
+                )));
+            }
+        }
+
         // ── 시간 경계 사전 체크 ──
         // 지정가 대기(최대 30초) 고려하여 15:19:30 이후 진입 포기
         let now = Local::now().time();
@@ -2327,6 +2477,20 @@ impl LiveRunner {
         }
 
         // 포지션 잠금은 poll_and_enter에서 CAS로 이미 설정됨
+
+        // 2026-04-16 실전 Go 조건 #2: 전역 일일 거래 카운터 기록.
+        // 매수 체결 + DB 저장까지 끝난 시점에서 1회로 카운트 — 이후 청산 결과와 무관하게
+        // 신규 진입은 전역 한도 아래에서만 허용된다.
+        if let Some(ref gate) = self.live_cfg.global_trade_gate {
+            let today = Local::now().date_naive();
+            let mut g = gate.write().await;
+            g.record_trade(today);
+            let (count, max) = g.snapshot(today);
+            info!(
+                "{}: 전역 거래 카운터 +1 → {}/{}",
+                self.stock_name, count, max
+            );
+        }
 
         Ok(())
     }

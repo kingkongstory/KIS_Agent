@@ -184,6 +184,18 @@ impl StrategyManager {
         *self.block_starts_reason.write().await = reason;
     }
 
+    /// 현재 전역 거래 카운터 스냅샷. UI/모니터링용.
+    pub async fn global_trade_snapshot(&self) -> Option<(usize, usize)> {
+        let cfg = self.live_runner_config.read().await;
+        if let Some(ref gate) = cfg.global_trade_gate {
+            let today = chrono::Local::now().date_naive();
+            let (count, max) = gate.write().await.snapshot(today);
+            Some((count, max))
+        } else {
+            None
+        }
+    }
+
     /// WS 체결통보 startup health 가 정상 수립됨을 표시.
     ///
     /// main.rs 의 health gate 폴링이 AES key/iv 수립 확인 후 호출한다.
@@ -433,6 +445,22 @@ impl StrategyManager {
                     "허용 종목 목록(KIS_ALLOWED_CODES) 밖 — {code} 시작 거부. 현재 허용: {:?}",
                     *allowed
                 ));
+            }
+        }
+
+        // 2026-04-16 Go 조건 #2 — 전역 일일 거래 한도 이미 도달?
+        // start 단계에서 선차단하여 불필요한 러너 생성/OR 조회를 막는다.
+        {
+            let cfg = self.live_runner_config.read().await;
+            if let Some(ref gate) = cfg.global_trade_gate {
+                let today = chrono::Local::now().date_naive();
+                let (count, max) = gate.write().await.snapshot(today);
+                if count >= max {
+                    return Err(format!(
+                        "전역 일일 거래 한도 이미 도달 ({}/{}) — 추가 시작 거부",
+                        count, max
+                    ));
+                }
             }
         }
 

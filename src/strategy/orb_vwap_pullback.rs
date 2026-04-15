@@ -2,6 +2,16 @@
 //!
 //! `docs/monitoring/strategy-redesign-plan.md` §P1 / `docs/strategy/backtest-live-parity-architecture.md` §13 Phase 7.
 //!
+//! ## ⚠ 실전 투입 금지 — 현재 스켈레톤
+//!
+//! `detect_next()` 는 항상 `None` 을 반환한다. 이 엔진을 `LiveRunner` 또는 parity backtest 에
+//! 주입하면 **거래가 한 건도 발생하지 않는다**. 2026-04-16 실전 첫날 투입 전략은
+//! `orb_fvg` + `LiveRunnerConfig::for_real_mode` (docs/monitoring/2026-04-16-deployment-checklist.md §0)
+//! 이며, `orb_vwap_pullback` 본 구현은 PR2/PR3 (strategy-redesign-plan.md) 일정으로 이월됐다.
+//!
+//! 투입 시점은 아래 체크리스트가 모두 끝난 뒤다. 실전 경로에 연결하기 전 반드시 parity backtest
+//! 로 최소 3영업일 동일 규칙 검증 필요.
+//!
 //! ## 전략 개요
 //! 1. **OR 15분 단일화**: `09:00~09:14` 1분봉 기준 OR high/low 하나만 사용.
 //! 2. **VWAP 기반 방향 확인**: 09:15 이후 5분봉 2개가 같은 방향으로 OR 밖에서
@@ -97,6 +107,13 @@ impl SignalEngine for OrbVwapPullbackEngine {
         // 5. armed 상태 진입 (zone 첫 터치)
         // 6. 1분 반전 확인 (1분봉 종가가 VWAP 재돌파 + 직전 1분봉 고가 돌파)
         // 7. DetectedSignal 반환
+        //
+        // 실전 배포 시 실수로 이 스켈레톤이 라이브 경로에 연결되지 않도록 매 호출마다
+        // warn 로그를 남긴다. 2026-04-16 실전 첫날은 `orb_fvg` 경로만 활성.
+        tracing::warn!(
+            target: "orb_vwap_pullback",
+            "orb_vwap_pullback 은 스켈레톤 상태 — 실전 투입 금지. 신호 생성 없이 None 반환."
+        );
         None
     }
 }
