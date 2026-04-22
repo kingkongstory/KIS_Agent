@@ -17,7 +17,7 @@
 //! - `MarketableLimitWithSlippageBudget`: best ask/bid + N tick 으로 시장성
 //!   지정가. Phase 7 새 전략(orb_vwap_pullback) 의 기본 정책.
 
-use super::conversions::{legacy_mid_price_plan, live_passive_plan};
+use super::conversions::{legacy_mid_price_plan, live_marketable_plan, live_passive_plan};
 use super::types::{
     EntryPlan, FillResolutionSource, FillResult, FillStatus, SignalId, SignalIntent,
 };
@@ -45,7 +45,7 @@ pub struct ExecutionContext {
     pub rr_ratio: f64,
     /// drift 허용치 (Passive 정책에서만 사용). None 이면 무제한.
     pub max_entry_drift_pct: Option<f64>,
-    /// 시장성 지정가의 slippage budget (향후 Marketable 정책용).
+    /// 시장성 지정가의 slippage budget (Marketable 정책용).
     pub slippage_budget_pct: Option<f64>,
 }
 
@@ -63,6 +63,19 @@ impl ExecutionContext {
             rr_ratio,
             max_entry_drift_pct,
             slippage_budget_pct: None,
+        }
+    }
+
+    /// 2026-04-18 Phase 3: 시장성 지정가 정책용 context.
+    pub fn marketable(
+        rr_ratio: f64,
+        max_entry_drift_pct: Option<f64>,
+        slippage_budget_pct: f64,
+    ) -> Self {
+        Self {
+            rr_ratio,
+            max_entry_drift_pct,
+            slippage_budget_pct: Some(slippage_budget_pct),
         }
     }
 }
@@ -114,6 +127,63 @@ impl ExecutionPolicy for PassiveTopBottomTimeout30s {
 
     fn plan(&self, intent: &SignalIntent, ctx: &ExecutionContext) -> EntryPlan {
         live_passive_plan(intent, ctx.rr_ratio, ctx.max_entry_drift_pct, 30_000)
+    }
+
+    fn resolve_fill(&self, plan: &EntryPlan, feedback: &FillFeedback) -> FillResult {
+        resolve_fill_common(plan, feedback, FillResolutionSource::BalanceRecheck)
+    }
+}
+
+// ───────────────────────────────────────────────────────────────
+// MarketableLimitWithBudget — Phase 3 (2026-04-18) 신규 정책.
+// ───────────────────────────────────────────────────────────────
+
+/// 시장성 지정가 + slippage budget.
+///
+/// `docs/monitoring/2026-04-18-execution-timing-implementation-plan.md` Phase 3.
+/// 패시브 지정가가 "신호 타이밍 ↔ 체결 타이밍" 괴리를 만드는 문제를 해결하기 위한 정책.
+///
+/// 규칙:
+/// - `intended_entry` = Long: zone edge top / Short: zone edge bottom (슬리피지 측정 기준)
+/// - `order_price` = None — adapter 런타임에서 best_ask + N tick / best_bid - N tick 계산
+/// - `timeout_ms` = 2_000~3_000 (빠른 실패 확정)
+/// - `cancel_on_timeout` = true
+/// - `fill_recheck_mode` = BalanceRecheck
+/// - `slippage_budget_pct` = 0.3% 기본 (zone edge 대비 이 이상 떨어진 체결가는 불리 판정)
+///
+/// 실제 주문 가격은 adapter 가 호가 스냅샷 (또는 현재가 fallback) + tick 으로 결정.
+/// adapter 는 ExecutionPolicy 가 계산한 intended_entry 와의 차이가
+/// `slippage_budget_pct` 를 초과하면 주문을 skip 해야 한다 (preflight gate).
+#[derive(Debug, Clone, Copy)]
+pub struct MarketableLimitWithBudget {
+    pub slippage_budget_pct: f64,
+    pub timeout_ms: u64,
+}
+
+impl Default for MarketableLimitWithBudget {
+    fn default() -> Self {
+        Self {
+            slippage_budget_pct: 0.003, // 0.3%
+            timeout_ms: 3_000,
+        }
+    }
+}
+
+impl ExecutionPolicy for MarketableLimitWithBudget {
+    fn version(&self) -> &'static str {
+        "marketable_limit_with_budget_v1"
+    }
+
+    fn plan(&self, intent: &SignalIntent, ctx: &ExecutionContext) -> EntryPlan {
+        // slippage_budget_pct 는 context 값이 있으면 우선, 없으면 정책 기본값.
+        let budget = ctx.slippage_budget_pct.unwrap_or(self.slippage_budget_pct);
+        live_marketable_plan(
+            intent,
+            ctx.rr_ratio,
+            ctx.max_entry_drift_pct,
+            budget,
+            self.timeout_ms,
+        )
     }
 
     fn resolve_fill(&self, plan: &EntryPlan, feedback: &FillFeedback) -> FillResult {
@@ -190,8 +260,8 @@ mod tests {
 
     use super::super::conversions::build_signal_intent;
     use super::super::types::{CancelReason, EntryMode, FillRecheckMode, SignalMetadata};
-    use crate::strategy::fvg::{FairValueGap, FvgDirection};
     use super::*;
+    use crate::strategy::fvg::{FairValueGap, FvgDirection};
 
     fn sample_intent_long() -> SignalIntent {
         let gap = FairValueGap {
@@ -223,7 +293,10 @@ mod tests {
         assert_eq!(plan.timeout_ms, 30_000);
         assert!(plan.cancel_on_timeout);
         assert_eq!(plan.fill_recheck_mode, FillRecheckMode::BalanceRecheck);
-        assert_eq!(plan.entry_mode, EntryMode::PassiveTopBottom { timeout_ms: 30_000 });
+        assert_eq!(
+            plan.entry_mode,
+            EntryMode::PassiveTopBottom { timeout_ms: 30_000 }
+        );
         assert_eq!(policy.version(), "passive_top_bottom_timeout_30s");
     }
 
@@ -281,6 +354,70 @@ mod tests {
         assert_eq!(result.slippage, Some(20));
         assert_eq!(result.status, FillStatus::Filled);
         assert_eq!(result.resolution_source, FillResolutionSource::WsNotice);
+    }
+
+    /// 2026-04-18 Phase 3: MarketableLimitWithBudget plan 회귀.
+    #[test]
+    fn marketable_policy_uses_zone_edge_and_leaves_order_price_for_adapter() {
+        let policy = MarketableLimitWithBudget::default();
+        let ctx = ExecutionContext::live(2.5, Some(0.3));
+        let plan = policy.plan(&sample_intent_long(), &ctx);
+        // intended_entry 는 PassiveTopBottom 과 동일 (zone edge).
+        assert_eq!(plan.intended_entry_price, 10_200);
+        // order_price 는 None — adapter 가 best_ask/bid + tick 으로 결정.
+        assert!(
+            plan.order_price.is_none(),
+            "MarketableLimit 은 런타임 호가 정보가 필요해 plan 단계에선 주문가 미정"
+        );
+        // timeout 은 기본 3초 (Phase 3 권장)
+        assert_eq!(plan.timeout_ms, 3_000);
+        assert!(plan.cancel_on_timeout);
+        assert_eq!(plan.fill_recheck_mode, FillRecheckMode::BalanceRecheck);
+        // entry_mode 에 slippage_budget 기록.
+        match plan.entry_mode {
+            EntryMode::MarketableLimit {
+                slippage_budget_pct,
+            } => {
+                assert!((slippage_budget_pct - 0.003).abs() < 1e-9);
+            }
+            other => panic!("expected MarketableLimit, got {:?}", other),
+        }
+        assert_eq!(policy.version(), "marketable_limit_with_budget_v1");
+    }
+
+    #[test]
+    fn marketable_policy_respects_custom_slippage_budget_context() {
+        let policy = MarketableLimitWithBudget {
+            slippage_budget_pct: 0.003,
+            timeout_ms: 3_000,
+        };
+        // ExecutionContext::marketable 로 슬리피지 budget override.
+        let ctx = ExecutionContext::marketable(2.5, Some(0.3), 0.005);
+        let plan = policy.plan(&sample_intent_long(), &ctx);
+        match plan.entry_mode {
+            EntryMode::MarketableLimit {
+                slippage_budget_pct,
+            } => {
+                assert!(
+                    (slippage_budget_pct - 0.005).abs() < 1e-9,
+                    "context 에 slippage_budget_pct 가 있으면 policy 기본값 대신 사용"
+                );
+            }
+            other => panic!("expected MarketableLimit, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn marketable_policy_default_timeout_is_short() {
+        let policy = MarketableLimitWithBudget::default();
+        assert_eq!(
+            policy.timeout_ms, 3_000,
+            "Phase 3 권장: 2~3초 — 기본 3_000ms"
+        );
+        assert!(
+            policy.timeout_ms <= 5_000,
+            "5초를 넘지 않는다는 Phase 3 불변식"
+        );
     }
 }
 

@@ -1,5 +1,6 @@
 import { useEffect, useState, useCallback } from 'react';
 import { get, post } from '../../api/client';
+import { Card, CardHeader, Toggle, Badge, Button } from '../ui';
 import { cn } from '../../utils/cn';
 
 interface StrategyParams {
@@ -30,19 +31,36 @@ type SourceKind = 'ws' | 'yahoo' | 'naver';
 const SOURCE_LABEL: Record<SourceKind, string> = {
   ws: '실시간 WS',
   yahoo: 'Yahoo 5m',
-  naver: '네이버 (close-only)',
+  naver: '네이버',
 };
 
-/** 출처별 뱃지 색상 — 그린: 실시간/정확, 블루: 외부 정확 OHLC, 오렌지: 정확도 손실 */
-const SOURCE_STYLE: Record<SourceKind, string> = {
-  ws: 'bg-rise/20 text-rise border border-rise/30',
-  yahoo: 'bg-accent/20 text-accent border border-accent/30',
-  naver: 'bg-fall/20 text-fall border border-fall/30',
+const SOURCE_TONE: Record<SourceKind, 'rise' | 'accent' | 'fall'> = {
+  ws: 'rise',
+  yahoo: 'accent',
+  naver: 'fall',
 };
 
 function sourceKind(raw: string | null | undefined): SourceKind | null {
   if (raw === 'ws' || raw === 'yahoo' || raw === 'naver') return raw;
   return null;
+}
+
+function RefreshIcon({ spinning }: { spinning?: boolean }) {
+  return (
+    <svg
+      className={cn('w-3.5 h-3.5', spinning && 'animate-spin')}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <polyline points="23 4 23 10 17 10" />
+      <polyline points="1 20 1 14 7 14" />
+      <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
+    </svg>
+  );
 }
 
 export function StrategyPanel() {
@@ -53,9 +71,7 @@ export function StrategyPanel() {
     try {
       const data = await get<StrategyStatus[]>('/strategy/status');
       setStatuses(data);
-    } catch {
-      // 무시
-    }
+    } catch { /* 무시 */ }
   }, []);
 
   useEffect(() => {
@@ -69,9 +85,7 @@ export function StrategyPanel() {
       const endpoint = active ? '/strategy/stop' : '/strategy/start';
       await post<StrategyStatus>(endpoint, { code });
       fetchStatus();
-    } catch {
-      // 무시
-    }
+    } catch { /* 무시 */ }
   };
 
   const refreshBackfill = async () => {
@@ -83,138 +97,133 @@ export function StrategyPanel() {
         {},
       );
       await fetchStatus();
-    } catch {
-      // 무시
-    } finally {
+    } catch { /* 무시 */ } finally {
       setRefreshing(false);
     }
   };
 
+  const params = statuses[0]?.params;
+
   return (
-    <div className="bg-card rounded-lg border border-border p-4">
-      <div className="flex items-center justify-between mb-3">
-        <span className="text-sm font-semibold">ORB+FVG 자동매매</span>
-        <button
-          onClick={refreshBackfill}
-          disabled={refreshing}
-          title="OR 백필 데이터 새로 받기 (Yahoo 1순위, 네이버 fallback)"
-          className={cn(
-            'inline-flex items-center gap-1 px-2 py-1 rounded text-xs transition-colors',
-            'border border-border text-text-muted hover:text-text hover:border-accent/50',
-            refreshing && 'opacity-50 cursor-not-allowed',
-          )}
-        >
-          <svg
-            className={cn('w-3 h-3', refreshing && 'animate-spin')}
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="2.5"
-            strokeLinecap="round"
-            strokeLinejoin="round"
+    <Card>
+      <CardHeader
+        title="ORB+FVG 자동매매"
+        subtitle="Opening Range × Fair Value Gap"
+        action={
+          <Button
+            variant="ghost"
+            size="xs"
+            leftIcon={<RefreshIcon spinning={refreshing} />}
+            onClick={refreshBackfill}
+            disabled={refreshing}
+            title="OR 백필 (Yahoo→네이버)"
           >
-            <polyline points="23 4 23 10 17 10" />
-            <polyline points="1 20 1 14 7 14" />
-            <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
-          </svg>
-          {refreshing ? '새로고침 중…' : 'OR 백필 새로고침'}
-        </button>
-      </div>
+            {refreshing ? '갱신 중' : 'OR 백필'}
+          </Button>
+        }
+      />
+
       <div className="grid grid-cols-2 gap-3">
-        {statuses.map((s) => (
-          <div
-            key={s.code}
-            className={cn(
-              'rounded-lg border p-3 transition-colors',
-              s.active ? 'border-rise/50 bg-rise/5' : 'border-border bg-card',
-            )}
-          >
-            <div className="flex items-center justify-between mb-2">
-              <div>
-                <span className="text-sm font-medium">{s.name}</span>
-                <span className="text-xs text-text-muted ml-2">{s.code}</span>
-              </div>
-              <button
-                onClick={() => toggle(s.code, s.active)}
-                className={cn(
-                  'relative inline-flex items-center w-11 h-6 rounded-full transition-colors shrink-0',
-                  s.active ? 'bg-rise' : 'bg-border',
-                )}
-              >
-                <span
-                  className={cn(
-                    'inline-block w-4 h-4 rounded-full bg-white transition-transform',
-                    s.active ? 'translate-x-6' : 'translate-x-1',
-                  )}
-                />
-              </button>
-            </div>
-            <div className="flex items-center gap-2 text-xs">
-              <span
-                className={cn(
-                  'px-2 py-0.5 rounded-full',
-                  s.active ? 'bg-rise/20 text-rise' : 'bg-border text-text-muted',
-                )}
-              >
-                {s.state}
-              </span>
-              {s.today_trades > 0 && (
-                <span className="text-text-muted">
-                  {s.today_trades}건
-                </span>
+        {statuses.map((s) => {
+          const kind = sourceKind(s.or_source);
+          return (
+            <div
+              key={s.code}
+              className={cn(
+                'rounded-md border p-3 transition-all',
+                s.active
+                  ? 'border-rise/40 bg-rise-soft/30'
+                  : 'border-border bg-surface-2',
               )}
-              {s.today_pnl !== 0 && (
-                <span className={s.today_pnl > 0 ? 'text-rise' : 'text-fall'}>
-                  {s.today_pnl > 0 ? '+' : ''}{s.today_pnl.toFixed(2)}%
-                </span>
-              )}
-            </div>
-            <div className="text-xs text-text-muted mt-1">{s.message}</div>
-            {s.or_stages && s.or_stages.length > 0 ? (
-              <div className="mt-1 flex flex-wrap gap-1">
-                {s.or_stages.map(([stage, h, l]) => (
-                  <span key={stage} className="text-xs px-1.5 py-0.5 rounded bg-accent/20 text-accent">
-                    {stage} {l.toLocaleString()}~{h.toLocaleString()}
-                  </span>
-                ))}
-              </div>
-            ) : s.or_high && s.or_low ? (
-              <div className="text-xs text-text-muted mt-1">
-                OR {s.or_low.toLocaleString()} ~ {s.or_high.toLocaleString()}
-              </div>
-            ) : null}
-            {(() => {
-              const kind = sourceKind(s.or_source);
-              return (
-                <div className="mt-1.5 flex items-center gap-1.5 text-[10px]">
-                  <span className="text-text-muted">출처</span>
-                  {kind ? (
-                    <span
-                      className={cn('px-1.5 py-0.5 rounded font-medium', SOURCE_STYLE[kind])}
-                      title={SOURCE_LABEL[kind]}
-                    >
-                      {SOURCE_LABEL[kind]}
-                    </span>
-                  ) : (
-                    <span className="px-1.5 py-0.5 rounded bg-border text-text-muted">
-                      미수집
-                    </span>
-                  )}
+            >
+              <div className="flex items-start justify-between gap-2 mb-2">
+                <div className="min-w-0">
+                  <div className="text-sm font-semibold truncate">{s.name}</div>
+                  <div className="text-2xs text-text-muted font-mono">{s.code}</div>
                 </div>
-              );
-            })()}
-          </div>
-        ))}
+                <Toggle
+                  checked={s.active}
+                  onChange={() => toggle(s.code, s.active)}
+                  size="sm"
+                  tone="rise"
+                  label={`${s.name} 자동매매 ${s.active ? '중단' : '시작'}`}
+                />
+              </div>
+
+              <div className="flex flex-wrap items-center gap-1.5 mb-2">
+                <Badge
+                  tone={s.active ? 'rise' : 'muted'}
+                  variant="soft"
+                  size="xs"
+                  dot={s.active}
+                >
+                  {s.state}
+                </Badge>
+                {s.today_trades > 0 && (
+                  <Badge tone="muted" variant="outline" size="xs">
+                    {s.today_trades}건
+                  </Badge>
+                )}
+                {s.today_pnl !== 0 && (
+                  <Badge
+                    tone={s.today_pnl > 0 ? 'rise' : 'fall'}
+                    variant="soft"
+                    size="xs"
+                  >
+                    {s.today_pnl > 0 ? '+' : ''}{s.today_pnl.toFixed(2)}%
+                  </Badge>
+                )}
+              </div>
+
+              {s.message && (
+                <div className="text-2xs text-text-muted leading-relaxed mb-2 line-clamp-2">
+                  {s.message}
+                </div>
+              )}
+
+              {s.or_stages && s.or_stages.length > 0 ? (
+                <div className="flex flex-wrap gap-1 mb-2">
+                  {s.or_stages.map(([stage, h, l]) => (
+                    <Badge key={stage} tone="accent" variant="soft" size="xs">
+                      <span className="font-semibold mr-1">{stage}</span>
+                      <span className="tabular-nums opacity-90">
+                        {l.toLocaleString()}~{h.toLocaleString()}
+                      </span>
+                    </Badge>
+                  ))}
+                </div>
+              ) : s.or_high && s.or_low ? (
+                <div className="text-2xs text-text-muted tabular-nums mb-2">
+                  OR {s.or_low.toLocaleString()} ~ {s.or_high.toLocaleString()}
+                </div>
+              ) : null}
+
+              <div className="flex items-center gap-1.5 text-2xs">
+                <span className="text-text-disabled uppercase tracking-wider">출처</span>
+                {kind ? (
+                  <Badge tone={SOURCE_TONE[kind]} variant="soft" size="xs">
+                    {SOURCE_LABEL[kind]}
+                  </Badge>
+                ) : (
+                  <Badge tone="muted" variant="outline" size="xs">
+                    미수집
+                  </Badge>
+                )}
+              </div>
+            </div>
+          );
+        })}
       </div>
-      {statuses.length > 0 && statuses[0].params && (
-        <div className="mt-3 pt-2 border-t border-border flex flex-wrap gap-2 text-xs text-text-muted">
-          <span>RR 1:{statuses[0].params.rr_ratio}</span>
-          <span>Trail {statuses[0].params.trailing_r}R</span>
-          <span>BE {statuses[0].params.breakeven_r}R</span>
-          <span>Max {statuses[0].params.max_daily_trades}회</span>
-          <span>{statuses[0].params.long_only ? 'Long' : 'L+S'}</span>
+
+      {params && (
+        <div className="mt-3 pt-3 divider-soft flex flex-wrap gap-x-4 gap-y-1 text-xs text-text-muted tabular-nums">
+          <span><span className="text-text-disabled">RR</span> 1:{params.rr_ratio}</span>
+          <span><span className="text-text-disabled">Trail</span> {params.trailing_r}R</span>
+          <span><span className="text-text-disabled">BE</span> {params.breakeven_r}R</span>
+          <span><span className="text-text-disabled">Max</span> {params.max_daily_trades}회</span>
+          <span><span className="text-text-disabled">Side</span> {params.long_only ? 'Long' : 'L+S'}</span>
         </div>
       )}
-    </div>
+    </Card>
   );
 }

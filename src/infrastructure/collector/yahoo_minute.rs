@@ -54,7 +54,10 @@ impl YahooMinuteCollector {
                 warn!("Yahoo 분봉: {stock_code} 데이터 없음");
                 return Ok(0);
             }
-            let count = self.store.save_minute_ohlcv(stock_code, &candles_kq).await?;
+            let count = self
+                .store
+                .save_minute_ohlcv(stock_code, &candles_kq)
+                .await?;
             info!("Yahoo 분봉: {stock_code} {interval} {count}건 저장");
             return Ok(count);
         }
@@ -91,9 +94,7 @@ impl YahooMinuteCollector {
         range: &str,
         db_interval_min: i16,
     ) -> Result<Vec<MinuteCandle>, KisError> {
-        let url = format!(
-            "{YAHOO_CHART_URL}/{yahoo_symbol}?interval={interval}&range={range}"
-        );
+        let url = format!("{YAHOO_CHART_URL}/{yahoo_symbol}?interval={interval}&range={range}");
 
         let response = self
             .client
@@ -127,11 +128,10 @@ impl YahooMinuteCollector {
         let closes = quote["close"].as_array();
         let volumes = quote["volume"].as_array();
 
-        let (opens, highs, lows, closes, volumes) =
-            match (opens, highs, lows, closes, volumes) {
-                (Some(o), Some(h), Some(l), Some(c), Some(v)) => (o, h, l, c, v),
-                _ => return Ok(Vec::new()),
-            };
+        let (opens, highs, lows, closes, volumes) = match (opens, highs, lows, closes, volumes) {
+            (Some(o), Some(h), Some(l), Some(c), Some(v)) => (o, h, l, c, v),
+            _ => return Ok(Vec::new()),
+        };
 
         let market_open_hour = 9;
         let market_close_hour = 15;

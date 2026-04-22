@@ -126,7 +126,14 @@ pub fn calc_atr(candles: &[MinuteCandle], period: usize) -> i64 {
 mod tests {
     use super::*;
 
-    fn make_candle(hour: u32, min: u32, open: i64, high: i64, low: i64, close: i64) -> MinuteCandle {
+    fn make_candle(
+        hour: u32,
+        min: u32,
+        open: i64,
+        high: i64,
+        low: i64,
+        close: i64,
+    ) -> MinuteCandle {
         MinuteCandle {
             date: NaiveDate::from_ymd_opt(2026, 4, 8).unwrap(),
             time: NaiveTime::from_hms_opt(hour, min, 0).unwrap(),
@@ -173,7 +180,14 @@ mod tests {
         // 09:00 ~ 09:14 = 슬롯 0 (OR 캔들)
         let mut candles = Vec::new();
         for m in 0..15 {
-            candles.push(make_candle(9, m, 100 + m as i64, 110 + m as i64, 90, 105 + m as i64));
+            candles.push(make_candle(
+                9,
+                m,
+                100 + m as i64,
+                110 + m as i64,
+                90,
+                105 + m as i64,
+            ));
         }
         // 09:15 = 슬롯 1
         candles.push(make_candle(9, 15, 200, 210, 195, 205));

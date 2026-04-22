@@ -98,6 +98,9 @@ enum Commands {
         /// legacy = 기존 mid_price 즉시 체결 (parity 경로로 재현).
         #[arg(long, default_value = "")]
         parity: String,
+        /// 허용 OR stage 목록 (쉼표 구분: 15m 또는 5m,15m,30m)
+        #[arg(long, default_value = "15m")]
+        stages: String,
     },
     /// 네이버 금융 일봉 수집
     CollectDaily,
@@ -110,6 +113,18 @@ enum Commands {
         codes: String,
         /// 분봉 간격 (기본: 1)
         #[arg(long, default_value = "1")]
+        interval: i16,
+    },
+    /// KIS 주식일별분봉조회 API 로 과거 분봉 수집 (최대 1년, Yahoo 데이터 홀 복구용)
+    CollectKisHistory {
+        /// 종목코드 (쉼표 구분)
+        #[arg(long, default_value = "122630,114800")]
+        codes: String,
+        /// 날짜 (YYYYMMDD)
+        #[arg(long)]
+        date: String,
+        /// 분봉 간격 (기본 5 — 1분봉 수집 후 집계)
+        #[arg(long, default_value = "5")]
         interval: i16,
     },
     /// Yahoo Finance 분봉 수집 (OHLCV, 최대 1달)
@@ -135,12 +150,13 @@ enum Commands {
         /// RR (손익비, 기본: 2.5)
         #[arg(long, default_value = "2.5")]
         rr: f64,
+        /// 허용 OR stage 목록 (쉼표 구분: 15m 또는 5m,15m,30m)
+        #[arg(long, default_value = "15m")]
+        stages: String,
     },
     /// 웹 서버 시작
     Server,
 }
-
-
 
 #[tokio::main]
 async fn main() {
@@ -165,11 +181,53 @@ async fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Commands::Trade { stock_code, rr, qty }) => {
+        Some(Commands::Trade {
+            stock_code,
+            rr,
+            qty,
+        }) => {
             run_trade(&config, &stock_code, rr, qty).await;
         }
-        Some(Commands::Backtest { stock_code, days, rr, trail, tstop, be_r, fvg_exp, min2nd, dynamic_lookback, session_reset, multi_stage, dual_locked, max_trades, cutoff, force_exit, parity }) => {
-            run_backtest(&config, &stock_code, days, rr, trail, tstop, be_r, fvg_exp, min2nd, dynamic_lookback, session_reset, multi_stage, dual_locked, max_trades, &cutoff, &force_exit, &parity).await;
+        Some(Commands::Backtest {
+            stock_code,
+            days,
+            rr,
+            trail,
+            tstop,
+            be_r,
+            fvg_exp,
+            min2nd,
+            dynamic_lookback,
+            session_reset,
+            multi_stage,
+            dual_locked,
+            max_trades,
+            cutoff,
+            force_exit,
+            parity,
+            stages,
+        }) => {
+            run_backtest(
+                &config,
+                &stock_code,
+                days,
+                rr,
+                trail,
+                tstop,
+                be_r,
+                fvg_exp,
+                min2nd,
+                dynamic_lookback,
+                session_reset,
+                multi_stage,
+                dual_locked,
+                max_trades,
+                &cutoff,
+                &force_exit,
+                &parity,
+                &stages,
+            )
+            .await;
         }
         Some(Commands::CollectDaily) => {
             run_collect_daily(&config).await;
@@ -180,11 +238,27 @@ async fn main() {
         Some(Commands::CollectMinuteNaver { codes, interval }) => {
             run_collect_minute_naver(&config, &codes, interval).await;
         }
-        Some(Commands::CollectYahoo { codes, interval, range }) => {
+        Some(Commands::CollectKisHistory {
+            codes,
+            date,
+            interval,
+        }) => {
+            run_collect_kis_history(&config, &codes, &date, interval).await;
+        }
+        Some(Commands::CollectYahoo {
+            codes,
+            interval,
+            range,
+        }) => {
             run_collect_yahoo(&config, &codes, &interval, &range).await;
         }
-        Some(Commands::Replay { stock_code, date, rr }) => {
-            run_replay(&config, &stock_code, &date, rr).await;
+        Some(Commands::Replay {
+            stock_code,
+            date,
+            rr,
+            stages,
+        }) => {
+            run_replay(&config, &stock_code, &date, rr, &stages).await;
         }
         Some(Commands::Server) | None => {
             run_server(config).await;
@@ -204,12 +278,17 @@ async fn run_trade(config: &AppConfig, stock_code: &str, _rr: f64, _qty: u64) {
 
     // 인프라 구성 (웹 서버와 동일한 파이프라인)
     let token_manager = Arc::new(TokenManager::new(
-        config.appkey.clone(), config.appsecret.clone(), config.environment,
+        config.appkey.clone(),
+        config.appsecret.clone(),
+        config.environment,
     ));
     let rate_limiter = Arc::new(KisRateLimiter::new(config.environment));
     let client = Arc::new(KisHttpClient::new(
-        Arc::clone(&token_manager), Arc::clone(&rate_limiter),
-        config.environment, config.account_no.clone(), config.account_product_code.clone(),
+        Arc::clone(&token_manager),
+        Arc::clone(&rate_limiter),
+        config.environment,
+        config.account_no.clone(),
+        config.account_product_code.clone(),
     ));
 
     // DB 연결
@@ -231,7 +310,9 @@ async fn run_trade(config: &AppConfig, stock_code: &str, _rr: f64, _qty: u64) {
     {
         use kis_agent::infrastructure::websocket::connection::KisWebSocketClient;
         let ws_client = Arc::new(KisWebSocketClient::new(
-            Arc::clone(&token_manager), config.environment, realtime_tx.clone(),
+            Arc::clone(&token_manager),
+            config.environment,
+            realtime_tx.clone(),
         ));
         let sub_mgr = ws_client.subscription_manager();
         sub_mgr.add("H0STCNT0", stock_code).await;
@@ -263,14 +344,20 @@ async fn run_trade(config: &AppConfig, stock_code: &str, _rr: f64, _qty: u64) {
 
     let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut runner = LiveRunner::new(
-        Arc::clone(&client), code, stock_code.to_string(), 0, stop_flag,
+        Arc::clone(&client),
+        code,
+        stock_code.to_string(),
+        0,
+        stop_flag,
     );
     runner = runner.with_trade_tx(realtime_tx.clone());
     runner = runner.with_ws_candles(ws_candles);
     if let Some(ref store) = pg_store {
         runner = runner.with_db_store(Arc::clone(store));
         runner = runner.with_event_logger(Arc::new(
-            kis_agent::infrastructure::monitoring::event_logger::EventLogger::new(store.pool().clone()),
+            kis_agent::infrastructure::monitoring::event_logger::EventLogger::new(
+                store.pool().clone(),
+            ),
         ));
     }
 
@@ -289,13 +376,49 @@ async fn run_trade(config: &AppConfig, stock_code: &str, _rr: f64, _qty: u64) {
     }
 }
 
+fn parse_allowed_stages(csv: &str) -> Result<Vec<String>, String> {
+    let mut stages = Vec::new();
+    for raw in csv.split(',') {
+        let normalized = match raw.trim().to_ascii_lowercase().as_str() {
+            "5m" | "5" | "5분" | "5분or" => "5m",
+            "15m" | "15" | "15분" | "15분or" => "15m",
+            "30m" | "30" | "30분" | "30분or" => "30m",
+            "" => continue,
+            other => {
+                return Err(format!("지원하지 않는 stage: {other} (허용: 5m, 15m, 30m)"));
+            }
+        };
+        if !stages.iter().any(|s| s == normalized) {
+            stages.push(normalized.to_string());
+        }
+    }
+    if stages.is_empty() {
+        return Err("허용 stage 목록이 비었습니다".to_string());
+    }
+    Ok(stages)
+}
+
 /// ORB+FVG 백테스트 (DB 기반)
 #[allow(clippy::too_many_arguments)]
 async fn run_backtest(
-    config: &AppConfig, stock_code: &str, days: usize, rr: f64,
-    trail: f64, tstop: usize, be_r: f64, fvg_exp: usize, min2nd: f64,
-    dynamic_lookback: usize, session_reset: bool, multi_stage: bool, dual_locked: bool,
-    max_trades: usize, cutoff: &str, force_exit: &str, parity: &str,
+    config: &AppConfig,
+    stock_code: &str,
+    days: usize,
+    rr: f64,
+    trail: f64,
+    tstop: usize,
+    be_r: f64,
+    fvg_exp: usize,
+    min2nd: f64,
+    dynamic_lookback: usize,
+    session_reset: bool,
+    multi_stage: bool,
+    dual_locked: bool,
+    max_trades: usize,
+    cutoff: &str,
+    force_exit: &str,
+    parity: &str,
+    stages: &str,
 ) {
     use kis_agent::strategy::orb_fvg::OrbFvgConfig;
 
@@ -308,14 +431,16 @@ async fn run_backtest(
         }
     };
 
-    let mut strategy_config = OrbFvgConfig::default();
-    strategy_config.rr_ratio = rr;
-    strategy_config.trailing_r = trail;
-    strategy_config.time_stop_candles = tstop;
-    strategy_config.breakeven_r = be_r;
-    strategy_config.fvg_expiry_candles = fvg_exp;
-    strategy_config.min_first_pnl_for_second = min2nd;
-    strategy_config.max_daily_trades = max_trades;
+    let mut strategy_config = OrbFvgConfig {
+        rr_ratio: rr,
+        trailing_r: trail,
+        time_stop_candles: tstop,
+        breakeven_r: be_r,
+        fvg_expiry_candles: fvg_exp,
+        min_first_pnl_for_second: min2nd,
+        max_daily_trades: max_trades,
+        ..OrbFvgConfig::default()
+    };
     if let Ok(t) = chrono::NaiveTime::parse_from_str(&format!("{}:00", cutoff), "%H:%M:%S") {
         strategy_config.entry_cutoff = t;
     }
@@ -325,12 +450,22 @@ async fn run_backtest(
 
     let source_interval = 5_i16;
     let engine = BacktestEngine::with_config(store, strategy_config, source_interval);
+    let allowed_stages = match parse_allowed_stages(stages) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("stage 파싱 오류: {e}");
+            std::process::exit(1);
+        }
+    };
 
     // Parity 경로 — SignalEngine + ExecutionPolicy + PositionManager 조합.
     if !parity.is_empty() {
         info!("=== Parity 백테스트 시작 (policy={parity}) ===");
-        info!("종목: {stock_code}, 기간: {days}일, RR: 1:{rr:.1}");
-        match engine.run_parity(stock_code, days, parity).await {
+        info!("종목: {stock_code}, 기간: {days}일, RR: 1:{rr:.1}, stages={allowed_stages:?}");
+        match engine
+            .run_parity(stock_code, days, parity, &allowed_stages)
+            .await
+        {
             Ok(report) => println!("{report}"),
             Err(e) => {
                 eprintln!("parity 백테스트 에러: {e}");
@@ -343,13 +478,20 @@ async fn run_backtest(
     if dual_locked {
         let codes: Vec<&str> = stock_code.split(',').map(|s| s.trim()).collect();
         if codes.len() != 2 {
-            eprintln!("dual-locked 모드는 종목코드 2개를 쉼표로 구분해야 합니다 (예: 122630,114800)");
+            eprintln!(
+                "dual-locked 모드는 종목코드 2개를 쉼표로 구분해야 합니다 (예: 122630,114800)"
+            );
             std::process::exit(1);
         }
         let (code_a, code_b) = (codes[0], codes[1]);
         info!("=== 두 종목 통합 백테스트 (position_lock) 시작 ===");
-        info!("{code_a} + {code_b}, 기간: {days}일, Multi-Stage: {multi_stage}");
-        match engine.run_dual_locked(code_a, code_b, days, multi_stage).await {
+        info!(
+            "{code_a} + {code_b}, 기간: {days}일, Multi-Stage: {multi_stage}, stages={allowed_stages:?}"
+        );
+        match engine
+            .run_dual_locked(code_a, code_b, days, multi_stage, &allowed_stages)
+            .await
+        {
             Ok((report_a, report_b)) => {
                 println!("{report_a}");
                 println!("{report_b}");
@@ -358,46 +500,77 @@ async fn run_backtest(
                 let total_wins = report_a.wins + report_b.wins;
                 let actual_days = report_a.days_tested.max(1);
                 println!("\n=== 합산 ===");
-                println!("  실제 테스트 일수: {}일 (CLI --days={})", report_a.days_tested, days);
+                println!(
+                    "  실제 테스트 일수: {}일 (CLI --days={})",
+                    report_a.days_tested, days
+                );
                 println!("  총 거래: {}회 (승리 {}회)", total_trades, total_wins);
                 println!("  총 손익: {:.2}%", total_pnl);
                 println!("  일평균: {:.2}%", total_pnl / actual_days as f64);
             }
-            Err(e) => { eprintln!("백테스트 에러: {e}"); std::process::exit(1); }
+            Err(e) => {
+                eprintln!("백테스트 에러: {e}");
+                std::process::exit(1);
+            }
         }
     } else if multi_stage {
         info!("=== Multi-Stage ORB 백테스트 시작 ===");
-        info!("종목: {stock_code}, 기간: {days}일 (5분/15분/30분 OR 동시 추적)");
-        match engine.run_multi_stage(stock_code, days).await {
+        info!("종목: {stock_code}, 기간: {days}일, stages={allowed_stages:?}");
+        match engine
+            .run_multi_stage(stock_code, days, &allowed_stages)
+            .await
+        {
             Ok(report) => println!("{report}"),
-            Err(e) => { eprintln!("백테스트 에러: {e}"); std::process::exit(1); }
+            Err(e) => {
+                eprintln!("백테스트 에러: {e}");
+                std::process::exit(1);
+            }
         }
     } else if session_reset {
         info!("=== Session Reset 백테스트 시작 ===");
-        info!("종목: {stock_code}, 기간: {days}일 (오전+오후 독립 세션)");
-        match engine.run_session_reset(stock_code, days).await {
+        info!(
+            "종목: {stock_code}, 기간: {days}일 (오전+오후 독립 세션), stages={allowed_stages:?}"
+        );
+        match engine
+            .run_session_reset(stock_code, days, &allowed_stages)
+            .await
+        {
             Ok(report) => println!("{report}"),
-            Err(e) => { eprintln!("백테스트 에러: {e}"); std::process::exit(1); }
+            Err(e) => {
+                eprintln!("백테스트 에러: {e}");
+                std::process::exit(1);
+            }
         }
     } else if dynamic_lookback > 0 {
         info!("=== Dynamic Target 백테스트 시작 ===");
-        info!("종목: {stock_code}, 기간: {days}일, lookback: {dynamic_lookback}일");
-        match engine.run_dynamic_target(stock_code, days, dynamic_lookback).await {
+        info!(
+            "종목: {stock_code}, 기간: {days}일, lookback: {dynamic_lookback}일, stages={allowed_stages:?}"
+        );
+        match engine
+            .run_dynamic_target(stock_code, days, dynamic_lookback, &allowed_stages)
+            .await
+        {
             Ok(report) => println!("{report}"),
-            Err(e) => { eprintln!("백테스트 에러: {e}"); std::process::exit(1); }
+            Err(e) => {
+                eprintln!("백테스트 에러: {e}");
+                std::process::exit(1);
+            }
         }
     } else {
         info!("=== ORB+FVG 백테스트 시작 ===");
-        info!("종목: {stock_code}, 기간: {days}일, RR: 1:{rr:.1}");
-        match engine.run(stock_code, days).await {
+        info!("종목: {stock_code}, 기간: {days}일, RR: 1:{rr:.1}, stages={allowed_stages:?}");
+        match engine.run(stock_code, days, &allowed_stages).await {
             Ok(report) => println!("{report}"),
-            Err(e) => { eprintln!("백테스트 에러: {e}"); std::process::exit(1); }
+            Err(e) => {
+                eprintln!("백테스트 에러: {e}");
+                std::process::exit(1);
+            }
         }
     }
 }
 
 /// Candle replay comparison — 단일 날짜를 세 경로(legacy / parity-legacy / parity-passive)로 비교
-async fn run_replay(config: &AppConfig, stock_code: &str, date_str: &str, rr: f64) {
+async fn run_replay(config: &AppConfig, stock_code: &str, date_str: &str, rr: f64, stages: &str) {
     use chrono::NaiveDate;
     use kis_agent::strategy::orb_fvg::OrbFvgConfig;
 
@@ -418,13 +591,24 @@ async fn run_replay(config: &AppConfig, stock_code: &str, date_str: &str, rr: f6
         }
     };
 
-    let mut strategy_config = OrbFvgConfig::default();
-    strategy_config.rr_ratio = rr;
+    let strategy_config = OrbFvgConfig {
+        rr_ratio: rr,
+        ..OrbFvgConfig::default()
+    };
 
     let engine = BacktestEngine::with_config(store, strategy_config, 5);
+    let allowed_stages = match parse_allowed_stages(stages) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("stage 파싱 오류: {e}");
+            std::process::exit(1);
+        }
+    };
 
-    info!("=== Candle Replay 비교 시작 ({stock_code}, {date}, RR=1:{rr:.1}) ===");
-    match engine.replay_day(stock_code, date).await {
+    info!(
+        "=== Candle Replay 비교 시작 ({stock_code}, {date}, RR=1:{rr:.1}, stages={allowed_stages:?}) ==="
+    );
+    match engine.replay_day(stock_code, date, &allowed_stages).await {
         Ok(report) => println!("{report}"),
         Err(e) => {
             eprintln!("replay 에러: {e}");
@@ -438,10 +622,7 @@ async fn run_collect_yahoo(config: &AppConfig, codes: &str, interval: &str, rang
     use kis_agent::infrastructure::collector::yahoo_minute::YahooMinuteCollector;
 
     // interval 문자열에서 분 단위 추출 (e.g. "5m" → 5)
-    let db_interval_min: i16 = interval
-        .trim_end_matches('m')
-        .parse()
-        .unwrap_or(5);
+    let db_interval_min: i16 = interval.trim_end_matches('m').parse().unwrap_or(5);
 
     info!("=== Yahoo Finance 분봉 수집 시작 ({interval}, {range}) ===");
 
@@ -503,7 +684,9 @@ async fn run_collect_daily(config: &AppConfig) {
     let end_date = chrono::Local::now().format("%Y%m%d").to_string();
     let start_date = {
         let now = chrono::Local::now();
-        (now - chrono::Duration::days(365 * 3)).format("%Y%m%d").to_string()
+        (now - chrono::Duration::days(365 * 3))
+            .format("%Y%m%d")
+            .to_string()
     };
 
     info!("수집 기간: {start_date} ~ {end_date}");
@@ -592,6 +775,58 @@ async fn run_collect_minute(config: &AppConfig) {
     info!("=== 수집 완료 ===");
 }
 
+/// KIS 주식일별분봉조회 — 과거 분봉 수집 (최대 1년)
+async fn run_collect_kis_history(
+    config: &AppConfig,
+    codes: &str,
+    date: &str,
+    interval: i16,
+) {
+    info!("=== KIS 주식일별분봉조회 수집 시작 ({date}, {interval}m) ===");
+
+    // 날짜 입력 유효성 (YYYYMMDD, 8자리 숫자)
+    if date.len() != 8 || !date.chars().all(|c| c.is_ascii_digit()) {
+        eprintln!("--date 는 YYYYMMDD 형식 8자리 숫자여야 합니다: {date}");
+        std::process::exit(2);
+    }
+
+    let store = match PostgresStore::new(&config.database_url).await {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            eprintln!("KIS 과거 분봉 수집 실패 — PostgreSQL 연결 불가: {e}");
+            std::process::exit(2);
+        }
+    };
+
+    let token_manager = Arc::new(TokenManager::new(
+        config.appkey.clone(),
+        config.appsecret.clone(),
+        config.environment,
+    ));
+    let rate_limiter = Arc::new(KisRateLimiter::new(config.environment));
+    let http_client = Arc::new(KisHttpClient::new(
+        Arc::clone(&token_manager),
+        Arc::clone(&rate_limiter),
+        config.environment,
+        config.account_no.clone(),
+        config.account_product_code.clone(),
+    ));
+
+    let collector = KisMinuteCollector::new(http_client, store);
+
+    let stocks: Vec<&str> = codes.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+
+    match collector
+        .collect_historical_batch(&stocks, date, interval)
+        .await
+    {
+        Ok(count) => info!("KIS 과거 분봉 수집 완료: 총 {count}건"),
+        Err(e) => tracing::error!("KIS 과거 분봉 수집 실패: {e}"),
+    }
+
+    info!("=== 수집 완료 ===");
+}
+
 /// 웹 서버 실행
 async fn run_server(config: AppConfig) {
     info!(
@@ -659,7 +894,10 @@ async fn run_server(config: AppConfig) {
     let price_cache = Arc::new(MemoryCache::new(std::time::Duration::from_secs(5)));
     let orderbook_cache = Arc::new(MemoryCache::new(std::time::Duration::from_secs(3)));
     let market_data_service = Arc::new(MarketDataService::new(
-        market_data_adapter, price_cache, orderbook_cache, sqlite_cache,
+        market_data_adapter,
+        price_cache,
+        orderbook_cache,
+        sqlite_cache,
     ));
     let trading_service = Arc::new(TradingService::new(trading_adapter));
     let account_service = Arc::new(AccountService::new(account_adapter));
@@ -670,9 +908,11 @@ async fn run_server(config: AppConfig) {
     // 운영 이벤트 로거 (fire-and-forget 비동기 DB 저장).
     // WebSocket 재연결, API 에러 등 system 이벤트를 기록하려면 이 시점에 먼저 만들어야 함.
     let event_logger = pg_store.as_ref().map(|store| {
-        Arc::new(kis_agent::infrastructure::monitoring::event_logger::EventLogger::new(
-            store.pool().clone(),
-        ))
+        Arc::new(
+            kis_agent::infrastructure::monitoring::event_logger::EventLogger::new(
+                store.pool().clone(),
+            ),
+        )
     });
     // HTTP 클라이언트에 사후 주입 (api_error 이벤트 기록 활성화)
     if let Some(ref el) = event_logger {
@@ -748,7 +988,10 @@ async fn run_server(config: AppConfig) {
                     );
                     if let Some(ref el) = event_logger_watch {
                         el.log_event(
-                            "", "system", "ws_watchdog_exit", "critical",
+                            "",
+                            "system",
+                            "ws_watchdog_exit",
+                            "critical",
                             "WS terminated — 프로세스 교체 필요",
                             serde_json::json!({
                                 "retry_count": snapshot.retry_count,
@@ -772,9 +1015,9 @@ async fn run_server(config: AppConfig) {
                 let tick_age = snapshot.tick_age_secs();
                 let msg_age = snapshot.message_age_secs();
                 let critical = match (tick_age, msg_age) {
-                    (Some(t), _) if t > stale_tick_secs => Some(format!(
-                        "tick stale {t}초 > 임계 {stale_tick_secs}초"
-                    )),
+                    (Some(t), _) if t > stale_tick_secs => {
+                        Some(format!("tick stale {t}초 > 임계 {stale_tick_secs}초"))
+                    }
                     (None, _) => {
                         let elapsed_since_open = (now_t - market_start).num_seconds().max(0) as u64;
                         if elapsed_since_open > 600 {
@@ -783,20 +1026,26 @@ async fn run_server(config: AppConfig) {
                             None
                         }
                     }
-                    (_, Some(m)) if m > stale_message_secs => Some(format!(
-                        "message stale {m}초 > 임계 {stale_message_secs}초"
-                    )),
+                    (_, Some(m)) if m > stale_message_secs => {
+                        Some(format!("message stale {m}초 > 임계 {stale_message_secs}초"))
+                    }
                     _ => None,
                 };
 
                 if let Some(reason) = critical {
                     tracing::error!(
                         "[ws-watchdog] stale 감지 — {} (retry_count={}, tick_age={:?}, msg_age={:?}) — 프로세스 종료",
-                        reason, snapshot.retry_count, tick_age, msg_age
+                        reason,
+                        snapshot.retry_count,
+                        tick_age,
+                        msg_age
                     );
                     if let Some(ref el) = event_logger_watch {
                         el.log_event(
-                            "", "system", "ws_watchdog_exit", "critical",
+                            "",
+                            "system",
+                            "ws_watchdog_exit",
+                            "critical",
                             &format!("WS stale — {reason}"),
                             serde_json::json!({
                                 "retry_count": snapshot.retry_count,
@@ -827,9 +1076,7 @@ async fn run_server(config: AppConfig) {
         // DB에서 당일 분봉 프리로딩 (장중 재시작 복구)
         aggregator.preload_from_db(&codes_ref).await;
         // OR 데이터 없으면 Yahoo 1순위 / 네이버 fallback으로 자동 보충
-        aggregator
-            .backfill_or(&codes_ref, false)
-            .await;
+        aggregator.backfill_or(&codes_ref, false).await;
 
         let candles = aggregator.completed_candles();
         let rx = realtime_tx.subscribe();
@@ -852,6 +1099,11 @@ async fn run_server(config: AppConfig) {
         if let Some(ref el) = event_logger {
             mgr.set_event_logger(Arc::clone(el));
         }
+        // 2026-04-17 P1 — reconcile 재확인 파라미터 주입.
+        mgr.set_reconcile_confirm_params(
+            config.reconcile_confirm_attempts,
+            config.reconcile_confirm_interval_secs,
+        );
         mgr
     };
 
@@ -869,7 +1121,7 @@ async fn run_server(config: AppConfig) {
             GlobalTradeGate::new(config.max_daily_trades_total.max(1)),
         ));
 
-        let live_cfg = if config.is_real_mode() {
+        let mut live_cfg = if config.is_real_mode() {
             LiveRunnerConfig::for_real_mode(
                 config.real_or_stages.clone(),
                 config.entry_cutoff_real,
@@ -879,17 +1131,28 @@ async fn run_server(config: AppConfig) {
         } else {
             // 모의 모드도 전역 가드는 동일하게 적용 (burn-in 검증을 위해).
             // 원치 않으면 `KIS_MAX_DAILY_TRADES_TOTAL=5` 이상으로 풀어두면 실질 비활성.
-            let mut cfg = LiveRunnerConfig::default();
-            cfg.global_trade_gate = Some(Arc::clone(&global_trade_gate));
-            cfg
+            LiveRunnerConfig {
+                global_trade_gate: Some(Arc::clone(&global_trade_gate)),
+                ..LiveRunnerConfig::default()
+            }
         };
+        live_cfg.execution_policy_kind = config.live_execution_policy_kind;
+        live_cfg.entry_fill_timeout_ms = config.live_entry_fill_timeout_ms;
+        live_cfg.exit_verification_budget_ms = config.live_exit_verification_budget_ms;
+        live_cfg.poll_interval_ms = config.live_poll_interval_ms;
+        live_cfg.manage_poll_interval_ms = config.live_manage_poll_interval_ms;
         info!(
-            "LiveRunnerConfig — real_mode={}, enable_real_orders={}, allowed_stages={:?}, max_daily_trades_override={:?}, entry_cutoff_override={:?}",
+            "LiveRunnerConfig — real_mode={}, enable_real_orders={}, allowed_stages={:?}, max_daily_trades_override={:?}, entry_cutoff_override={:?}, execution_policy={:?}, entry_fill_timeout_ms={}, exit_verification_budget_ms={}, poll_interval_ms={}, manage_poll_interval_ms={}",
             live_cfg.real_mode,
             live_cfg.enable_real_orders,
             live_cfg.allowed_stages,
             live_cfg.max_daily_trades_override,
-            live_cfg.entry_cutoff_override
+            live_cfg.entry_cutoff_override,
+            live_cfg.execution_policy_kind,
+            live_cfg.entry_fill_timeout_ms,
+            live_cfg.exit_verification_budget_ms,
+            live_cfg.poll_interval_ms,
+            live_cfg.manage_poll_interval_ms
         );
         strategy_manager.set_live_runner_config(live_cfg).await;
 
@@ -935,8 +1198,10 @@ async fn run_server(config: AppConfig) {
                 loop {
                     let now = chrono::Local::now().time();
                     let target = chrono::NaiveTime::from_hms_opt(hour, min, 0).unwrap();
-                    if now >= target { break; }
-                    let secs = (target - now).num_seconds().max(1).min(10) as u64;
+                    if now >= target {
+                        break;
+                    }
+                    let secs = (target - now).num_seconds().clamp(1, 10) as u64;
                     tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
                 }
                 // 성공할 때까지 1분 간격 재시도 (최대 20회)
@@ -949,12 +1214,18 @@ async fn run_server(config: AppConfig) {
                         break;
                     }
                     if attempt < 20 {
-                        warn!("Yahoo OR 교체 실패 ({} OR, {}회차/20) — 60초 후 재시도", stage, attempt);
+                        warn!(
+                            "Yahoo OR 교체 실패 ({} OR, {}회차/20) — 60초 후 재시도",
+                            stage, attempt
+                        );
                         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                     }
                 }
                 if !success {
-                    tracing::error!("Yahoo OR 교체 최종 실패 ({} OR, 20회 시도) — WS OR 유지, 백테스트 정합성 미확보", stage);
+                    tracing::error!(
+                        "Yahoo OR 교체 최종 실패 ({} OR, 20회 시도) — WS OR 유지, 백테스트 정합성 미확보",
+                        stage
+                    );
                     agg.mark_or_refresh_failed(stage).await;
                 }
             }
@@ -1073,13 +1344,16 @@ async fn run_server(config: AppConfig) {
     // taskkill /F, SIGKILL 등 OS 레벨 강제 종료는 처리 불가 (재시작 시 cancel_all_pending_orders로 복구).
     let shutdown_signal = async move {
         let ctrl_c = async {
-            tokio::signal::ctrl_c().await.expect("SIGINT 핸들러 설치 실패");
+            tokio::signal::ctrl_c()
+                .await
+                .expect("SIGINT 핸들러 설치 실패");
         };
         #[cfg(unix)]
         let terminate = async {
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
                 .expect("SIGTERM 핸들러 설치 실패")
-                .recv().await;
+                .recv()
+                .await;
         };
         #[cfg(not(unix))]
         let terminate = std::future::pending::<()>();
@@ -1092,7 +1366,9 @@ async fn run_server(config: AppConfig) {
         // 1) 모든 러너에 stop 신호 → 체결 대기 루프 즉시 탈출 → cancel 경로 실행
         shutdown_mgr.stop_all().await;
         // 2) 러너들이 cancel 완료할 때까지 대기 (체결 대기 30초 + cancel 재시도 여유 = 40초)
-        shutdown_mgr.wait_all_stopped(std::time::Duration::from_secs(40)).await;
+        shutdown_mgr
+            .wait_all_stopped(std::time::Duration::from_secs(40))
+            .await;
         info!("모든 러너 종료 확인 — axum shutdown 진행");
     };
 
@@ -1102,4 +1378,77 @@ async fn run_server(config: AppConfig) {
         .expect("서버 실행 실패");
 
     info!("서버 종료 완료");
+}
+
+/// v3 불변식 #1 Stage 3: `--stages` CSV 정규화 회귀.
+///
+/// 오프라인 경로가 라이브 불변식과 같은 단일 15m 의미를 갖도록, 이 parser 의
+/// 정규화 규칙 (대소문자 / `분` 접미사 / 중복 제거 / 오입력 거부) 이 깨지지 않게
+/// 방어한다.
+#[cfg(test)]
+mod parse_allowed_stages_tests {
+    use super::*;
+
+    #[test]
+    fn single_15m_normalized() {
+        assert_eq!(parse_allowed_stages("15m").unwrap(), vec!["15m"]);
+        assert_eq!(parse_allowed_stages("15").unwrap(), vec!["15m"]);
+        assert_eq!(parse_allowed_stages("15분").unwrap(), vec!["15m"]);
+        assert_eq!(parse_allowed_stages("15M").unwrap(), vec!["15m"]);
+    }
+
+    #[test]
+    fn csv_order_preserved_for_multi_stages() {
+        assert_eq!(
+            parse_allowed_stages("5m,15m").unwrap(),
+            vec!["5m".to_string(), "15m".to_string()]
+        );
+        assert_eq!(
+            parse_allowed_stages("15m,5m,30m").unwrap(),
+            vec!["15m".to_string(), "5m".to_string(), "30m".to_string()]
+        );
+    }
+
+    #[test]
+    fn whitespace_and_case_tolerated() {
+        assert_eq!(
+            parse_allowed_stages(" 15m , 5M ").unwrap(),
+            vec!["15m".to_string(), "5m".to_string()]
+        );
+    }
+
+    #[test]
+    fn duplicates_removed_preserving_first_position() {
+        assert_eq!(
+            parse_allowed_stages("15m,15m,15분").unwrap(),
+            vec!["15m".to_string()]
+        );
+        assert_eq!(
+            parse_allowed_stages("5m,15m,5m").unwrap(),
+            vec!["5m".to_string(), "15m".to_string()]
+        );
+    }
+
+    #[test]
+    fn empty_string_errors() {
+        let err = parse_allowed_stages("").unwrap_err();
+        assert!(err.contains("비었"), "empty error: {err}");
+    }
+
+    #[test]
+    fn only_commas_errors() {
+        let err = parse_allowed_stages(", , ,").unwrap_err();
+        assert!(err.contains("비었"), "blank error: {err}");
+    }
+
+    #[test]
+    fn unknown_stage_errors() {
+        let err = parse_allowed_stages("10m").unwrap_err();
+        assert!(err.contains("지원하지 않는 stage"), "unknown error: {err}");
+        let err2 = parse_allowed_stages("15m,10m").unwrap_err();
+        assert!(
+            err2.contains("지원하지 않는 stage"),
+            "partial unknown error: {err2}"
+        );
+    }
 }

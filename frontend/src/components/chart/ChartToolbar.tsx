@@ -1,10 +1,10 @@
 import { useStockStore } from '../../stores/stockStore';
-import { cn } from '../../utils/cn';
+import { SegmentedControl, Badge } from '../ui';
 
 const PERIODS = [
-  { label: '일', value: 'D' },
-  { label: '주', value: 'W' },
-  { label: '월', value: 'M' },
+  { label: '일', value: 'D' as const },
+  { label: '주', value: 'W' as const },
+  { label: '월', value: 'M' as const },
 ];
 
 const INDICATORS = [
@@ -22,43 +22,31 @@ export function ChartToolbar() {
     useStockStore();
 
   return (
-    <div className="flex items-center gap-4 py-2">
-      {/* 기간 선택 */}
-      <div className="flex gap-1">
-        {PERIODS.map((p) => (
-          <button
-            key={p.value}
-            onClick={() => setChartPeriod(p.value)}
-            className={cn(
-              'px-3 py-1 text-xs rounded transition-colors',
-              chartPeriod === p.value
-                ? 'bg-accent text-white'
-                : 'bg-card text-text-muted hover:bg-border/50',
-            )}
-          >
-            {p.label}
-          </button>
-        ))}
-      </div>
+    <div className="flex items-center gap-3 py-2 flex-wrap">
+      <SegmentedControl
+        options={PERIODS}
+        value={chartPeriod as 'D' | 'W' | 'M'}
+        onChange={(v) => setChartPeriod(v)}
+        size="sm"
+      />
 
-      <div className="w-px h-4 bg-border" />
+      <div className="w-px h-5 bg-border" />
 
-      {/* 지표 토글 */}
       <div className="flex gap-1 flex-wrap">
-        {INDICATORS.map((ind) => (
-          <button
-            key={ind.value}
-            onClick={() => toggleIndicator(ind.value)}
-            className={cn(
-              'px-2 py-1 text-xs rounded transition-colors',
-              activeIndicators.includes(ind.value)
-                ? 'bg-accent/20 text-accent border border-accent/30'
-                : 'bg-card text-text-muted hover:bg-border/50',
-            )}
-          >
-            {ind.label}
-          </button>
-        ))}
+        {INDICATORS.map((ind) => {
+          const active = activeIndicators.includes(ind.value);
+          return (
+            <button
+              key={ind.value}
+              onClick={() => toggleIndicator(ind.value)}
+              className="focus:outline-none"
+            >
+              <Badge tone={active ? 'accent' : 'muted'} variant={active ? 'soft' : 'outline'} size="sm">
+                {ind.label}
+              </Badge>
+            </button>
+          );
+        })}
       </div>
     </div>
   );

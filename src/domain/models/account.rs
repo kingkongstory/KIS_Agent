@@ -12,23 +12,38 @@ pub struct PositionItem {
     pub prdt_name: String,
 
     /// 보유수량
-    #[serde(deserialize_with = "string_to_i64::deserialize", serialize_with = "string_to_i64::serialize")]
+    #[serde(
+        deserialize_with = "string_to_i64::deserialize",
+        serialize_with = "string_to_i64::serialize"
+    )]
     pub hldg_qty: i64,
 
     /// 매입평균가
-    #[serde(deserialize_with = "string_to_f64::deserialize", serialize_with = "string_to_f64::serialize")]
+    #[serde(
+        deserialize_with = "string_to_f64::deserialize",
+        serialize_with = "string_to_f64::serialize"
+    )]
     pub pchs_avg_pric: f64,
 
     /// 현재가
-    #[serde(deserialize_with = "string_to_i64::deserialize", serialize_with = "string_to_i64::serialize")]
+    #[serde(
+        deserialize_with = "string_to_i64::deserialize",
+        serialize_with = "string_to_i64::serialize"
+    )]
     pub prpr: i64,
 
     /// 평가손익금액
-    #[serde(deserialize_with = "string_to_i64::deserialize", serialize_with = "string_to_i64::serialize")]
+    #[serde(
+        deserialize_with = "string_to_i64::deserialize",
+        serialize_with = "string_to_i64::serialize"
+    )]
     pub evlu_pfls_amt: i64,
 
     /// 평가손익률 (%)
-    #[serde(deserialize_with = "string_to_f64::deserialize", serialize_with = "string_to_f64::serialize")]
+    #[serde(
+        deserialize_with = "string_to_f64::deserialize",
+        serialize_with = "string_to_f64::serialize"
+    )]
     pub evlu_pfls_rt: f64,
 
     /// 매입금액
@@ -52,15 +67,24 @@ pub struct PositionItem {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountSummary {
     /// 예수금 총금액
-    #[serde(deserialize_with = "string_to_i64::deserialize", serialize_with = "string_to_i64::serialize")]
+    #[serde(
+        deserialize_with = "string_to_i64::deserialize",
+        serialize_with = "string_to_i64::serialize"
+    )]
     pub dnca_tot_amt: i64,
 
     /// 총평가금액
-    #[serde(deserialize_with = "string_to_i64::deserialize", serialize_with = "string_to_i64::serialize")]
+    #[serde(
+        deserialize_with = "string_to_i64::deserialize",
+        serialize_with = "string_to_i64::serialize"
+    )]
     pub tot_evlu_amt: i64,
 
     /// 평가손익 합계금액
-    #[serde(deserialize_with = "string_to_i64::deserialize", serialize_with = "string_to_i64::serialize")]
+    #[serde(
+        deserialize_with = "string_to_i64::deserialize",
+        serialize_with = "string_to_i64::serialize"
+    )]
     pub evlu_pfls_smtl_amt: i64,
 
     /// 매입금액 합계

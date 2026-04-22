@@ -7,15 +7,14 @@ pub struct IndicatorService;
 
 impl IndicatorService {
     /// 캔들 데이터로 지표 계산
-    pub fn calculate(
-        names: &[String],
-        candles: &[Candle],
-    ) -> Vec<IndicatorResultDto> {
+    pub fn calculate(names: &[String], candles: &[Candle]) -> Vec<IndicatorResultDto> {
         let results = IndicatorEngine::calculate_all(names, candles);
         results
             .into_iter()
             .filter_map(|(name, result)| {
-                result.ok().map(|values| IndicatorResultDto::from_values(name, values))
+                result
+                    .ok()
+                    .map(|values| IndicatorResultDto::from_values(name, values))
             })
             .collect()
     }

@@ -15,9 +15,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/v1/account/buyable", get(get_buyable))
 }
 
-async fn get_balance(
-    State(state): State<AppState>,
-) -> Result<Json<BalanceDto>, AppError> {
+async fn get_balance(State(state): State<AppState>) -> Result<Json<BalanceDto>, AppError> {
     let dto = state.account.get_balance().await?;
     Ok(Json(dto))
 }
@@ -50,9 +48,6 @@ async fn get_buyable(
     Query(query): Query<BuyableQuery>,
 ) -> Result<Json<BuyableDto>, AppError> {
     let stock_code = StockCode::new(&query.stock_code)?;
-    let dto = state
-        .account
-        .get_buyable(&stock_code, query.price)
-        .await?;
+    let dto = state.account.get_buyable(&stock_code, query.price).await?;
     Ok(Json(dto))
 }

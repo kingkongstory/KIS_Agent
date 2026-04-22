@@ -127,11 +127,7 @@ mod tests {
 
     #[test]
     fn test_classify_token_expired() {
-        let err = KisError::classify(
-            "1".into(),
-            "EGW00123".into(),
-            "기간이 만료된 token".into(),
-        );
+        let err = KisError::classify("1".into(), "EGW00123".into(), "기간이 만료된 token".into());
         assert!(matches!(err, KisError::TokenExpired(_)));
         assert!(err.is_retryable());
     }

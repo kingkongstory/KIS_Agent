@@ -47,6 +47,8 @@ pub struct Position {
     pub intended_entry_price: i64,
     /// 주문 → 체결 확인 지연 (밀리초)
     pub order_to_fill_ms: i64,
+    /// 진입을 발생시킨 신호 식별자. execution_journal 상관관계 키로 사용.
+    pub signal_id: String,
 }
 
 /// 청산 사유

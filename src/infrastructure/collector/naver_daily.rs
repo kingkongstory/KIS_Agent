@@ -47,9 +47,7 @@ impl NaverDailyCollector {
         start_date: &str,
         end_date: &str,
     ) -> Result<usize, KisError> {
-        let candles = self
-            .fetch_index_daily(symbol, start_date, end_date)
-            .await?;
+        let candles = self.fetch_index_daily(symbol, start_date, end_date).await?;
         if candles.is_empty() {
             warn!("네이버 금융: {symbol} 지수 데이터 없음");
             return Ok(0);
@@ -77,7 +75,11 @@ impl NaverDailyCollector {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
         }
-        info!("네이버 금융: {}/{}종목 일봉 수집 완료, 총 {total}건", stock_codes.len(), stock_codes.len());
+        info!(
+            "네이버 금융: {}/{}종목 일봉 수집 완료, 총 {total}건",
+            stock_codes.len(),
+            stock_codes.len()
+        );
         Ok(total)
     }
 
@@ -287,7 +289,10 @@ mod tests {
         assert_eq!(candles.len(), 2);
         assert_eq!(candles[0].open, 56200);
         assert_eq!(candles[0].close, 57100);
-        assert_eq!(candles[1].date, NaiveDate::from_ymd_opt(2026, 4, 8).unwrap());
+        assert_eq!(
+            candles[1].date,
+            NaiveDate::from_ymd_opt(2026, 4, 8).unwrap()
+        );
     }
 
     #[test]

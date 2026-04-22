@@ -35,6 +35,17 @@ impl Environment {
     }
 }
 
+/// 2026-04-17 권고 #2: trades.environment 컬럼에 쓰는 소문자 표기.
+/// `format!("{:?}")` 의 "Real"/"Paper" 가 아닌 "real"/"paper" 로 일관 저장.
+impl fmt::Display for Environment {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Real => f.write_str("real"),
+            Self::Paper => f.write_str("paper"),
+        }
+    }
+}
+
 /// 거래 ID (실전/모의에 따라 코드가 다름)
 #[derive(Debug, Clone)]
 pub enum TransactionId {
@@ -62,6 +73,8 @@ pub enum TransactionId {
     InquireBuyable,
     /// 주식 당일 분봉 조회
     InquireTimePrice,
+    /// 주식 일별 분봉 조회 (과거 분봉, 최대 1년)
+    InquireDailyTimePrice,
     /// 종목 검색 (조건검색)
     SearchStock,
 }
@@ -84,6 +97,7 @@ impl TransactionId {
             (Self::InquireAskingPrice, _) => "FHKST01010200",
             (Self::InquireDailyPrice, _) => "FHKST03010100",
             (Self::InquireTimePrice, _) => "FHKST03010200",
+            (Self::InquireDailyTimePrice, _) => "FHKST03010230",
             // 계좌
             (Self::InquireBalance, Environment::Real) => "TTTC8434R",
             (Self::InquireBalance, Environment::Paper) => "VTTC8434R",
@@ -233,7 +247,11 @@ mod tests {
 
     #[test]
     fn test_environment_urls() {
-        assert!(Environment::Real.rest_base_url().contains("openapi.koreainvestment"));
+        assert!(
+            Environment::Real
+                .rest_base_url()
+                .contains("openapi.koreainvestment")
+        );
         assert!(Environment::Paper.rest_base_url().contains("openapivts"));
         assert!(Environment::Real.ws_url().contains("21000"));
         assert!(Environment::Paper.ws_url().contains("31000"));
@@ -241,10 +259,30 @@ mod tests {
 
     #[test]
     fn test_transaction_id_codes() {
-        assert_eq!(TransactionId::OrderCashBuy.code(Environment::Real), "TTTC0802U");
-        assert_eq!(TransactionId::OrderCashBuy.code(Environment::Paper), "VTTC0802U");
-        assert_eq!(TransactionId::InquirePrice.code(Environment::Real), "FHKST01010100");
-        assert_eq!(TransactionId::InquirePrice.code(Environment::Paper), "FHKST01010100");
+        assert_eq!(
+            TransactionId::OrderCashBuy.code(Environment::Real),
+            "TTTC0802U"
+        );
+        assert_eq!(
+            TransactionId::OrderCashBuy.code(Environment::Paper),
+            "VTTC0802U"
+        );
+        assert_eq!(
+            TransactionId::InquirePrice.code(Environment::Real),
+            "FHKST01010100"
+        );
+        assert_eq!(
+            TransactionId::InquirePrice.code(Environment::Paper),
+            "FHKST01010100"
+        );
+        assert_eq!(
+            TransactionId::InquireDailyTimePrice.code(Environment::Real),
+            "FHKST03010230"
+        );
+        assert_eq!(
+            TransactionId::InquireDailyTimePrice.code(Environment::Paper),
+            "FHKST03010230"
+        );
     }
 
     #[test]

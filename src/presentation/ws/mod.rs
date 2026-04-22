@@ -12,10 +12,7 @@ pub fn routes() -> Router<AppState> {
     Router::new().route("/api/v1/ws/realtime", get(ws_handler))
 }
 
-async fn ws_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<AppState>,
-) -> impl IntoResponse {
+async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_ws(socket, state))
 }
 

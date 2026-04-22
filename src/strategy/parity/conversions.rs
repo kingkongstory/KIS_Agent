@@ -58,7 +58,17 @@ pub fn build_signal_intent(
 /// 헬퍼"가 동일 값을 돌려주는지 검증하는 기준.
 pub fn legacy_mid_price_plan(intent: &SignalIntent, rr_ratio: f64) -> EntryPlan {
     let intended = (intent.entry_zone_high + intent.entry_zone_low) / 2;
-    build_plan(intent, intended, rr_ratio, EntryMode::MidPriceZoneTouch, None, 0, false, FillRecheckMode::Synthetic, None)
+    build_plan(
+        intent,
+        intended,
+        rr_ratio,
+        EntryMode::MidPriceZoneTouch,
+        None,
+        0,
+        false,
+        FillRecheckMode::Synthetic,
+        None,
+    )
 }
 
 /// 라이브 현행(패시브 top/bottom 지정가) 진입 규칙을 EntryPlan으로 표현.
@@ -82,6 +92,43 @@ pub fn live_passive_plan(
         true,
         FillRecheckMode::BalanceRecheck,
         Some(intended),
+    )
+}
+
+/// 2026-04-18 Phase 3 (execution-timing-implementation-plan):
+/// 시장성 지정가 (best_ask + N tick / best_bid - N tick) 진입 규칙을 EntryPlan으로 표현.
+///
+/// `intended_entry_price` 는 zone edge 유지 (슬리피지 측정 기준). 실제 주문가
+/// (`order_price`) 는 **adapter 런타임에서** best_ask/bid (또는 현재가 fallback) + tick 으로
+/// 결정되므로 여기서는 `None` 을 리턴. `slippage_budget_pct` 로 이탈 한계를 보존한다.
+///
+/// 현행 `PassiveTopBottomTimeout30s` 대비 변경점:
+/// - timeout_ms: 30_000 → 2_000~3_000 (빠르게 실패 확정)
+/// - intended 는 동일 (zone edge) 이지만 order_price 는 adapter 가 추가 tick 반영
+pub fn live_marketable_plan(
+    intent: &SignalIntent,
+    rr_ratio: f64,
+    max_entry_drift_pct: Option<f64>,
+    slippage_budget_pct: f64,
+    timeout_ms: u64,
+) -> EntryPlan {
+    let intended = match intent.side {
+        PositionSide::Long => intent.entry_zone_high,
+        PositionSide::Short => intent.entry_zone_low,
+    };
+    build_plan(
+        intent,
+        intended,
+        rr_ratio,
+        EntryMode::MarketableLimit {
+            slippage_budget_pct,
+        },
+        max_entry_drift_pct,
+        timeout_ms,
+        true,
+        FillRecheckMode::BalanceRecheck,
+        // order_price: None — adapter 가 best_ask/bid + tick 으로 런타임 결정.
+        None,
     )
 }
 

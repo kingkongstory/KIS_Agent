@@ -40,9 +40,7 @@
 use chrono::NaiveTime;
 
 use super::candle::MinuteCandle;
-use super::parity::signal_engine::{
-    DetectedSignal, SignalEngine, SignalEngineConfig,
-};
+use super::parity::signal_engine::{DetectedSignal, SignalEngine, SignalEngineConfig};
 
 /// 전략 파라미터. 현재 경로에서는 직접 사용되지 않으며, 다음 PR 에서 채워짐.
 #[derive(Debug, Clone)]
@@ -80,17 +78,9 @@ impl Default for OrbVwapPullbackConfig {
 ///
 /// parity 인프라(`ParityDayRunner<E, P>`) 에 이 엔진을 주입하면 그대로 parity
 /// backtest/replay 경로가 동작한다. 로직만 채우면 됨.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct OrbVwapPullbackEngine {
     pub config: OrbVwapPullbackConfig,
-}
-
-impl Default for OrbVwapPullbackEngine {
-    fn default() -> Self {
-        Self {
-            config: OrbVwapPullbackConfig::default(),
-        }
-    }
 }
 
 impl SignalEngine for OrbVwapPullbackEngine {
@@ -133,6 +123,7 @@ mod tests {
             fvg_expiry_candles: 6,
             entry_cutoff: NaiveTime::from_hms_opt(10, 30, 0).unwrap(),
             require_or_breakout: true,
+            min_or_breakout_pct: 0.001,
             long_only: true,
             confirmed_side: None,
         };
@@ -144,7 +135,10 @@ mod tests {
         let cfg = OrbVwapPullbackConfig::default();
         assert_eq!(cfg.or_start, NaiveTime::from_hms_opt(9, 0, 0).unwrap());
         assert_eq!(cfg.or_end, NaiveTime::from_hms_opt(9, 15, 0).unwrap());
-        assert_eq!(cfg.entry_cutoff, NaiveTime::from_hms_opt(10, 30, 0).unwrap());
+        assert_eq!(
+            cfg.entry_cutoff,
+            NaiveTime::from_hms_opt(10, 30, 0).unwrap()
+        );
         assert_eq!(cfg.force_exit, NaiveTime::from_hms_opt(15, 15, 0).unwrap());
         assert_eq!(cfg.direction_confirm_candles, 2);
         assert_eq!(cfg.max_daily_trades, 1);

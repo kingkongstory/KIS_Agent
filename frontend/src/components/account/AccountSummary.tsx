@@ -3,6 +3,7 @@ import { get } from '../../api/client';
 import { useWsStore } from '../../stores/wsStore';
 import { formatKRW } from '../../utils/format';
 import type { BalanceSnapshot } from '../../types/websocket';
+import { Card, CardHeader, Stat, Skeleton, Badge } from '../ui';
 
 const STOCKS = [
   { code: '122630', name: 'KODEX 레버리지' },
@@ -15,7 +16,6 @@ export function AccountSummary() {
   const updateBalance = useWsStore((s) => s.updateBalance);
   const prevVersion = useRef(balanceVersion);
 
-  // 마운트 시 REST로 초기 잔고 로드
   useEffect(() => {
     (async () => {
       try {
@@ -25,7 +25,6 @@ export function AccountSummary() {
     })();
   }, [updateBalance]);
 
-  // 주문 체결 시 즉시 잔고 갱신 (1회성 REST fetch)
   useEffect(() => {
     if (balanceVersion !== prevVersion.current) {
       prevVersion.current = balanceVersion;
@@ -41,66 +40,80 @@ export function AccountSummary() {
 
   if (!balance) {
     return (
-      <div className="bg-card rounded-lg border border-border p-3">
-        <span className="text-xs text-text-muted">계좌 로딩 중...</span>
-      </div>
+      <Card>
+        <CardHeader title="모의투자 계좌" subtitle="자산 현황" />
+        <div className="grid grid-cols-3 gap-3">
+          <Skeleton height="2rem" />
+          <Skeleton height="2rem" />
+          <Skeleton height="2rem" />
+        </div>
+      </Card>
     );
   }
 
   const s = balance.summary;
-  const totalAsset = s.total_eval;
-
-  // 종목별 보유 현황
+  const pnlTone = s.total_profit_loss > 0 ? 'rise' : s.total_profit_loss < 0 ? 'fall' : 'default';
+  const pnlSign = s.total_profit_loss > 0 ? '+' : '';
   const posMap = new Map(balance.positions.map((p) => [p.stock_code, p]));
 
   return (
-    <div className="bg-card rounded-lg border border-border p-3">
-      <div className="flex items-center justify-between mb-2">
-        <span className="text-xs font-semibold text-text-muted">모의투자 계좌</span>
-        <span className="text-xs text-text-muted">전액 투입 (선착순)</span>
+    <Card>
+      <CardHeader
+        title="모의투자 계좌"
+        subtitle="전액 투입 · 선착순"
+        action={<Badge tone="accent" variant="soft" size="xs">실시간</Badge>}
+      />
+
+      <div className="grid grid-cols-3 gap-3">
+        <Stat label="총 자산" value={formatKRW(s.total_eval)} size="lg" />
+        <Stat label="예수금" value={formatKRW(s.cash)} size="md" tone="muted" />
+        <Stat
+          label="평가 손익"
+          value={`${pnlSign}${formatKRW(s.total_profit_loss)}`}
+          size="md"
+          tone={pnlTone}
+        />
       </div>
-      <div className="grid grid-cols-3 gap-3 text-xs">
-        <div>
-          <span className="text-text-muted">총 자산</span>
-          <div className="text-sm font-bold">{formatKRW(totalAsset)}</div>
-        </div>
-        <div>
-          <span className="text-text-muted">예수금</span>
-          <div>{formatKRW(s.cash)}</div>
-        </div>
-        <div>
-          <span className="text-text-muted">평가 손익</span>
-          <div className={s.total_profit_loss >= 0 ? 'text-rise' : 'text-fall'}>
-            {s.total_profit_loss >= 0 ? '+' : ''}{formatKRW(s.total_profit_loss)}
-          </div>
-        </div>
-      </div>
-      {/* 종목별 배분 현황 */}
-      <div className="mt-2 pt-2 border-t border-border grid grid-cols-2 gap-2">
+
+      {/* 종목별 배분 */}
+      <div className="mt-3 pt-3 divider-soft grid grid-cols-2 gap-3">
         {STOCKS.map(({ code, name }) => {
           const pos = posMap.get(code);
+          const tone = !pos
+            ? 'muted'
+            : pos.profit_loss > 0
+              ? 'rise'
+              : pos.profit_loss < 0
+                ? 'fall'
+                : 'default';
           return (
-            <div key={code} className="text-xs">
+            <div key={code} className="flex flex-col gap-1 min-w-0">
               <div className="flex items-center justify-between">
-                <span className="text-text-muted">{name}</span>
+                <span className="text-2xs text-text-muted truncate uppercase tracking-wider font-medium">
+                  {name}
+                </span>
+                <Badge tone={pos ? 'accent' : 'muted'} variant="outline" size="xs">
+                  {pos ? '보유' : '대기'}
+                </Badge>
               </div>
               {pos ? (
-                <div className="flex items-center justify-between mt-0.5">
-                  <span className="text-text-muted">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="text-text-muted tabular-nums">
                     {pos.quantity}주 @ {pos.avg_price.toLocaleString()}
                   </span>
-                  <span className={pos.profit_loss >= 0 ? 'text-rise' : 'text-fall'}>
-                    {pos.profit_loss >= 0 ? '+' : ''}{formatKRW(pos.profit_loss)}
-                    ({pos.profit_loss_rate.toFixed(2)}%)
+                  <span className={`tabular-nums font-medium ${tone === 'rise' ? 'text-rise' : tone === 'fall' ? 'text-fall' : 'text-text-muted'}`}>
+                    {pos.profit_loss > 0 ? '+' : ''}
+                    {formatKRW(pos.profit_loss)}{' '}
+                    <span className="opacity-70">({pos.profit_loss_rate.toFixed(2)}%)</span>
                   </span>
                 </div>
               ) : (
-                <div className="text-text-muted mt-0.5">대기</div>
+                <span className="text-xs text-text-disabled">진입 대기 중</span>
               )}
             </div>
           );
         })}
       </div>
-    </div>
+    </Card>
   );
 }

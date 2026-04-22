@@ -113,7 +113,11 @@ async fn get_indicators(
         })
         .collect();
 
-    let names: Vec<String> = query.names.split(',').map(|s| s.trim().to_string()).collect();
+    let names: Vec<String> = query
+        .names
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .collect();
     let results = IndicatorService::calculate(&names, &candles);
     Ok(Json(results))
 }

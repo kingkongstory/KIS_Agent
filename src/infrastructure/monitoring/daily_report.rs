@@ -51,7 +51,11 @@ impl DailyReportGenerator {
         .map_err(|e| format!("trades 집계 실패: {e}"))?;
 
         let (total, wins, losses, total_pnl, max_loss) = trade_stats.unwrap_or((0, 0, 0, 0.0, 0.0));
-        let win_rate = if total > 0 { wins as f64 / total as f64 * 100.0 } else { 0.0 };
+        let win_rate = if total > 0 {
+            wins as f64 / total as f64 * 100.0
+        } else {
+            0.0
+        };
 
         // 평균 슬리피지
         let avg_slip: Option<(Option<f64>,)> = sqlx::query_as(
@@ -128,7 +132,11 @@ impl DailyReportGenerator {
         .map_err(|e| format!("합산 집계 실패: {e}"))?;
 
         let (total, wins, losses, total_pnl, max_loss) = trade_stats.unwrap_or((0, 0, 0, 0.0, 0.0));
-        let win_rate = if total > 0 { wins as f64 / total as f64 * 100.0 } else { 0.0 };
+        let win_rate = if total > 0 {
+            wins as f64 / total as f64 * 100.0
+        } else {
+            0.0
+        };
 
         let ws_reconnect: (i64,) = sqlx::query_as(
             "SELECT COUNT(*)::BIGINT FROM event_log WHERE event_type = 'ws_reconnect' AND event_time::date = $1",

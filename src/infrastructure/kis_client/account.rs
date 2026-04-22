@@ -69,7 +69,8 @@ impl AccountPort for KisAccountAdapter {
             )
             .await?;
 
-        let summary = resp2.output2
+        let summary = resp2
+            .output2
             .and_then(|v| v.into_iter().next())
             .unwrap_or(AccountSummary {
                 dnca_tot_amt: 0,

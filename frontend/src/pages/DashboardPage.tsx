@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { MinuteCandleChart } from '../components/chart/MinuteCandleChart';
 import { StockPriceCard } from '../components/stock/StockPriceCard';
 import { StrategyPanel } from '../components/strategy/StrategyPanel';
@@ -8,13 +8,21 @@ import { AccountSummary } from '../components/account/AccountSummary';
 import { useStockStore, STOCK_CODES } from '../stores/stockStore';
 import { useWsStore } from '../stores/wsStore';
 import { get } from '../api/client';
+import { SegmentedControl } from '../components/ui';
 import type { PriceData } from '../types/stock';
+
+type Timeframe = 1 | 5 | 15;
+const TIMEFRAME_OPTIONS: { value: '1' | '5' | '15'; label: string }[] = [
+  { value: '1', label: '1m' },
+  { value: '5', label: '5m' },
+  { value: '15', label: '15m' },
+];
 
 export function DashboardPage() {
   const { setPriceData } = useStockStore();
   const prices = useWsStore((s) => s.prices);
+  const [timeframe, setTimeframe] = useState<Timeframe>(5);
 
-  // 마운트 시 REST로 초기 가격 로드 (WS PriceSnapshot 도착 전)
   useEffect(() => {
     STOCK_CODES.forEach(async (meta, i) => {
       try {
@@ -24,7 +32,6 @@ export function DashboardPage() {
     });
   }, [setPriceData]);
 
-  // WebSocket PriceSnapshot → stockStore 동기화 (가격 카드에서 사용)
   useEffect(() => {
     for (let i = 0; i < STOCK_CODES.length; i++) {
       const snapshot = prices.get(STOCK_CODES[i].code);
@@ -47,32 +54,38 @@ export function DashboardPage() {
   }, [prices, setPriceData]);
 
   return (
-    <div className="flex flex-col gap-4 h-full">
-      {/* 계좌 + 자동매매 컨트롤 + 거래 내역 */}
-      <div className="grid grid-cols-3 gap-4">
+    <div className="flex flex-col gap-4">
+      {/* Row 1: 계좌 + 자동매매 컨트롤 + 거래 내역 */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
         <AccountSummary />
         <StrategyPanel />
         <TradeLog />
       </div>
-      {/* FVG 탐지 현황 (신호/중단/drift 이탈 실시간 요약) */}
+
+      {/* Row 2: FVG 탐지 현황 (full width) */}
       <FVGPanel />
-      {/* 두 종목 가격 카드 */}
-      <div className="grid grid-cols-2 gap-4">
+
+      {/* Row 3: 두 종목 가격 카드 */}
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         <StockPriceCard index={0} />
         <StockPriceCard index={1} />
       </div>
-      {/* 실시간 분봉 차트: 1분 / 5분 / 15분 × 2종목 */}
-      <div className="grid grid-cols-2 gap-3">
-        <MinuteCandleChart index={0} timeframe={1} />
-        <MinuteCandleChart index={1} timeframe={1} />
+
+      {/* Row 4+: 실시간 분봉 차트 — timeframe 토글로 압축 */}
+      <div className="flex items-center justify-between">
+        <h2 className="text-sm font-semibold text-text-secondary uppercase tracking-wider">
+          실시간 분봉 차트
+        </h2>
+        <SegmentedControl
+          options={TIMEFRAME_OPTIONS}
+          value={String(timeframe) as '1' | '5' | '15'}
+          onChange={(v) => setTimeframe(Number(v) as Timeframe)}
+          size="sm"
+        />
       </div>
-      <div className="grid grid-cols-2 gap-3">
-        <MinuteCandleChart index={0} timeframe={5} />
-        <MinuteCandleChart index={1} timeframe={5} />
-      </div>
-      <div className="grid grid-cols-2 gap-3">
-        <MinuteCandleChart index={0} timeframe={15} />
-        <MinuteCandleChart index={1} timeframe={15} />
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <MinuteCandleChart index={0} timeframe={timeframe} />
+        <MinuteCandleChart index={1} timeframe={timeframe} />
       </div>
     </div>
   );

@@ -3,10 +3,10 @@ use tracing::{debug, info};
 
 use super::candle::{self, MinuteCandle};
 use super::parity::position_manager::{
-    gap_exit_reason, is_sl_hit, is_tp_hit, open_gap_breach, sl_exit_reason,
-    time_stop_breached_by_candles, update_best_and_trailing, PositionManagerConfig,
+    PositionManagerConfig, gap_exit_reason, is_sl_hit, is_tp_hit, open_gap_breach, sl_exit_reason,
+    time_stop_breached_by_candles, update_best_and_trailing,
 };
-use super::parity::signal_engine::{detect_next_fvg_signal, SignalEngineConfig};
+use super::parity::signal_engine::{SignalEngineConfig, detect_next_fvg_signal};
 use super::types::*;
 
 /// ORB+FVG 전략 설정
@@ -32,6 +32,8 @@ pub struct OrbFvgConfig {
     pub atr_sl_multiplier: f64,
     /// FVG 유효시간 (캔들 수, 기본 4캔들 = 20분)
     pub fvg_expiry_candles: usize,
+    /// OR 돌파 최소 강도 (기본 0.1%).
+    pub min_or_breakout_pct: f64,
     /// 2차 진입 허용 최소 1차 수익률 (%, 기본 0.5%)
     pub min_first_pnl_for_second: f64,
     /// 일일 최대 누적 손실 한도 (%, 기본 -1.5%)
@@ -55,6 +57,7 @@ impl Default for OrbFvgConfig {
             breakeven_r: 0.15,
             atr_sl_multiplier: 1.5,
             fvg_expiry_candles: 6,
+            min_or_breakout_pct: 0.001,
             min_first_pnl_for_second: 0.0,
             max_daily_loss_pct: -1.5,
             max_daily_trades: 5,
@@ -91,8 +94,8 @@ impl OrbFvgStrategy {
             return results;
         }
 
-        let is_5m_input = candles.len() >= 2
-            && (candles[1].time - candles[0].time).num_minutes() >= 4;
+        let is_5m_input =
+            candles.len() >= 2 && (candles[1].time - candles[0].time).num_minutes() >= 4;
 
         // 1) OR 범위 확정
         let or_candles: Vec<_> = candles
@@ -108,7 +111,10 @@ impl OrbFvgStrategy {
 
         let or_high = or_candles.iter().map(|c| c.high).max().unwrap();
         let or_low = or_candles.iter().map(|c| c.low).min().unwrap();
-        info!("OR 범위: HIGH={or_high}, LOW={or_low} ({}개 캔들)", or_candles.len());
+        info!(
+            "OR 범위: HIGH={or_high}, LOW={or_low} ({}개 캔들)",
+            or_candles.len()
+        );
 
         // 2) 5분봉 준비
         let scan_candles: Vec<_> = candles
@@ -151,20 +157,21 @@ impl OrbFvgStrategy {
             }
             let scan_slice = &candles_5m[search_from..];
 
-            // 1차는 OR 돌파 필수, 이후는 FVG만
-            let require_or = trade_count == 0;
+            // 2026-04-17 v3 불변식 #1b: require_or_breakout 항상 true (라이브 일치).
+            let require_or = true;
+            let _ = trade_count; // 더 이상 OR 가드 분기에 사용하지 않음 (호환성 유지)
             let (trade_result, exit_idx_rel, _) =
                 self.scan_and_trade(scan_slice, or_high, or_low, require_or);
 
             match trade_result {
                 Some(trade) => {
                     // 방향 확인 (confirmed_side가 있으면 같은 방향만 허용)
-                    if let Some(cs) = confirmed_side {
-                        if trade.side != cs {
-                            // 방향 불일치 → 이 거래는 무시하고 탐색 계속
-                            search_from += exit_idx_rel.max(1);
-                            continue;
-                        }
+                    if let Some(cs) = confirmed_side
+                        && trade.side != cs
+                    {
+                        // 방향 불일치 → 이 거래는 무시하고 탐색 계속
+                        search_from += exit_idx_rel.max(1);
+                        continue;
                     }
 
                     let pnl = trade.pnl_pct();
@@ -210,6 +217,7 @@ impl OrbFvgStrategy {
             fvg_expiry_candles: self.config.fvg_expiry_candles,
             entry_cutoff: self.config.entry_cutoff,
             require_or_breakout,
+            min_or_breakout_pct: self.config.min_or_breakout_pct,
             long_only: self.config.long_only,
             confirmed_side: None, // 방향 필터는 run_day 가 상위에서 처리
         };
@@ -306,11 +314,22 @@ impl OrbFvgStrategy {
             // ── Step 0: 시가에서 이미 SL 돌파 (갭 손절) ──
             if open_gap_breach(side, current_sl, c.open) {
                 let reason = gap_exit_reason(reached_1r);
-                info!("{}: 시가 갭 {:?} — open={}, SL={}", c.time, reason, c.open, current_sl);
+                info!(
+                    "{}: 시가 갭 {:?} — open={}, SL={}",
+                    c.time, reason, c.open, current_sl
+                );
                 return Some(TradeResult {
-                    side, entry_price, exit_price: c.open, stop_loss, take_profit,
-                    entry_time, exit_time: c.time, exit_reason: reason,
-                    quantity: 0, intended_entry_price: entry_price, order_to_fill_ms: 0,
+                    side,
+                    entry_price,
+                    exit_price: c.open,
+                    stop_loss,
+                    take_profit,
+                    entry_time,
+                    exit_time: c.time,
+                    exit_reason: reason,
+                    quantity: 0,
+                    intended_entry_price: entry_price,
+                    order_to_fill_ms: 0,
                 });
             }
 
@@ -322,9 +341,17 @@ impl OrbFvgStrategy {
             if is_tp_hit(side, take_profit, tp_extreme) {
                 info!("{}: TP 지정가 체결 — TP={}", c.time, take_profit);
                 return Some(TradeResult {
-                    side, entry_price, exit_price: take_profit, stop_loss, take_profit,
-                    entry_time, exit_time: c.time, exit_reason: ExitReason::TakeProfit,
-                    quantity: 0, intended_entry_price: entry_price, order_to_fill_ms: 0,
+                    side,
+                    entry_price,
+                    exit_price: take_profit,
+                    stop_loss,
+                    take_profit,
+                    entry_time,
+                    exit_time: c.time,
+                    exit_reason: ExitReason::TakeProfit,
+                    quantity: 0,
+                    intended_entry_price: entry_price,
+                    order_to_fill_ms: 0,
                 });
             }
 
@@ -334,11 +361,20 @@ impl OrbFvgStrategy {
                 PositionSide::Short => c.low,
             };
             let update = update_best_and_trailing(
-                side, entry_price, &mut best_price, &mut current_sl,
-                &mut reached_1r, original_risk, favorable, &pm_cfg,
+                side,
+                entry_price,
+                &mut best_price,
+                &mut current_sl,
+                &mut reached_1r,
+                original_risk,
+                favorable,
+                &pm_cfg,
             );
             if update.reached_1r_newly {
-                info!("{}: 1R 도달 — 본전 스탑 활성화 (SL → {})", c.time, current_sl);
+                info!(
+                    "{}: 1R 도달 — 본전 스탑 활성화 (SL → {})",
+                    c.time, current_sl
+                );
             } else if update.trailing_changed {
                 debug!("{}: 트레일링 SL 갱신 → {}", c.time, current_sl);
             }
@@ -352,20 +388,38 @@ impl OrbFvgStrategy {
                 let reason = sl_exit_reason(side, current_sl, stop_loss, entry_price, reached_1r);
                 info!("{}: {:?} — SL={}", c.time, reason, current_sl);
                 return Some(TradeResult {
-                    side, entry_price, exit_price: current_sl, stop_loss, take_profit,
-                    entry_time, exit_time: c.time, exit_reason: reason,
-                    quantity: 0, intended_entry_price: entry_price, order_to_fill_ms: 0,
+                    side,
+                    entry_price,
+                    exit_price: current_sl,
+                    stop_loss,
+                    take_profit,
+                    entry_time,
+                    exit_time: c.time,
+                    exit_reason: reason,
+                    quantity: 0,
+                    intended_entry_price: entry_price,
+                    order_to_fill_ms: 0,
                 });
             }
 
             // ── Step 4: 시간 스탑 ──
             if time_stop_breached_by_candles(i + 1, self.config.time_stop_candles, reached_1r) {
-                info!("{}: 시간 스탑 — {}캔들 경과, 1R 미달 (close={})",
-                    c.time, self.config.time_stop_candles, c.close);
+                info!(
+                    "{}: 시간 스탑 — {}캔들 경과, 1R 미달 (close={})",
+                    c.time, self.config.time_stop_candles, c.close
+                );
                 return Some(TradeResult {
-                    side, entry_price, exit_price: c.close, stop_loss, take_profit,
-                    entry_time, exit_time: c.time, exit_reason: ExitReason::TimeStop,
-                    quantity: 0, intended_entry_price: entry_price, order_to_fill_ms: 0,
+                    side,
+                    entry_price,
+                    exit_price: c.close,
+                    stop_loss,
+                    take_profit,
+                    entry_time,
+                    exit_time: c.time,
+                    exit_reason: ExitReason::TimeStop,
+                    quantity: 0,
+                    intended_entry_price: entry_price,
+                    order_to_fill_ms: 0,
                 });
             }
 
@@ -373,17 +427,33 @@ impl OrbFvgStrategy {
             if c.time >= self.config.force_exit {
                 info!("{}: 장마감 청산 — close={}", c.time, c.close);
                 return Some(TradeResult {
-                    side, entry_price, exit_price: c.close, stop_loss, take_profit,
-                    entry_time, exit_time: c.time, exit_reason: ExitReason::EndOfDay,
-                    quantity: 0, intended_entry_price: entry_price, order_to_fill_ms: 0,
+                    side,
+                    entry_price,
+                    exit_price: c.close,
+                    stop_loss,
+                    take_profit,
+                    entry_time,
+                    exit_time: c.time,
+                    exit_reason: ExitReason::EndOfDay,
+                    quantity: 0,
+                    intended_entry_price: entry_price,
+                    order_to_fill_ms: 0,
                 });
             }
         }
 
         remaining.last().map(|last| TradeResult {
-            side, entry_price, exit_price: last.close, stop_loss, take_profit,
-            entry_time, exit_time: last.time, exit_reason: ExitReason::EndOfDay,
-            quantity: 0, intended_entry_price: entry_price, order_to_fill_ms: 0,
+            side,
+            entry_price,
+            exit_price: last.close,
+            stop_loss,
+            take_profit,
+            entry_time,
+            exit_time: last.time,
+            exit_reason: ExitReason::EndOfDay,
+            quantity: 0,
+            intended_entry_price: entry_price,
+            order_to_fill_ms: 0,
         })
     }
 
@@ -428,6 +498,7 @@ impl OrbFvgStrategy {
             fvg_expiry_candles: self.config.fvg_expiry_candles,
             entry_cutoff: self.config.entry_cutoff,
             require_or_breakout: true,
+            min_or_breakout_pct: self.config.min_or_breakout_pct,
             long_only: self.config.long_only,
             confirmed_side: None,
         };
@@ -580,11 +651,15 @@ mod tests {
             sl_triggered_tick: false,
             intended_entry_price: 0,
             order_to_fill_ms: 0,
+            signal_id: String::new(),
         };
 
         assert_eq!(strategy.check_exit(&pos, 10100), None);
         assert_eq!(strategy.check_exit(&pos, 9900), Some(ExitReason::StopLoss));
-        assert_eq!(strategy.check_exit(&pos, 10200), Some(ExitReason::TakeProfit));
+        assert_eq!(
+            strategy.check_exit(&pos, 10200),
+            Some(ExitReason::TakeProfit)
+        );
     }
 
     #[test]
@@ -606,10 +681,14 @@ mod tests {
             sl_triggered_tick: false,
             intended_entry_price: 0,
             order_to_fill_ms: 0,
+            signal_id: String::new(),
         };
 
         assert_eq!(strategy.check_exit(&pos, 9900), None);
         assert_eq!(strategy.check_exit(&pos, 10100), Some(ExitReason::StopLoss));
-        assert_eq!(strategy.check_exit(&pos, 9800), Some(ExitReason::TakeProfit));
+        assert_eq!(
+            strategy.check_exit(&pos, 9800),
+            Some(ExitReason::TakeProfit)
+        );
     }
 }

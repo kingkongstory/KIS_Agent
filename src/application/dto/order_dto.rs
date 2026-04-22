@@ -7,16 +7,15 @@ use crate::domain::types::StockCode;
 #[derive(Debug, Deserialize)]
 pub struct OrderRequestDto {
     pub stock_code: String,
-    pub side: String,         // "buy" | "sell"
-    pub order_type: String,   // "limit" | "market"
+    pub side: String,       // "buy" | "sell"
+    pub order_type: String, // "limit" | "market"
     pub quantity: u64,
     pub price: Option<i64>,
 }
 
 impl OrderRequestDto {
     pub fn into_domain(self) -> Result<OrderRequest, String> {
-        let stock_code =
-            StockCode::new(&self.stock_code).map_err(|e| e.to_string())?;
+        let stock_code = StockCode::new(&self.stock_code).map_err(|e| e.to_string())?;
         let side = match self.side.as_str() {
             "buy" => OrderSide::Buy,
             "sell" => OrderSide::Sell,

@@ -97,29 +97,31 @@ export function MinuteCandleChart({ index, timeframe }: Props) {
     const chart = createChart(containerRef.current, {
       autoSize: true,
       layout: {
-        background: { color: '#1A1A1A' },
-        textColor: '#A0A0A0',
+        background: { color: '#0B0E13' },
+        textColor: '#7A828F',
+        fontSize: 11,
+        fontFamily: 'JetBrains Mono, ui-monospace, Menlo, Consolas, monospace',
       },
       grid: {
-        vertLines: { color: '#2A2A2A' },
-        horzLines: { color: '#2A2A2A' },
+        vertLines: { color: '#161A21' },
+        horzLines: { color: '#161A21' },
       },
       crosshair: { mode: 1 },
-      rightPriceScale: { borderColor: '#2A2A2A' },
+      rightPriceScale: { borderColor: '#20252E' },
       timeScale: {
-        borderColor: '#2A2A2A',
+        borderColor: '#20252E',
         timeVisible: true,
         secondsVisible: false,
       },
     });
 
     const candleSeries = chart.addSeries(CandlestickSeries, {
-      upColor: '#00D084',
-      downColor: '#FF6B35',
-      borderUpColor: '#00D084',
-      borderDownColor: '#FF6B35',
-      wickUpColor: '#00D084',
-      wickDownColor: '#FF6B35',
+      upColor: '#1FCB8B',
+      downColor: '#FF7245',
+      borderUpColor: '#1FCB8B',
+      borderDownColor: '#FF7245',
+      wickUpColor: '#1FCB8B',
+      wickDownColor: '#FF7245',
     });
 
     const volumeSeries = chart.addSeries(HistogramSeries, {
@@ -182,8 +184,8 @@ export function MinuteCandleChart({ index, timeframe }: Props) {
         value: b.volume,
         color:
           b.close >= b.open
-            ? 'rgba(0, 208, 132, 0.3)'
-            : 'rgba(255, 107, 53, 0.3)',
+            ? 'rgba(31, 203, 139, 0.35)'
+            : 'rgba(255, 114, 69, 0.35)',
       }))
       .sort((a, b) => (a.time as number) - (b.time as number));
 
@@ -196,14 +198,18 @@ export function MinuteCandleChart({ index, timeframe }: Props) {
   const aggregated = aggregateCandles(allBars, timeframe);
 
   return (
-    <div className="bg-chart-bg rounded-lg border border-border overflow-hidden flex flex-col">
-      <div className="px-3 py-1.5 text-xs border-b border-border flex items-center justify-between">
-        <span className="text-text-muted">
-          {meta.name} ({meta.code}) {timeframe}분봉
-        </span>
-        <span className="text-accent">{aggregated.length}봉</span>
+    <div className="surface-card overflow-hidden flex flex-col">
+      <div className="px-3 py-2 text-xs border-b border-border-subtle flex items-center justify-between bg-surface/60">
+        <div className="flex items-center gap-2 min-w-0">
+          <span className="font-semibold text-text-primary truncate">{meta.name}</span>
+          <span className="text-text-muted font-mono text-2xs">{meta.code}</span>
+          <span className="px-1.5 py-0.5 rounded bg-accent-soft text-accent text-2xs font-medium">
+            {timeframe}m
+          </span>
+        </div>
+        <span className="text-text-muted text-2xs tabular-nums">{aggregated.length}봉</span>
       </div>
-      <div ref={containerRef} className="w-full flex-1 min-h-[300px]" />
+      <div ref={containerRef} className="w-full flex-1 min-h-[300px] bg-chart-bg" />
     </div>
   );
 }

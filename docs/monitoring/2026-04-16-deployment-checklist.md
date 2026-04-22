@@ -23,8 +23,8 @@
 - 커밋 SHA: `<배포 직전 git rev-parse HEAD 값을 여기에 기입>`
 - 빌드 파일: `target/release/kis_agent.exe`
 - 빌드 명령: `cargo build --release --bin kis_agent`
-- 허용 종목: `KIS_ALLOWED_CODES` 값 (권장 첫날 `122630` 단일)
-- 최대 거래: `KIS_MAX_DAILY_TRADES_TOTAL=1`
+- 허용 종목: `KIS_ALLOWED_CODES` 값 (현재 운영값 `122630,114800`)
+- 최대 거래: `KIS_MAX_DAILY_TRADES_TOTAL=2`
 
 ## 2. `.env` 핵심 값 (실전 기준)
 
@@ -38,8 +38,8 @@ KIS_HTS_ID=<HTS 로그인 ID — 체결통보 필수>
 
 # 2026-04-16 가드
 KIS_AUTO_START=false
-KIS_ALLOWED_CODES=122630
-KIS_MAX_DAILY_TRADES_TOTAL=1          # 시스템 전역 하루 1회 (종목별 1회와 별개, AND 조건)
+KIS_ALLOWED_CODES=122630,114800
+KIS_MAX_DAILY_TRADES_TOTAL=2          # 시스템 전역 하루 2회 (종목별 1회와 별개, AND 조건)
 KIS_REQUIRE_DB_IN_REAL=true
 KIS_WS_STALE_SECS=120
 KIS_WS_STALE_MESSAGE_SECS=240
@@ -51,8 +51,9 @@ DATABASE_URL=postgres://postgres@localhost:5433/kis_agent
 ```
 
 중요:
+- `KIS_ALLOWED_CODES=122630,114800` 를 명시하면 실전/모의 공통으로 두 종목만 허용된다.
 - `KIS_ALLOWED_CODES` 를 비워두면 **실전 모드는 자동으로 `["122630"]` 단일 종목으로 축소**된다. 모의 모드는 기존 2종목 유지.
-- `KIS_MAX_DAILY_TRADES_TOTAL` 은 `GlobalTradeGate` 에 주입되어 시스템 전역에서 N회 체결 초과 시 `execute_entry` 진입부에서 `global_trade_gate_blocked` 이벤트를 남기고 거부한다. 종목별 `max_daily_trades_override=1` 과 **AND** 관계 — 둘 중 먼저 도달한 쪽이 차단.
+- `KIS_MAX_DAILY_TRADES_TOTAL` 은 `GlobalTradeGate` 에 주입되어 시스템 전역에서 N회 체결 초과 시 `execute_entry` 진입부에서 `global_trade_gate_blocked` 이벤트를 남기고 거부한다. 종목별 `max_daily_trades_override=1` 과 **AND** 관계 — 둘 중 먼저 도달한 쪽이 차단. 현재 값 `2`는 두 종목이 각각 1회씩 진입할 수 있게 맞춘 것이다.
 
 모의 burn-in 단계에서는 `KIS_ENVIRONMENT=paper`, `KIS_ENABLE_REAL_TRADING=false` 로 두고 나머지 가드는 동일.
 
@@ -144,8 +145,8 @@ cargo build --release --bin kis_agent
 1. **PostgreSQL 복구 + replay/parity 검증 통과**: DB 기동 후 `replay 122630 --date 2026-04-15`,
    `replay 114800 --date 2026-04-15`, `backtest 122630 --days 5 --parity passive --multi-stage`
    세 명령이 panic 없이 완료. `parity_backtest_legacy`·`parity_backtest_passive` 거래수가 출력되면 통과.
-2. **전역 1회 거래 가드 적용**: `KIS_MAX_DAILY_TRADES_TOTAL=1` + `GlobalTradeGate`.
-   `KIS_ALLOWED_CODES=122630` 로 단일 종목 강제 (또는 빈 값으로 실전 모드 fallback 이용).
+2. **전역 2회 거래 가드 적용**: `KIS_MAX_DAILY_TRADES_TOTAL=2` + `GlobalTradeGate`.
+   `KIS_ALLOWED_CODES=122630,114800` 로 두 종목 허용.
 3. **투입 전략 확정**: `orb_fvg_safe` (기존 orb_fvg + 런타임 실전 가드). `orb_vwap_pullback` 은
    스켈레톤 상태라 투입 제외.
 

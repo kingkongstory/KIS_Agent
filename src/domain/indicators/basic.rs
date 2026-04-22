@@ -28,11 +28,7 @@ pub fn calc_returns(candles: &[Candle]) -> Vec<f64> {
 
 /// 이격도 (Disparity = 현재가 / MA * 100)
 pub fn calc_disparity(close: f64, ma: f64) -> f64 {
-    if ma != 0.0 {
-        close / ma * 100.0
-    } else {
-        100.0
-    }
+    if ma != 0.0 { close / ma * 100.0 } else { 100.0 }
 }
 
 /// 변동성 (수익률의 표준편차)

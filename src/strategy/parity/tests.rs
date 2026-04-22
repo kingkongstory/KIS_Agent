@@ -18,8 +18,8 @@ use super::conversions::{
     position_to_snapshot, side_from_fvg, synthetic_fill, trade_to_exit_decision,
 };
 use super::types::{
-    EntryMode, ExitPriceModel, FillRecheckMode, FillResolutionSource, FillStatus,
-    SignalId, SignalMetadata,
+    EntryMode, ExitPriceModel, FillRecheckMode, FillResolutionSource, FillStatus, SignalId,
+    SignalMetadata,
 };
 
 fn sample_gap_long() -> FairValueGap {
@@ -104,7 +104,10 @@ fn live_passive_plan_uses_top_for_long() {
     assert_eq!(plan.order_price, Some(10_200));
     assert_eq!(plan.risk_amount, 250);
     assert_eq!(plan.planned_take_profit, 10_200 + (250.0f64 * 2.5) as i64);
-    assert_eq!(plan.entry_mode, EntryMode::PassiveTopBottom { timeout_ms: 30_000 });
+    assert_eq!(
+        plan.entry_mode,
+        EntryMode::PassiveTopBottom { timeout_ms: 30_000 }
+    );
     assert!(plan.cancel_on_timeout);
     assert_eq!(plan.fill_recheck_mode, FillRecheckMode::BalanceRecheck);
     assert_eq!(plan.max_entry_drift_pct, Some(0.3));
@@ -154,6 +157,7 @@ fn position_to_snapshot_preserves_fields() {
         sl_triggered_tick: false,
         intended_entry_price: 10_200,
         order_to_fill_ms: 1_234,
+        signal_id: "legacy-test-signal".into(),
     };
 
     let snap = position_to_snapshot(&pos, SignalId(7), 250);

@@ -87,6 +87,59 @@ impl std::fmt::Display for BacktestReport {
     }
 }
 
+/// 허용 stage 필터의 순수 판정 — `filtered_stage_tuples`/`filter_stage_defs` 공유.
+/// 테스트 용이성을 위해 BacktestEngine 인스턴스 없이도 호출 가능하게 자유 함수로 분리.
+pub(crate) fn stage_enabled(allowed_stages: &[String], stage_name: &str) -> bool {
+    allowed_stages.is_empty() || allowed_stages.iter().any(|s| s == stage_name)
+}
+
+/// OR 시작 시각 + 허용 stage 리스트 → `(name, or_start, or_end)` 튜플 목록.
+pub(crate) fn filtered_stage_tuples_for(
+    or_start: NaiveTime,
+    allowed_stages: &[String],
+) -> Vec<(&'static str, NaiveTime, NaiveTime)> {
+    [
+        ("5m", or_start, NaiveTime::from_hms_opt(9, 5, 0).unwrap()),
+        ("15m", or_start, NaiveTime::from_hms_opt(9, 15, 0).unwrap()),
+        ("30m", or_start, NaiveTime::from_hms_opt(9, 30, 0).unwrap()),
+    ]
+    .into_iter()
+    .filter(|(name, _, _)| stage_enabled(allowed_stages, name))
+    .collect()
+}
+
+/// OR 시작 시각 → live_stage_defs(5m/15m/30m 전체) 순수 생성.
+pub(crate) fn live_stage_defs_for(or_start: NaiveTime) -> Vec<StageDef> {
+    vec![
+        StageDef {
+            name: "5m".into(),
+            or_start,
+            or_end: NaiveTime::from_hms_opt(9, 5, 0).unwrap(),
+        },
+        StageDef {
+            name: "15m".into(),
+            or_start,
+            or_end: NaiveTime::from_hms_opt(9, 15, 0).unwrap(),
+        },
+        StageDef {
+            name: "30m".into(),
+            or_start,
+            or_end: NaiveTime::from_hms_opt(9, 30, 0).unwrap(),
+        },
+    ]
+}
+
+/// OR 시작 시각 + 허용 stage 리스트 → 필터링된 StageDef 목록.
+pub(crate) fn filtered_stage_defs_for(
+    or_start: NaiveTime,
+    allowed_stages: &[String],
+) -> Vec<StageDef> {
+    live_stage_defs_for(or_start)
+        .into_iter()
+        .filter(|stage| stage_enabled(allowed_stages, &stage.name))
+        .collect()
+}
+
 /// 백테스트 엔진 (PostgreSQL DB 기반)
 pub struct BacktestEngine {
     store: Arc<PostgresStore>,
@@ -116,13 +169,26 @@ impl BacktestEngine {
         }
     }
 
-    /// DB에서 분봉 조회 → 백테스트 실행
+    /// DB에서 분봉 조회 → 백테스트 실행 (단일 stage 경로)
+    ///
+    /// `allowed_stages` 는 정확히 1 개 값이어야 하며, 그 stage 의 OR 종료 시각이
+    /// strategy.config.or_end 에 반영된다. 라이브 불변식과 동일 규칙.
     pub async fn run(
         &self,
         stock_code: &str,
         days: usize,
+        allowed_stages: &[String],
     ) -> Result<BacktestReport, KisError> {
-        self.run_impl(stock_code, days, false).await
+        let stage = Self::require_single_stage(allowed_stages, "run")?;
+        let or_end = Self::stage_to_or_end(stage)?;
+        let mut cfg = self.strategy.config.clone();
+        cfg.or_end = or_end;
+        let engine = BacktestEngine {
+            store: Arc::clone(&self.store),
+            strategy: OrbFvgStrategy { config: cfg },
+            source_interval: self.source_interval,
+        };
+        engine.run_impl(stock_code, days, false).await
     }
 
     /// 두 종목 통합 백테스트: 라이브 position_lock과 일치하는 incremental 시뮬레이션
@@ -140,22 +206,30 @@ impl BacktestEngine {
         code_b: &str,
         days: usize,
         multi_stage: bool,
+        allowed_stages: &[String],
     ) -> Result<(BacktestReport, BacktestReport), KisError> {
         let dates_a = self.fetch_available_dates(code_a, days).await?;
         let dates_b = self.fetch_available_dates(code_b, days).await?;
         let dates_set: std::collections::HashSet<NaiveDate> = dates_b.iter().cloned().collect();
-        let common_dates: Vec<NaiveDate> = dates_a.iter()
+        let common_dates: Vec<NaiveDate> = dates_a
+            .iter()
             .filter(|d| dates_set.contains(d))
             .cloned()
             .collect();
 
-        info!("통합 백테스트 (incremental position_lock): {} + {}, {}일", code_a, code_b, common_dates.len());
+        info!(
+            "통합 백테스트 (incremental position_lock): {} + {}, {}일",
+            code_a,
+            code_b,
+            common_dates.len()
+        );
 
-        let stages = [
-            ("5m",  NaiveTime::from_hms_opt(9, 0, 0).unwrap(), NaiveTime::from_hms_opt(9, 5, 0).unwrap()),
-            ("15m", NaiveTime::from_hms_opt(9, 0, 0).unwrap(), NaiveTime::from_hms_opt(9, 15, 0).unwrap()),
-            ("30m", NaiveTime::from_hms_opt(9, 0, 0).unwrap(), NaiveTime::from_hms_opt(9, 30, 0).unwrap()),
-        ];
+        let stages = self.filtered_stage_tuples(allowed_stages);
+        if stages.is_empty() {
+            return Err(KisError::Internal(
+                "허용된 stage가 없어 dual_locked 백테스트를 실행할 수 없습니다.".to_string(),
+            ));
+        }
 
         let mut trades_a: Vec<(NaiveDate, TradeResult)> = Vec::new();
         let mut trades_b: Vec<(NaiveDate, TradeResult)> = Vec::new();
@@ -165,8 +239,12 @@ impl BacktestEngine {
             let candles_b = self.fetch_day_candles(code_b, *date).await?;
 
             let day_pair = self.simulate_day_locked(&candles_a, &candles_b, multi_stage, &stages);
-            for r in day_pair.0 { trades_a.push((*date, r)); }
-            for r in day_pair.1 { trades_b.push((*date, r)); }
+            for r in day_pair.0 {
+                trades_a.push((*date, r));
+            }
+            for r in day_pair.1 {
+                trades_b.push((*date, r));
+            }
         }
 
         let report_a = Self::build_report(code_a, common_dates.len(), trades_a);
@@ -180,7 +258,7 @@ impl BacktestEngine {
         candles_a: &[MinuteCandle],
         candles_b: &[MinuteCandle],
         multi_stage: bool,
-        stages: &[(&str, NaiveTime, NaiveTime)],
+        stages: &[(&'static str, NaiveTime, NaiveTime)],
     ) -> (Vec<TradeResult>, Vec<TradeResult>) {
         // 1) 종목별 strategy 결정 (multi_stage이면 가장 빠른 진입 stage)
         let strat_a = self.pick_strategy_for_day(candles_a, multi_stage, stages);
@@ -190,16 +268,22 @@ impl BacktestEngine {
             Some(x) => x,
             None => {
                 // A는 진입 신호 없음 → B만 단독으로 처리
-                return (Vec::new(), strat_b
-                    .map(|(s, c, h, l)| Self::run_solo(&s, &c, h, l))
-                    .unwrap_or_default());
+                return (
+                    Vec::new(),
+                    strat_b
+                        .map(|(s, c, h, l)| Self::run_solo(&s, &c, h, l))
+                        .unwrap_or_default(),
+                );
             }
         };
         let (strat_b, candles_5m_b, or_high_b, or_low_b) = match strat_b {
             Some(x) => x,
             None => {
                 // B는 신호 없음 → A만 단독으로 처리
-                return (Self::run_solo(&strat_a, &candles_5m_a, or_high_a, or_low_a), Vec::new());
+                return (
+                    Self::run_solo(&strat_a, &candles_5m_a, or_high_a, or_low_a),
+                    Vec::new(),
+                );
             }
         };
 
@@ -216,17 +300,35 @@ impl BacktestEngine {
                 || state_a.cumulative_pnl <= strat_a.config.max_daily_loss_pct;
             let b_done = state_b.trade_count >= strat_b.config.max_daily_trades
                 || state_b.cumulative_pnl <= strat_b.config.max_daily_loss_pct;
-            if a_done && b_done { break; }
+            if a_done && b_done {
+                break;
+            }
 
             // 양쪽에서 다음 거래 후보 탐색 (lock 해제 시각 이후로 search 동기화)
             Self::sync_search_to(&mut state_a.search_from, &candles_5m_a, last_unlock_time);
             Self::sync_search_to(&mut state_b.search_from, &candles_5m_b, last_unlock_time);
 
-            let cand_a = if a_done { None } else {
-                Self::next_valid_candidate(&strat_a, &candles_5m_a, or_high_a, or_low_a, &mut state_a)
+            let cand_a = if a_done {
+                None
+            } else {
+                Self::next_valid_candidate(
+                    &strat_a,
+                    &candles_5m_a,
+                    or_high_a,
+                    or_low_a,
+                    &mut state_a,
+                )
             };
-            let cand_b = if b_done { None } else {
-                Self::next_valid_candidate(&strat_b, &candles_5m_b, or_high_b, or_low_b, &mut state_b)
+            let cand_b = if b_done {
+                None
+            } else {
+                Self::next_valid_candidate(
+                    &strat_b,
+                    &candles_5m_b,
+                    or_high_b,
+                    or_low_b,
+                    &mut state_b,
+                )
             };
 
             // 둘 중 더 빠른 진입 채택
@@ -269,8 +371,12 @@ impl BacktestEngine {
         let mut state = StockState::default();
         let mut results = Vec::new();
         loop {
-            if state.trade_count >= strat.config.max_daily_trades { break; }
-            if state.cumulative_pnl <= strat.config.max_daily_loss_pct { break; }
+            if state.trade_count >= strat.config.max_daily_trades {
+                break;
+            }
+            if state.cumulative_pnl <= strat.config.max_daily_loss_pct {
+                break;
+            }
             match Self::next_valid_candidate(strat, candles_5m, or_high, or_low, &mut state) {
                 Some((trade, exit_idx)) => {
                     Self::accept_trade(&trade, &mut state, exit_idx);
@@ -288,9 +394,11 @@ impl BacktestEngine {
         &self,
         candles: &[MinuteCandle],
         multi_stage: bool,
-        stages: &[(&str, NaiveTime, NaiveTime)],
+        stages: &[(&'static str, NaiveTime, NaiveTime)],
     ) -> Option<(OrbFvgStrategy, Vec<MinuteCandle>, i64, i64)> {
-        if candles.is_empty() { return None; }
+        if candles.is_empty() {
+            return None;
+        }
 
         let prepare = |cfg: super::orb_fvg::OrbFvgConfig| -> Option<(OrbFvgStrategy, Vec<MinuteCandle>, i64, i64)> {
             let or_candles: Vec<_> = candles.iter()
@@ -320,12 +428,15 @@ impl BacktestEngine {
                 None => continue,
             };
             // dry-run: scan_and_trade로 첫 거래 entry_time만 측정
-            let (first_trade, _, _) = prepared.0.scan_and_trade(&prepared.1, prepared.2, prepared.3, true);
-            if let Some(t) = first_trade {
-                if t.entry_time < earliest_entry {
-                    earliest_entry = t.entry_time;
-                    earliest = Some(prepared);
-                }
+            let (first_trade, _, _) =
+                prepared
+                    .0
+                    .scan_and_trade(&prepared.1, prepared.2, prepared.3, true);
+            if let Some(t) = first_trade
+                && t.entry_time < earliest_entry
+            {
+                earliest_entry = t.entry_time;
+                earliest = Some(prepared);
             }
         }
         earliest
@@ -333,7 +444,10 @@ impl BacktestEngine {
 
     /// search_from 인덱스를 target 시각 이후 첫 캔들 위치로 동기화
     fn sync_search_to(search_from: &mut usize, candles: &[MinuteCandle], target: NaiveTime) {
-        let new_pos = candles.iter().position(|c| c.time > target).unwrap_or(candles.len());
+        let new_pos = candles
+            .iter()
+            .position(|c| c.time > target)
+            .unwrap_or(candles.len());
         if new_pos > *search_from {
             *search_from = new_pos;
         }
@@ -349,21 +463,24 @@ impl BacktestEngine {
         state: &mut StockState,
     ) -> Option<(TradeResult, usize)> {
         loop {
-            if state.search_from >= candles_5m.len() { return None; }
+            if state.search_from >= candles_5m.len() {
+                return None;
+            }
             let scan_slice = &candles_5m[state.search_from..];
-            let require_or = state.trade_count == 0;
+            // 2026-04-17 v3 불변식 #1b: require_or_breakout 항상 true.
+            let require_or = true;
             let (trade_result, exit_idx_rel, _) =
                 strat.scan_and_trade(scan_slice, or_high, or_low, require_or);
 
             match trade_result {
                 Some(trade) => {
                     // 방향 일치 체크 (1차 이후)
-                    if let Some(cs) = state.confirmed_side {
-                        if trade.side != cs {
-                            // 거부 → 다음 신호 탐색
-                            state.search_from += exit_idx_rel.max(1);
-                            continue;
-                        }
+                    if let Some(cs) = state.confirmed_side
+                        && trade.side != cs
+                    {
+                        // 거부 → 다음 신호 탐색
+                        state.search_from += exit_idx_rel.max(1);
+                        continue;
                     }
                     return Some((trade, exit_idx_rel));
                 }
@@ -385,9 +502,11 @@ impl BacktestEngine {
     fn run_day_multi_stage(
         &self,
         candles: &[MinuteCandle],
-        stages: &[(&str, NaiveTime, NaiveTime)],
+        stages: &[(&'static str, NaiveTime, NaiveTime)],
     ) -> Vec<TradeResult> {
-        if candles.is_empty() { return Vec::new(); }
+        if candles.is_empty() {
+            return Vec::new();
+        }
 
         let mut earliest_results: Vec<TradeResult> = Vec::new();
         let mut earliest_entry = NaiveTime::from_hms_opt(23, 59, 59).unwrap();
@@ -398,55 +517,94 @@ impl BacktestEngine {
             cfg.or_end = *or_end;
             let strat = OrbFvgStrategy { config: cfg };
             let results = strat.run_day(candles);
-            if let Some(first) = results.first() {
-                if first.entry_time < earliest_entry {
-                    earliest_entry = first.entry_time;
-                    earliest_results = results;
-                }
+            if let Some(first) = results.first()
+                && first.entry_time < earliest_entry
+            {
+                earliest_entry = first.entry_time;
+                earliest_results = results;
             }
         }
         earliest_results
     }
 
-    fn build_report(stock_code: &str, days: usize, trades: Vec<(NaiveDate, TradeResult)>) -> BacktestReport {
+    fn build_report(
+        stock_code: &str,
+        days: usize,
+        trades: Vec<(NaiveDate, TradeResult)>,
+    ) -> BacktestReport {
         let total = trades.len();
         let wins = trades.iter().filter(|(_, t)| t.is_win()).count();
         let losses = total - wins;
         let total_pnl: f64 = trades.iter().map(|(_, t)| t.pnl_pct()).sum();
         let avg_rr = if total > 0 {
             trades.iter().map(|(_, t)| t.realized_rr()).sum::<f64>() / total as f64
-        } else { 0.0 };
+        } else {
+            0.0
+        };
         BacktestReport {
             stock_code: stock_code.to_string(),
             days_tested: days,
-            trades, total_trades: total, wins, losses,
-            win_rate: if total > 0 { wins as f64 / total as f64 * 100.0 } else { 0.0 },
-            total_pnl_pct: total_pnl, avg_rr,
+            trades,
+            total_trades: total,
+            wins,
+            losses,
+            win_rate: if total > 0 {
+                wins as f64 / total as f64 * 100.0
+            } else {
+                0.0
+            },
+            total_pnl_pct: total_pnl,
+            avg_rr,
             strategy_version: LEGACY_STRATEGY_VERSION.to_string(),
             execution_version: LEGACY_EXECUTION_VERSION.to_string(),
             simulation_mode: LEGACY_SIMULATION_MODE.to_string(),
         }
     }
 
-    fn live_stage_defs(&self) -> Vec<StageDef> {
-        let or_start = self.strategy.config.or_start;
-        vec![
-            StageDef {
-                name: "5m".into(),
-                or_start,
-                or_end: NaiveTime::from_hms_opt(9, 5, 0).unwrap(),
-            },
-            StageDef {
-                name: "15m".into(),
-                or_start,
-                or_end: NaiveTime::from_hms_opt(9, 15, 0).unwrap(),
-            },
-            StageDef {
-                name: "30m".into(),
-                or_start,
-                or_end: NaiveTime::from_hms_opt(9, 30, 0).unwrap(),
-            },
-        ]
+    /// 2026-04-18 v3 마감: 단일 stage 경로(run/run_session_reset/run_dynamic_target)는
+    /// `--stages` 가 정확히 1 개여야 한다. 2 개 이상이면 어느 OR 구간을 쓸지 암묵
+    /// 해석하지 않고 즉시 에러로 거부 — 라이브 불변식(15m-only) 과 일치하는 명시적
+    /// 규칙을 강제.
+    pub(crate) fn require_single_stage<'a>(
+        allowed_stages: &'a [String],
+        path_name: &str,
+    ) -> Result<&'a str, KisError> {
+        match allowed_stages.len() {
+            1 => Ok(allowed_stages[0].as_str()),
+            0 => Err(KisError::Internal(format!(
+                "{path_name}: --stages 목록이 비었습니다 (단일 stage 값 필요)",
+            ))),
+            n => Err(KisError::Internal(format!(
+                "{path_name}: 단일-stage 경로는 --stages 에 정확히 1 개 값이 필요합니다 \
+                 (받음: {n} 개 {:?}). multi-stage/parity/dual-locked 경로를 사용하거나 \
+                 `--stages 15m` 처럼 단일 값을 지정하세요",
+                allowed_stages
+            ))),
+        }
+    }
+
+    /// stage 이름 → OR 종료 시각. 단일 stage 경로에서 strategy.config.or_end 를
+    /// 이 값으로 맞춘 뒤 실행한다.
+    pub(crate) fn stage_to_or_end(stage_name: &str) -> Result<NaiveTime, KisError> {
+        match stage_name {
+            "5m" => Ok(NaiveTime::from_hms_opt(9, 5, 0).unwrap()),
+            "15m" => Ok(NaiveTime::from_hms_opt(9, 15, 0).unwrap()),
+            "30m" => Ok(NaiveTime::from_hms_opt(9, 30, 0).unwrap()),
+            other => Err(KisError::Internal(format!(
+                "지원하지 않는 stage: {other} (허용: 5m, 15m, 30m)"
+            ))),
+        }
+    }
+
+    fn filtered_stage_tuples(
+        &self,
+        allowed_stages: &[String],
+    ) -> Vec<(&'static str, NaiveTime, NaiveTime)> {
+        filtered_stage_tuples_for(self.strategy.config.or_start, allowed_stages)
+    }
+
+    fn filter_stage_defs(&self, allowed_stages: &[String]) -> Vec<StageDef> {
+        filtered_stage_defs_for(self.strategy.config.or_start, allowed_stages)
     }
 
     async fn fetch_day_candles_with_interval(
@@ -483,7 +641,9 @@ impl BacktestEngine {
         date: NaiveDate,
     ) -> Result<(Vec<MinuteCandle>, i16), KisError> {
         if self.source_interval != 1 {
-            let candles_1m = self.fetch_day_candles_with_interval(stock_code, date, 1).await?;
+            let candles_1m = self
+                .fetch_day_candles_with_interval(stock_code, date, 1)
+                .await?;
             if !candles_1m.is_empty() {
                 return Ok((candles_1m, 1));
             }
@@ -502,6 +662,7 @@ impl BacktestEngine {
         &self,
         stock_code: &str,
         days: usize,
+        allowed_stages: &[String],
     ) -> Result<BacktestReport, KisError> {
         let dates = self.fetch_available_dates(stock_code, days).await?;
         if dates.is_empty() {
@@ -512,15 +673,17 @@ impl BacktestEngine {
 
         info!(
             "Multi-Stage ORB (선착순) 백테스트: {}일 ({} ~ {})",
-            dates.len(), dates.first().unwrap(), dates.last().unwrap(),
+            dates.len(),
+            dates.first().unwrap(),
+            dates.last().unwrap(),
         );
 
-        // 3개 OR 단계: 5분(09:00~09:05), 15분(09:00~09:15), 30분(09:00~09:30)
-        let stages = [
-            ("5분OR", NaiveTime::from_hms_opt(9, 0, 0).unwrap(), NaiveTime::from_hms_opt(9, 5, 0).unwrap()),
-            ("15분OR", NaiveTime::from_hms_opt(9, 0, 0).unwrap(), NaiveTime::from_hms_opt(9, 15, 0).unwrap()),
-            ("30분OR", NaiveTime::from_hms_opt(9, 0, 0).unwrap(), NaiveTime::from_hms_opt(9, 30, 0).unwrap()),
-        ];
+        let stages = self.filtered_stage_tuples(allowed_stages);
+        if stages.is_empty() {
+            return Err(KisError::Internal(
+                "허용된 stage가 없어 multi-stage 백테스트를 실행할 수 없습니다.".to_string(),
+            ));
+        }
 
         let mut trades = Vec::new();
 
@@ -539,22 +702,29 @@ impl BacktestEngine {
                 let mut stage_config = self.strategy.config.clone();
                 stage_config.or_start = *or_start;
                 stage_config.or_end = *or_end;
-                let stage_strategy = OrbFvgStrategy { config: stage_config };
+                let stage_strategy = OrbFvgStrategy {
+                    config: stage_config,
+                };
 
                 let results = stage_strategy.run_day(&candles);
-                if let Some(first) = results.first() {
-                    if first.entry_time < earliest_entry {
-                        earliest_entry = first.entry_time;
-                        earliest_results = results;
-                        earliest_stage = name;
-                    }
+                if let Some(first) = results.first()
+                    && first.entry_time < earliest_entry
+                {
+                    earliest_entry = first.entry_time;
+                    earliest_results = results;
+                    earliest_stage = name;
                 }
             }
 
             if !earliest_results.is_empty() {
                 let pnl: f64 = earliest_results.iter().map(|t| t.pnl_pct()).sum();
-                info!("{date}: 선착순 {} (진입 {}) — {}건, {:.2}%",
-                    earliest_stage, earliest_entry, earliest_results.len(), pnl);
+                info!(
+                    "{date}: 선착순 {} (진입 {}) — {}건, {:.2}%",
+                    earliest_stage,
+                    earliest_entry,
+                    earliest_results.len(),
+                    pnl
+                );
                 for r in earliest_results {
                     trades.push((*date, r));
                 }
@@ -578,7 +748,11 @@ impl BacktestEngine {
             total_trades: total,
             wins,
             losses,
-            win_rate: if total > 0 { wins as f64 / total as f64 * 100.0 } else { 0.0 },
+            win_rate: if total > 0 {
+                wins as f64 / total as f64 * 100.0
+            } else {
+                0.0
+            },
             total_pnl_pct: total_pnl,
             avg_rr,
             strategy_version: LEGACY_STRATEGY_VERSION.to_string(),
@@ -587,13 +761,26 @@ impl BacktestEngine {
         })
     }
 
-    /// Session-Based Reset 백테스트: 오전/오후 세션 각각 독립 OR 생성
+    /// Session-Based Reset 백테스트: 오전/오후 세션 각각 독립 OR 생성 (단일 stage)
     pub async fn run_session_reset(
         &self,
         stock_code: &str,
         days: usize,
+        allowed_stages: &[String],
     ) -> Result<BacktestReport, KisError> {
-        let dates = self.fetch_available_dates(stock_code, days).await?;
+        let stage = Self::require_single_stage(allowed_stages, "run_session_reset")?;
+        let or_end = Self::stage_to_or_end(stage)?;
+        // AM OR 종료 시각만 override (PM 은 13:15 로 고정 유지)
+        let mut strategy = OrbFvgStrategy {
+            config: self.strategy.config.clone(),
+        };
+        strategy.config.or_end = or_end;
+        let this = BacktestEngine {
+            store: Arc::clone(&self.store),
+            strategy,
+            source_interval: self.source_interval,
+        };
+        let dates = this.fetch_available_dates(stock_code, days).await?;
         if dates.is_empty() {
             return Err(KisError::Internal(format!(
                 "{stock_code}: DB에 분봉 데이터가 없습니다."
@@ -602,27 +789,34 @@ impl BacktestEngine {
 
         info!(
             "Session Reset 백테스트: {}일 ({} ~ {})",
-            dates.len(), dates.first().unwrap(), dates.last().unwrap(),
+            dates.len(),
+            dates.first().unwrap(),
+            dates.last().unwrap(),
         );
 
         let mut trades = Vec::new();
 
         for date in &dates {
-            let candles = self.fetch_day_candles(stock_code, *date).await?;
+            let candles = this.fetch_day_candles(stock_code, *date).await?;
             if candles.is_empty() {
                 continue;
             }
 
             // 오전 세션: OR 09:00~09:15, 거래 09:15~12:30
             let am_cutoff = NaiveTime::from_hms_opt(12, 30, 0).unwrap();
-            let am_candles: Vec<_> = candles.iter()
+            let am_candles: Vec<_> = candles
+                .iter()
                 .filter(|c| c.time < am_cutoff)
                 .cloned()
                 .collect();
 
             if !am_candles.is_empty() {
-                let am_results = self.strategy.run_day(&am_candles);
-                info!("{date} 오전: {}개 캔들, {}건 거래", am_candles.len(), am_results.len());
+                let am_results = this.strategy.run_day(&am_candles);
+                info!(
+                    "{date} 오전: {}개 캔들, {}건 거래",
+                    am_candles.len(),
+                    am_results.len()
+                );
                 for r in am_results {
                     trades.push((*date, r));
                 }
@@ -631,20 +825,25 @@ impl BacktestEngine {
             // 오후 세션: OR 13:00~13:15, 거래 13:15~15:20
             let pm_or_start = NaiveTime::from_hms_opt(13, 0, 0).unwrap();
             let pm_or_end = NaiveTime::from_hms_opt(13, 15, 0).unwrap();
-            let pm_candles: Vec<MinuteCandle> = candles.iter()
+            let pm_candles: Vec<MinuteCandle> = candles
+                .iter()
                 .filter(|c| c.time >= pm_or_start)
                 .cloned()
                 .collect();
 
             if !pm_candles.is_empty() {
                 // 오후 세션 전용 config: OR 시간만 변경
-                let mut pm_config = self.strategy.config.clone();
+                let mut pm_config = this.strategy.config.clone();
                 pm_config.or_start = pm_or_start;
                 pm_config.or_end = pm_or_end;
                 let pm_strategy = OrbFvgStrategy { config: pm_config };
 
                 let pm_results = pm_strategy.run_day(&pm_candles);
-                info!("{date} 오후: {}개 캔들, {}건 거래", pm_candles.len(), pm_results.len());
+                info!(
+                    "{date} 오후: {}개 캔들, {}건 거래",
+                    pm_candles.len(),
+                    pm_results.len()
+                );
                 for r in pm_results {
                     trades.push((*date, r));
                 }
@@ -668,7 +867,11 @@ impl BacktestEngine {
             total_trades: total,
             wins,
             losses,
-            win_rate: if total > 0 { wins as f64 / total as f64 * 100.0 } else { 0.0 },
+            win_rate: if total > 0 {
+                wins as f64 / total as f64 * 100.0
+            } else {
+                0.0
+            },
             total_pnl_pct: total_pnl,
             avg_rr,
             strategy_version: LEGACY_STRATEGY_VERSION.to_string(),
@@ -677,14 +880,24 @@ impl BacktestEngine {
         })
     }
 
-    /// Dynamic Target 백테스트: 과거 N일 OR 돌파 확장폭 평균으로 TP 동적 설정
+    /// Dynamic Target 백테스트: 과거 N일 OR 돌파 확장폭 평균으로 TP 동적 설정 (단일 stage)
     pub async fn run_dynamic_target(
         &self,
         stock_code: &str,
         days: usize,
         lookback: usize,
+        allowed_stages: &[String],
     ) -> Result<BacktestReport, KisError> {
-        self.run_impl_dynamic(stock_code, days, lookback).await
+        let stage = Self::require_single_stage(allowed_stages, "run_dynamic_target")?;
+        let or_end = Self::stage_to_or_end(stage)?;
+        let mut cfg = self.strategy.config.clone();
+        cfg.or_end = or_end;
+        let engine = BacktestEngine {
+            store: Arc::clone(&self.store),
+            strategy: OrbFvgStrategy { config: cfg },
+            source_interval: self.source_interval,
+        };
+        engine.run_impl_dynamic(stock_code, days, lookback).await
     }
 
     async fn run_impl(
@@ -763,7 +976,9 @@ impl BacktestEngine {
         days: usize,
         lookback: usize,
     ) -> Result<BacktestReport, KisError> {
-        let dates = self.fetch_available_dates(stock_code, days + lookback).await?;
+        let dates = self
+            .fetch_available_dates(stock_code, days + lookback)
+            .await?;
         if dates.is_empty() {
             return Err(KisError::Internal(format!(
                 "{stock_code}: DB에 분봉 데이터가 없습니다."
@@ -772,7 +987,10 @@ impl BacktestEngine {
 
         info!(
             "Dynamic Target 백테스트: {}일 (lookback={}일, {} ~ {})",
-            dates.len(), lookback, dates.first().unwrap(), dates.last().unwrap(),
+            dates.len(),
+            lookback,
+            dates.first().unwrap(),
+            dates.last().unwrap(),
         );
 
         // 1단계: 각 날의 OR 돌파 후 최대 확장폭(R 배수) 기록
@@ -788,7 +1006,8 @@ impl BacktestEngine {
 
             // OR 범위 계산
             let cfg = &self.strategy.config;
-            let or_candles: Vec<_> = candles.iter()
+            let or_candles: Vec<_> = candles
+                .iter()
                 .filter(|c| c.time >= cfg.or_start && c.time < cfg.or_end)
                 .collect();
             if or_candles.is_empty() {
@@ -801,7 +1020,8 @@ impl BacktestEngine {
             let or_range = (or_high - or_low).max(1) as f64;
 
             // OR 돌파 후 최대 확장폭 (OR 범위 대비 R 배수)
-            let max_extension = candles.iter()
+            let max_extension = candles
+                .iter()
                 .filter(|c| c.time >= cfg.or_end)
                 .map(|c| {
                     let bull_ext = (c.high - or_high).max(0) as f64 / or_range;
@@ -820,15 +1040,22 @@ impl BacktestEngine {
                     self.strategy.config.rr_ratio // fallback
                 } else {
                     let avg = valid.iter().sum::<f64>() / valid.len() as f64;
-                    avg.max(1.0).min(5.0) // 최소 1R, 최대 5R 클램프
+                    avg.clamp(1.0, 5.0) // 최소 1R, 최대 5R 클램프
                 };
 
                 // 해당 날의 RR을 동적으로 설정하여 전략 실행
-                let mut day_strategy = OrbFvgStrategy { config: self.strategy.config.clone() };
+                let mut day_strategy = OrbFvgStrategy {
+                    config: self.strategy.config.clone(),
+                };
                 day_strategy.config.rr_ratio = dynamic_rr;
 
-                info!("{date}: {}개 캔들, dynamic RR={:.2} (과거 {}일 평균 확장={:.2}R)",
-                    candles.len(), dynamic_rr, valid.len(), dynamic_rr);
+                info!(
+                    "{date}: {}개 캔들, dynamic RR={:.2} (과거 {}일 평균 확장={:.2}R)",
+                    candles.len(),
+                    dynamic_rr,
+                    valid.len(),
+                    dynamic_rr
+                );
 
                 let day_results = day_strategy.run_day(&candles);
                 for result in day_results {
@@ -855,7 +1082,11 @@ impl BacktestEngine {
             total_trades: total,
             wins,
             losses,
-            win_rate: if total > 0 { wins as f64 / total as f64 * 100.0 } else { 0.0 },
+            win_rate: if total > 0 {
+                wins as f64 / total as f64 * 100.0
+            } else {
+                0.0
+            },
             total_pnl_pct: total_pnl,
             avg_rr,
             strategy_version: LEGACY_STRATEGY_VERSION.to_string(),
@@ -877,6 +1108,7 @@ impl BacktestEngine {
         stock_code: &str,
         days: usize,
         policy_id: &str,
+        allowed_stages: &[String],
     ) -> Result<BacktestReport, KisError> {
         use super::parity::{
             execution_policy::{LegacyMidPriceSim, PassiveTopBottomTimeout30s},
@@ -914,10 +1146,16 @@ impl BacktestEngine {
             _ => ("passive_top_bottom_timeout_30s", "parity_backtest_passive"),
         };
 
-        let stage_defs = self.live_stage_defs();
+        let stage_defs = self.filter_stage_defs(allowed_stages);
+        if stage_defs.is_empty() {
+            return Err(KisError::Internal(
+                "허용된 stage가 없어 parity 백테스트를 실행할 수 없습니다.".to_string(),
+            ));
+        }
         let mut trades = Vec::new();
         for date in &dates {
-            let (candles, interval_used) = self.fetch_day_candles_prefer_1m(stock_code, *date).await?;
+            let (candles, interval_used) =
+                self.fetch_day_candles_prefer_1m(stock_code, *date).await?;
             if candles.is_empty() {
                 warn!("{date}: 분봉 데이터 없음, 건너뜀");
                 continue;
@@ -943,6 +1181,7 @@ impl BacktestEngine {
                         force_exit: cfg.force_exit,
                         pm_config,
                         fvg_expiry_candles: cfg.fvg_expiry_candles,
+                        min_or_breakout_pct: cfg.min_or_breakout_pct,
                         long_only: cfg.long_only,
                         rr_ratio: cfg.rr_ratio,
                         max_entry_drift_pct: None,
@@ -963,6 +1202,7 @@ impl BacktestEngine {
                         force_exit: cfg.force_exit,
                         pm_config,
                         fvg_expiry_candles: cfg.fvg_expiry_candles,
+                        min_or_breakout_pct: cfg.min_or_breakout_pct,
                         long_only: cfg.long_only,
                         rr_ratio: cfg.rr_ratio,
                         max_entry_drift_pct: None,
@@ -994,7 +1234,11 @@ impl BacktestEngine {
             total_trades: total,
             wins,
             losses,
-            win_rate: if total > 0 { wins as f64 / total as f64 * 100.0 } else { 0.0 },
+            win_rate: if total > 0 {
+                wins as f64 / total as f64 * 100.0
+            } else {
+                0.0
+            },
             total_pnl_pct: total_pnl,
             avg_rr,
             strategy_version: LEGACY_STRATEGY_VERSION.to_string(),
@@ -1011,6 +1255,7 @@ impl BacktestEngine {
         &self,
         stock_code: &str,
         date: NaiveDate,
+        allowed_stages: &[String],
     ) -> Result<super::parity::replay::ReplayDayReport, KisError> {
         use super::parity::{
             execution_policy::{LegacyMidPriceSim, PassiveTopBottomTimeout30s},
@@ -1026,7 +1271,8 @@ impl BacktestEngine {
                 "{stock_code} / {date}: DB에 분봉 데이터가 없습니다."
             )));
         }
-        let (parity_candles, interval_used) = self.fetch_day_candles_prefer_1m(stock_code, date).await?;
+        let (parity_candles, interval_used) =
+            self.fetch_day_candles_prefer_1m(stock_code, date).await?;
         if parity_candles.is_empty() {
             return Err(KisError::Internal(format!(
                 "{stock_code} / {date}: parity 실행용 분봉 데이터가 없습니다."
@@ -1039,12 +1285,13 @@ impl BacktestEngine {
             );
         }
 
-        let stages = self.live_stage_defs();
-        let stage_tuples = [
-            ("5분OR", NaiveTime::from_hms_opt(9, 0, 0).unwrap(), NaiveTime::from_hms_opt(9, 5, 0).unwrap()),
-            ("15분OR", NaiveTime::from_hms_opt(9, 0, 0).unwrap(), NaiveTime::from_hms_opt(9, 15, 0).unwrap()),
-            ("30분OR", NaiveTime::from_hms_opt(9, 0, 0).unwrap(), NaiveTime::from_hms_opt(9, 30, 0).unwrap()),
-        ];
+        let stages = self.filter_stage_defs(allowed_stages);
+        let stage_tuples = self.filtered_stage_tuples(allowed_stages);
+        if stages.is_empty() || stage_tuples.is_empty() {
+            return Err(KisError::Internal(
+                "허용된 stage가 없어 replay를 실행할 수 없습니다.".to_string(),
+            ));
+        }
 
         let legacy = self.run_day_multi_stage(&candles, &stage_tuples);
 
@@ -1068,6 +1315,7 @@ impl BacktestEngine {
             force_exit: cfg.force_exit,
             pm_config,
             fvg_expiry_candles: cfg.fvg_expiry_candles,
+            min_or_breakout_pct: cfg.min_or_breakout_pct,
             long_only: cfg.long_only,
             rr_ratio: cfg.rr_ratio,
             max_entry_drift_pct: None,
@@ -1087,6 +1335,7 @@ impl BacktestEngine {
             force_exit: cfg.force_exit,
             pm_config,
             fvg_expiry_candles: cfg.fvg_expiry_candles,
+            min_or_breakout_pct: cfg.min_or_breakout_pct,
             long_only: cfg.long_only,
             rr_ratio: cfg.rr_ratio,
             max_entry_drift_pct: None,
@@ -1137,5 +1386,132 @@ impl BacktestEngine {
     ) -> Result<Vec<MinuteCandle>, KisError> {
         self.fetch_day_candles_with_interval(stock_code, date, self.source_interval)
             .await
+    }
+}
+
+/// v3 불변식 #1 Stage 3: stage 필터/검증 순수 함수 회귀.
+///
+/// DB 없는 순수 helper 만 대상 — engine 인스턴스 불필요.
+/// `filtered_stage_tuples_for`/`filtered_stage_defs_for` 는 실사용 메서드가
+/// 동일 함수를 호출하도록 Stage 1 에서 얇은 wrapper 로 축소됨.
+#[cfg(test)]
+mod stage_filter_tests {
+    use super::*;
+
+    fn or_start() -> NaiveTime {
+        NaiveTime::from_hms_opt(9, 0, 0).unwrap()
+    }
+
+    #[test]
+    fn stage_enabled_empty_list_allows_all() {
+        let empty: Vec<String> = vec![];
+        assert!(stage_enabled(&empty, "5m"));
+        assert!(stage_enabled(&empty, "15m"));
+        assert!(stage_enabled(&empty, "30m"));
+    }
+
+    #[test]
+    fn stage_enabled_list_filters_to_named_only() {
+        let only_15m = vec!["15m".to_string()];
+        assert!(!stage_enabled(&only_15m, "5m"));
+        assert!(stage_enabled(&only_15m, "15m"));
+        assert!(!stage_enabled(&only_15m, "30m"));
+    }
+
+    #[test]
+    fn filtered_stage_tuples_15m_only_returns_one_entry() {
+        let only_15m = vec!["15m".to_string()];
+        let tuples = filtered_stage_tuples_for(or_start(), &only_15m);
+        assert_eq!(tuples.len(), 1);
+        assert_eq!(tuples[0].0, "15m");
+        assert_eq!(tuples[0].1, or_start());
+        assert_eq!(tuples[0].2, NaiveTime::from_hms_opt(9, 15, 0).unwrap());
+    }
+
+    #[test]
+    fn filtered_stage_tuples_5m_and_15m_returns_two() {
+        let list = vec!["5m".to_string(), "15m".to_string()];
+        let tuples = filtered_stage_tuples_for(or_start(), &list);
+        assert_eq!(tuples.len(), 2);
+        assert_eq!(tuples[0].0, "5m");
+        assert_eq!(tuples[1].0, "15m");
+    }
+
+    #[test]
+    fn filtered_stage_tuples_empty_list_returns_all_three() {
+        let empty: Vec<String> = vec![];
+        let tuples = filtered_stage_tuples_for(or_start(), &empty);
+        assert_eq!(tuples.len(), 3);
+    }
+
+    #[test]
+    fn filtered_stage_defs_15m_only_returns_one_entry() {
+        let only_15m = vec!["15m".to_string()];
+        let defs = filtered_stage_defs_for(or_start(), &only_15m);
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].name, "15m");
+        assert_eq!(defs[0].or_end, NaiveTime::from_hms_opt(9, 15, 0).unwrap());
+    }
+
+    #[test]
+    fn filtered_stage_defs_5m_and_15m_returns_two() {
+        let list = vec!["5m".to_string(), "15m".to_string()];
+        let defs = filtered_stage_defs_for(or_start(), &list);
+        assert_eq!(defs.len(), 2);
+        assert_eq!(defs[0].name, "5m");
+        assert_eq!(defs[1].name, "15m");
+    }
+
+    #[test]
+    fn require_single_stage_single_ok() {
+        let one = vec!["15m".to_string()];
+        let got = BacktestEngine::require_single_stage(&one, "run");
+        assert_eq!(got.unwrap(), "15m");
+    }
+
+    #[test]
+    fn require_single_stage_empty_errors() {
+        let empty: Vec<String> = vec![];
+        let err = BacktestEngine::require_single_stage(&empty, "run").unwrap_err();
+        let msg = format!("{:?}", err);
+        assert!(msg.contains("비었"), "empty stages error message: {msg}");
+    }
+
+    #[test]
+    fn require_single_stage_multi_errors() {
+        let two = vec!["5m".to_string(), "15m".to_string()];
+        let err = BacktestEngine::require_single_stage(&two, "run_dynamic_target").unwrap_err();
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("정확히 1 개"),
+            "multi-stage error message: {msg}"
+        );
+        assert!(
+            msg.contains("run_dynamic_target"),
+            "error should mention path name: {msg}"
+        );
+    }
+
+    #[test]
+    fn stage_to_or_end_known_stages_ok() {
+        assert_eq!(
+            BacktestEngine::stage_to_or_end("5m").unwrap(),
+            NaiveTime::from_hms_opt(9, 5, 0).unwrap()
+        );
+        assert_eq!(
+            BacktestEngine::stage_to_or_end("15m").unwrap(),
+            NaiveTime::from_hms_opt(9, 15, 0).unwrap()
+        );
+        assert_eq!(
+            BacktestEngine::stage_to_or_end("30m").unwrap(),
+            NaiveTime::from_hms_opt(9, 30, 0).unwrap()
+        );
+    }
+
+    #[test]
+    fn stage_to_or_end_unknown_stage_errors() {
+        let err = BacktestEngine::stage_to_or_end("10m").unwrap_err();
+        let msg = format!("{:?}", err);
+        assert!(msg.contains("지원하지 않는 stage"));
     }
 }

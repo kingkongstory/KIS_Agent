@@ -36,12 +36,8 @@ impl BollingerBands {
         }
 
         let mean = self.buffer.iter().sum::<f64>() / self.period as f64;
-        let variance = self
-            .buffer
-            .iter()
-            .map(|x| (x - mean).powi(2))
-            .sum::<f64>()
-            / self.period as f64;
+        let variance =
+            self.buffer.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / self.period as f64;
         let std_dev = variance.sqrt();
 
         let upper = mean + self.multiplier * std_dev;

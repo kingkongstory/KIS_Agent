@@ -3,3 +3,17 @@
 *.db
 kis_cache.db*
 node_modules
+
+# 개인/툴 환경 설정 (Claude Code, Codex, Playwright MCP)
+.claude/
+.codex/
+.playwright-mcp/
+
+# 런타임 로그 (HTS ID 등 민감 정보 포함)
+logs/
+
+# 로컬 스크린샷 (포트폴리오/계좌 정보 노출 위험)
+/*.png
+
+# 프론트엔드 빌드 캐시
+frontend/tsconfig.tsbuildinfo

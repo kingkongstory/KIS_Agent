@@ -1,5 +1,5 @@
-use serde::de::DeserializeOwned;
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use std::sync::Arc;
 use tracing::{debug, warn};
 
@@ -119,7 +119,8 @@ pub struct KisHttpClient {
     account_product_code: String,
     /// 운영 이벤트 로거 (api_error 기록용).
     /// `KisHttpClient` 는 `pg_store` 보다 먼저 생성되는 경우가 있어 `OnceLock` 으로 사후 주입.
-    event_logger: std::sync::OnceLock<Arc<crate::infrastructure::monitoring::event_logger::EventLogger>>,
+    event_logger:
+        std::sync::OnceLock<Arc<crate::infrastructure::monitoring::event_logger::EventLogger>>,
 }
 
 impl KisHttpClient {
@@ -176,8 +177,17 @@ impl KisHttpClient {
                     );
                     if let Some(el) = self.event_logger.get() {
                         el.log_event(
-                            "", "system", "api_error", "warn",
-                            &format!("{:?} {} 실패: {e} (재시도 {}/{})", method, path, attempt + 1, max_retries),
+                            "",
+                            "system",
+                            "api_error",
+                            "warn",
+                            &format!(
+                                "{:?} {} 실패: {e} (재시도 {}/{})",
+                                method,
+                                path,
+                                attempt + 1,
+                                max_retries
+                            ),
                             serde_json::json!({
                                 "path": path,
                                 "tr_id": format!("{:?}", tr_id),
@@ -196,7 +206,10 @@ impl KisHttpClient {
                     if let Some(el) = self.event_logger.get() {
                         let severity = if e.is_retryable() { "error" } else { "warn" };
                         el.log_event(
-                            "", "system", "api_error", severity,
+                            "",
+                            "system",
+                            "api_error",
+                            severity,
                             &format!("{:?} {} 최종 실패: {e}", method, path),
                             serde_json::json!({
                                 "path": path,
@@ -253,16 +266,26 @@ impl KisHttpClient {
             request = request.json(b);
         }
 
-        let response = request.send().await.map_err(|e| KisError::HttpError(e.to_string()))?;
+        let response = request
+            .send()
+            .await
+            .map_err(|e| KisError::HttpError(e.to_string()))?;
 
         let status = response.status();
-        let text = response.text().await.map_err(|e| KisError::HttpError(e.to_string()))?;
+        let text = response
+            .text()
+            .await
+            .map_err(|e| KisError::HttpError(e.to_string()))?;
 
         if !status.is_success() {
             // KIS API는 HTTP 500이어도 JSON body에 에러 코드를 포함 — 파싱하여 분류
             // 에러 응답은 msg_cd 대신 message 필드를 사용하는 경우가 있음
             if let Ok(err) = serde_json::from_str::<KisErrorBody>(&text) {
-                let msg_cd = if err.msg_cd.is_empty() { err.message } else { err.msg_cd };
+                let msg_cd = if err.msg_cd.is_empty() {
+                    err.message
+                } else {
+                    err.msg_cd
+                };
                 if !msg_cd.is_empty() {
                     return Err(KisError::classify(err.rt_cd, msg_cd, err.msg1));
                 }
@@ -270,9 +293,8 @@ impl KisHttpClient {
             return Err(KisError::HttpError(format!("HTTP {status}: {text}")));
         }
 
-        let raw: RawKisResponse = serde_json::from_str(&text).map_err(|e| {
-            KisError::ParseError(format!("JSON 파싱 실패: {e}, 응답: {text}"))
-        })?;
+        let raw: RawKisResponse = serde_json::from_str(&text)
+            .map_err(|e| KisError::ParseError(format!("JSON 파싱 실패: {e}, 응답: {text}")))?;
         Ok(raw.into_typed())
     }
 

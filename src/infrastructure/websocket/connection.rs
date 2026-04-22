@@ -2,7 +2,7 @@ use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{RwLock, broadcast};
 use tokio::time::{Duration, sleep};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
@@ -150,7 +150,17 @@ impl KisWebSocketClient {
 
     /// WebSocket 연결 시작 (백그라운드 태스크로 실행)
     pub async fn run(self: Arc<Self>) {
-        let max_retries = 10;
+        // 2026-04-17 권고: max_retries env 화 + 기본 20 (기존 10).
+        // KIS WS 는 매 정시(:00) 리셋 + 장외 시간 불안정이라 10회로는 하루를
+        // 못 버틴다. 구독 확인 완료 시 self.retry_count 가 0 으로 리셋되므로
+        // 실제 카운트는 "연속 연결 실패" 기준.
+        let max_retries: u32 = std::env::var("KIS_WS_MAX_RETRIES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20);
+        // retry_count 는 현재 observation 용 — 재연결 실패/성공에 따라 갱신만 되고
+        // 로직 분기에는 쓰이지 않는다. self.retry_count 가 실제 상태라 여기는 로컬 카운터만.
+        #[allow(unused_assignments)]
         let mut retry_count = 0;
 
         loop {
@@ -160,14 +170,19 @@ impl KisWebSocketClient {
                     break;
                 }
                 Err(e) => {
-                    retry_count += 1;
-                    self.retry_count.store(retry_count, Ordering::Relaxed);
+                    // 구독 확인까지 성공했다면 connect_and_listen 내부에서 이미
+                    // self.retry_count 를 0 으로 리셋함. 여기선 self 값을 기준 삼아
+                    // 연속 실패만 카운트.
+                    retry_count = self.retry_count.fetch_add(1, Ordering::Relaxed) + 1;
                     if retry_count > max_retries {
                         error!("WebSocket 최대 재시도 횟수 초과: {e}");
                         self.terminated.store(true, Ordering::Relaxed);
                         if let Some(ref el) = self.event_logger {
                             el.log_event(
-                                "", "system", "ws_reconnect", "critical",
+                                "",
+                                "system",
+                                "ws_reconnect",
+                                "critical",
                                 &format!("최대 재시도 횟수 초과 — 종료: {e}"),
                                 serde_json::json!({
                                     "retry_count": retry_count,
@@ -185,7 +200,10 @@ impl KisWebSocketClient {
                     );
                     if let Some(ref el) = self.event_logger {
                         el.log_event(
-                            "", "system", "ws_reconnect", "warn",
+                            "",
+                            "system",
+                            "ws_reconnect",
+                            "warn",
                             &format!("WS 재연결 (시도 {retry_count}/{max_retries}): {e}"),
                             serde_json::json!({
                                 "retry_count": retry_count,
@@ -292,6 +310,13 @@ impl KisWebSocketClient {
                 warn!("구독 확인 타임아웃: {confirmed}/{expected_subs}건만 확인");
             } else {
                 info!("전체 구독 확인 완료: {confirmed}건");
+                // 2026-04-17 권고: 재연결이 구독 확인까지 안정적으로 성공했으면
+                // retry_count 를 리셋. 정시 리셋/일시 Connection reset 이 누적되어
+                // max_retries 초과로 프로세스 종료되는 회귀 차단 (2026-04-17 사고).
+                let prev = self.retry_count.swap(0, Ordering::Relaxed);
+                if prev > 0 {
+                    info!("WebSocket 연결 안정화 — retry_count {} → 0 리셋", prev);
+                }
             }
         }
 
@@ -331,7 +356,9 @@ impl KisWebSocketClient {
         if ctrl.header.tr_id != "H0STCNI9" && ctrl.header.tr_id != "H0STCNI0" {
             return;
         }
-        let Some(output) = &ctrl.body.output else { return };
+        let Some(output) = &ctrl.body.output else {
+            return;
+        };
         let key = output.get("key").and_then(|v| v.as_str()).map(String::from);
         let iv = output.get("iv").and_then(|v| v.as_str()).map(String::from);
         if key.is_none() || iv.is_none() {
@@ -404,14 +431,17 @@ impl KisWebSocketClient {
                         if let (Some(key), Some(iv)) = (key_guard.as_ref(), iv_guard.as_ref()) {
                             match aes_cbc_base64_decrypt(key, iv, &raw) {
                                 Ok(decrypted) => {
-                                    let parts: Vec<String> = decrypted.split('^').map(String::from).collect();
+                                    let parts: Vec<String> =
+                                        decrypted.split('^').map(String::from).collect();
                                     let dec_data = DataMessage {
                                         encrypted: false,
                                         tr_id: "H0STCNI9".to_string(),
                                         count: 1,
                                         data_parts: parts,
                                     };
-                                    if let Some(realtime) = parser::parse_execution_notice(&dec_data) {
+                                    if let Some(realtime) =
+                                        parser::parse_execution_notice(&dec_data)
+                                    {
                                         let _ = tx.send(realtime);
                                     }
                                 }
@@ -426,7 +456,10 @@ impl KisWebSocketClient {
                 }
             }
             None => {
-                warn!("알 수 없는 WebSocket 메시지: {}", &text[..text.len().min(100)]);
+                warn!(
+                    "알 수 없는 WebSocket 메시지: {}",
+                    &text[..text.len().min(100)]
+                );
             }
         }
     }
@@ -509,7 +542,10 @@ mod tests {
             }
             tokio::task::yield_now().await;
         }
-        assert!(client.is_notification_ready().await, "AES key/iv should be captured");
+        assert!(
+            client.is_notification_ready().await,
+            "AES key/iv should be captured"
+        );
     }
 
     #[tokio::test]

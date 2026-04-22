@@ -204,6 +204,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::approx_constant)] // 3.14 는 PI 근사 의도 아님 (단순 변환 테스트 값)
     fn test_string_to_f64() {
         let json = r#"{"value": "3.14"}"#;
         let parsed: TestF64 = serde_json::from_str(json).unwrap();

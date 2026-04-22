@@ -99,10 +99,12 @@ Rust 워크스페이스로 구성된 웹 애플리케이션이며, 아래 계층
 
 ### ORB+FVG 전략 흐름
 
-1. **OR 수집** (09:00~09:15): Opening Range 고가/저가 산출 (Multi-Stage 5m/15m/30m)
-2. **FVG 탐색** (09:15~15:20): 5분봉에서 3캔들 갭 패턴 탐지 + OR 돌파 확인
+1. **OR 수집** (09:00~09:15): Opening Range 고가/저가 산출. **2026-04-18 v3 불변식**: paper/real 모두 `allowed_stages=Some(["15m"])` 단일 stage 고정 (기본값 `LiveRunnerConfig::default()` 에서 강제). 5m/30m 은 `or_stages` 관찰 배열에만 노출되며 진입 경로 차단.
+2. **FVG 탐색** (09:15~15:20): 5분봉에서 3캔들 갭 패턴 탐지 + **OR 돌파 항상 필수** (`require_or_breakout=true` 고정 — 기존 `trade_count==0` 조건부는 2026-04-17 2 차 거래 오탐의 원인이라 v3 에서 제거).
 3. **진입**: FVG 리트레이스 시 **지정가 매수 (gap.top 기준, 30초 체결 대기)**
 4. **청산**: TP 지정가 매도 (KRX 자동 체결) / SL·트레일링·시간스탑은 시장가
+
+**stage 불변식 관통 범위**: 라이브 + `backtest.rs:run/run_session_reset/run_dynamic_target` + `parity_backtest.rs` + `orb_fvg.rs` + `main.rs` 의 `--stages` 옵션 (기본 `15m`) 까지 동일 규칙. 단일 stage 경로는 `--stages "5m,15m"` 로 2+ 개 지정하면 `require_single_stage()` 가 즉시 에러로 거부 (multi-stage / parity / dual-locked / replay 경로는 CSV 필터 그대로 허용).
 
 ### 주문 방식 (하이브리드)
 
@@ -115,7 +117,7 @@ Rust 워크스페이스로 구성된 웹 애플리케이션이며, 아래 계층
 
 **지정가 매수 상세**: 30초 체결 대기 루프 → 미체결 시 자동 취소 → 다음 FVG 탐색. cancel 3회 실패 시 `cancel_all_pending_orders()` fallback 동작.
 
-### 포지션 잠금 (2단계 PositionLockState)
+### 포지션 잠금 (PositionLockState)
 
 두 종목(122630/114800) 간 동시 진입 방지용 공유 lock:
 
@@ -124,14 +126,20 @@ Rust 워크스페이스로 구성된 웹 애플리케이션이며, 아래 계층
 | `Free` | 잠금 없음 | 어느 종목이든 진입 가능 |
 | `Pending{code, preempted}` | 지정가 발주 후 체결 대기 중 | 다른 종목 진입 시 `preempted=true` 설정 → 대기 종목 즉시 취소 |
 | `Held(code)` | 포지션 보유 확정 | 다른 종목 진입 차단 (청산 시 Free) |
+| `ManualHeld(code)` | 포지션 보유 + 수동 개입 플래그 | 자동 청산 전 경로 차단 (P0 / SL / TP / 트레일 모두). `active_positions.manual_intervention_required=true` 로 DB 영속화되어 재시작/watchdog 재기동 후에도 보존 |
 
 **선점(preempt) 메커니즘**: `wait_execution_notice()`의 `tokio::select!` 에 200ms 폴링 branch로 preempted 플래그 감지 (live_runner.rs `wait_preempted` 함수).
 
-### 데이터 소스 분리
+**reconcile Pending/ManualHeld 가드**: `should_skip_reconcile_for_lock()` helper 가 현재 종목이 `Pending(self)` 또는 `ManualHeld(self)` 상태면 reconcile 판정을 skip (지정가 발주 ~ 체결 확인 과도 상태에서 `runner_qty=0, KIS_qty>0` 가 manual 승격으로 오판되던 2026-04-17 11:00 사고 재발 방지). `reconcile_once` 가 `classify_reconcile_outcome` 과 함께 실경로에서 이 helper 를 직접 호출.
 
-- **OR 범위 계산**: 네이버 백필 + DB 저장 데이터 포함 전체 캔들
-- **FVG 신호 탐색**: WebSocket 실시간 수집 분봉만 (`is_realtime=true`)
-- 네이버 백필 데이터는 종가만 제공(OHLC 동일) → FVG 탐색에 부적합
+### 데이터 소스 분리 (v3 canonical 5m)
+
+- **OR 범위 계산 / FVG 신호 탐색**: `fetch_canonical_5m_candles()` 가 반환하는 **단일 canonical 5m 시퀀스**로 둘 다 판정 (2026-04-17 v3 불변식 #2). 기존 `is_realtime` flag 기반 2-배열 분리는 granularity 혼재(WS 1 분봉 + Yahoo 5 분봉) + 배열 간 의미 차이로 FVG 오탐 유발 → 폐기.
+- **merge precedence**:
+  - **과거 완료 버킷**: Yahoo (`interval_min=5`) 백필 **우선**. 없을 때만 WS 1 분봉 집계로 보완. 근거: postmortem (docs/monitoring/2026-04-17-trading-postmortem.md) 상 WS 집계 OR high 가 Yahoo 대비 ±90 원 괴리 — Yahoo 가 진실.
+  - **현재 진행 중 버킷**: WS 집계만 사용 (Yahoo 는 장중 데이터 아직 없음).
+- `CompletedCandle.interval_min: u32` 필드가 granularity 를 태그. `upsert_completed_bar()` 는 `(time, interval_min)` 복합키로 merge.
+- 네이버 백필 데이터는 종가만 제공(OHLC 동일) → FVG 탐색에 부적합.
 
 ### 서버 재시작 복구
 
@@ -168,11 +176,11 @@ Rust 워크스페이스로 구성된 웹 애플리케이션이며, 아래 계층
 ### 전략 파라미터 (OrbFvgConfig, `src/strategy/orb_fvg.rs:41-59`)
 
 - **RR 비율: 2.5** (손익비 1:2.5)
-- OR: 09:00~09:15 (Multi-Stage 5m/15m/30m 동시 추적)
+- OR: 09:00~09:15, **stage 는 15m 단일 고정** (2026-04-18 v3 불변식)
 - 진입 마감: 15:20 (지정가 대기 고려해 실제 컷오프 15:19:30), 강제 청산: 15:25
 - **트레일링: 0.05R (5%R)**, **본전스탑: 0.15R (15%R)** — 매우 공격적 설정 (2026-04-11 `360f167` 파라미터 최적화)
 - FVG 유효: 6캔들 (30분)
-- 일일 최대 손실: -1.5%, 최대 거래: 5회
+- 일일 최대 손실: -1.5%, 최대 거래: 5회 (단, 실전은 `max_daily_trades_override=1` 로 종목당 1 회)
 - Long only (공매도 금지)
 
 ### 일일 운영 절차
@@ -183,12 +191,17 @@ Rust 워크스페이스로 구성된 웹 애플리케이션이며, 아래 계층
 # 1. 백테스트용 5분봉 당일 추가 — Yahoo Finance range=1d (당일 73캔들/종목)
 ./target/release/kis_agent.exe collect-yahoo --codes "122630,114800" --interval 5m --range 1d
 
-# 2. 당일 결과 재현 백테스트 (라이브와 동일한 Multi-Stage + dual_locked 모드)
-./target/release/kis_agent.exe backtest 122630 --days 1 --rr 2.5 --multi-stage --dual-locked
+# 2. 당일 결과 재현 (라이브 15m 단일 stage 와 같은 규칙)
+./target/release/kis_agent.exe replay 122630 --date 2026-04-18 --rr 2.5 --stages 15m
 
-# 3. 누적 백테스트 (DB가 보유한 전체 일자 = 시간이 지날수록 길어짐)
-./target/release/kis_agent.exe backtest 122630 --days 365 --rr 2.5 --multi-stage --dual-locked
+# 3. 누적 백테스트 (단일 stage 경로 — 라이브 불변식 동일)
+./target/release/kis_agent.exe backtest 122630 --days 365 --rr 2.5 --stages 15m
+
+# 4. multi-stage 분석용 (진입 경로 아님, 관찰 목적만)
+./target/release/kis_agent.exe backtest 122630 --days 365 --rr 2.5 --stages "5m,15m,30m" --multi-stage --dual-locked
 ```
+
+**`--stages` 규칙**: 기본 `15m`. 단일 경로(`run`/`run_session_reset`/`run_dynamic_target`)는 정확히 1 개 값만 허용 (2+ 개면 `require_single_stage()` 에러). `--multi-stage`/`--dual-locked`/replay/parity 경로는 CSV 필터 그대로 수용.
 
 **자동화 (Windows Task Scheduler 권장)**:
 ```cmd
@@ -210,6 +223,8 @@ schtasks /Create /SC WEEKLY /D MON,TUE,WED,THU,FRI /TN "KIS_Yahoo_Daily" /TR "C:
 |---|---|---|
 | 2026-04-10 | DB 세션 KST timezone 강제 (백테스트 09:00~15:30 조회 0건 사고) | [docs/monitoring/2026-04-10.md](docs/monitoring/2026-04-10.md) |
 | 2026-04-14 | 지정가 매수 전환 + 2단계 lock + Graceful shutdown + orphan 정리 | [docs/monitoring/2026-04-14.md](docs/monitoring/2026-04-14.md) |
+| 2026-04-17 | -1.05% 손실 + P0 우회 사고 (2 차 거래 OR 돌파 0 통과, manual 오승격) | [docs/monitoring/2026-04-17-trading-postmortem.md](docs/monitoring/2026-04-17-trading-postmortem.md) |
+| 2026-04-18 | 3 불변식 관통 (15m 단일 / canonical 5m / reconcile Pending 가드) — "수정 무한 루프" 탈출 | [docs/monitoring/2026-04-17-invariants-plan.md](docs/monitoring/2026-04-17-invariants-plan.md) |
 
 ## 운영 주의사항
 

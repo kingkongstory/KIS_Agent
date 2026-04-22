@@ -1,8 +1,21 @@
 import { useStockStore, STOCK_CODES } from '../../stores/stockStore';
-import { formatKRW, formatPercent, formatChange, priceColorClass, formatShortKRW } from '../../utils/format';
+import {
+  formatKRW,
+  formatPercent,
+  formatChange,
+  formatShortKRW,
+} from '../../utils/format';
+import { Card, CardHeader, Stat, Skeleton, Badge } from '../ui';
+import { cn } from '../../utils/cn';
 
 interface Props {
   index: number;
+}
+
+function trendInfo(sign: string): { tone: 'rise' | 'fall' | 'muted'; arrow: string } {
+  if (sign === '1' || sign === '2') return { tone: 'rise', arrow: '▲' };
+  if (sign === '4' || sign === '5') return { tone: 'fall', arrow: '▼' };
+  return { tone: 'muted', arrow: '–' };
 }
 
 export function StockPriceCard({ index }: Props) {
@@ -11,50 +24,49 @@ export function StockPriceCard({ index }: Props) {
 
   if (!stock.priceData) {
     return (
-      <div className="bg-card rounded-lg border border-border p-4">
-        <div className="text-text-muted text-sm">{meta.name} 로딩 중...</div>
-      </div>
+      <Card>
+        <CardHeader title={meta.name} subtitle={meta.code} />
+        <Skeleton height="2.5rem" />
+        <div className="grid grid-cols-4 gap-3 mt-3">
+          {Array.from({ length: 4 }).map((_, i) => (
+            <Skeleton key={i} height="1.25rem" />
+          ))}
+        </div>
+      </Card>
     );
   }
 
   const p = stock.priceData;
-  const colorClass = priceColorClass(p.change_sign);
+  const { tone, arrow } = trendInfo(p.change_sign);
+  const colorClass = tone === 'rise' ? 'text-rise' : tone === 'fall' ? 'text-fall' : 'text-text-muted';
 
   return (
-    <div className="bg-card rounded-lg border border-border p-4">
-      <div className="flex items-baseline gap-2 mb-2">
-        <span className="text-lg font-bold">{meta.name}</span>
-        <span className="text-xs text-text-muted">{meta.code}</span>
-      </div>
+    <Card tone={tone === 'muted' ? 'default' : tone}>
+      <CardHeader
+        title={meta.name}
+        subtitle={meta.code}
+        action={
+          <Badge tone={tone === 'muted' ? 'muted' : tone} variant="soft" size="sm">
+            {arrow} {formatPercent(p.change_rate)}
+          </Badge>
+        }
+      />
+
       <div className="flex items-baseline gap-3">
-        <span className={`text-2xl font-bold ${colorClass}`}>
+        <span className={cn('text-3xl font-bold tabular-nums tracking-tight', colorClass)}>
           {formatKRW(p.price)}
         </span>
-        <span className={`text-sm ${colorClass}`}>
+        <span className={cn('text-sm tabular-nums font-medium', colorClass)}>
           {formatChange(p.change)}
         </span>
-        <span className={`text-sm ${colorClass}`}>
-          ({formatPercent(p.change_rate)})
-        </span>
       </div>
-      <div className="grid grid-cols-4 gap-4 mt-3 text-xs">
-        <div>
-          <span className="text-text-muted">시가</span>
-          <div>{formatKRW(p.open)}</div>
-        </div>
-        <div>
-          <span className="text-text-muted">고가</span>
-          <div className="text-rise">{formatKRW(p.high)}</div>
-        </div>
-        <div>
-          <span className="text-text-muted">저가</span>
-          <div className="text-fall">{formatKRW(p.low)}</div>
-        </div>
-        <div>
-          <span className="text-text-muted">거래대금</span>
-          <div>{formatShortKRW(p.amount)}</div>
-        </div>
+
+      <div className="grid grid-cols-4 gap-3 mt-4 pt-3 divider-soft">
+        <Stat label="시가" value={formatKRW(p.open)} size="sm" />
+        <Stat label="고가" value={formatKRW(p.high)} size="sm" tone="rise" />
+        <Stat label="저가" value={formatKRW(p.low)} size="sm" tone="fall" />
+        <Stat label="거래대금" value={formatShortKRW(p.amount)} size="sm" />
       </div>
-    </div>
+    </Card>
   );
 }

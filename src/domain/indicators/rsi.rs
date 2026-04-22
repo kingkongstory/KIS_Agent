@@ -51,10 +51,8 @@ impl Rsi {
                     self.losses.push(loss);
 
                     if self.gains.len() == self.period {
-                        let ag: f64 =
-                            self.gains.iter().sum::<f64>() / self.period as f64;
-                        let al: f64 =
-                            self.losses.iter().sum::<f64>() / self.period as f64;
+                        let ag: f64 = self.gains.iter().sum::<f64>() / self.period as f64;
+                        let al: f64 = self.losses.iter().sum::<f64>() / self.period as f64;
                         self.avg_gain = Some(ag);
                         self.avg_loss = Some(al);
 

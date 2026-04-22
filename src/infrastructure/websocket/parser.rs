@@ -4,6 +4,32 @@ use crate::domain::ports::realtime::{
     ExecutionNotice, MarketOperation, RealtimeData, RealtimeExecution, RealtimeOrderBook,
 };
 
+// KIS WebSocket 필드 인덱스는 `docs/api/websocket.md`의 0-based 표를 그대로 따른다.
+// 스프레드 gate와 분봉 집계가 이 값을 직접 사용하므로, magic number를 상수화해
+// 문서-구현 불일치를 테스트로 바로 잡을 수 있게 한다.
+const EXEC_STOCK_CODE_IDX: usize = 0;
+const EXEC_TIME_IDX: usize = 1;
+const EXEC_PRICE_IDX: usize = 2;
+const EXEC_CHANGE_IDX: usize = 4;
+const EXEC_CHANGE_RATE_IDX: usize = 5;
+const EXEC_ASK_PRICE_IDX: usize = 12;
+const EXEC_BID_PRICE_IDX: usize = 13;
+const EXEC_TRADE_VOLUME_IDX: usize = 15;
+const EXEC_OPEN_IDX: usize = 21;
+const EXEC_HIGH_IDX: usize = 22;
+const EXEC_LOW_IDX: usize = 23;
+const EXEC_MIN_FIELDS: usize = EXEC_LOW_IDX + 1;
+
+const ORDERBOOK_STOCK_CODE_IDX: usize = 0;
+const ORDERBOOK_ASK_START_IDX: usize = 3;
+const ORDERBOOK_BID_START_IDX: usize = 13;
+const ORDERBOOK_ASK_QTY_START_IDX: usize = 23;
+const ORDERBOOK_BID_QTY_START_IDX: usize = 33;
+const ORDERBOOK_TOTAL_ASK_IDX: usize = 43;
+const ORDERBOOK_TOTAL_BID_IDX: usize = 44;
+const ORDERBOOK_LEVEL_COUNT: usize = 10;
+const ORDERBOOK_MIN_FIELDS: usize = ORDERBOOK_TOTAL_BID_IDX + 1;
+
 /// WebSocket 메시지 종류 (JSON 제어 vs 파이프 데이터)
 #[derive(Debug)]
 pub enum WsMessage {
@@ -75,53 +101,55 @@ pub fn parse_ws_message(text: &str) -> Option<WsMessage> {
 
 /// 실시간 체결가 (H0STCNT0) 파싱
 pub fn parse_execution(data: &DataMessage) -> Option<RealtimeData> {
-    if data.data_parts.len() < 14 {
+    if data.data_parts.len() < EXEC_MIN_FIELDS {
         return None;
     }
 
     let parts = &data.data_parts;
     Some(RealtimeData::Execution(RealtimeExecution {
-        stock_code: parts[0].clone(),
-        time: parts[1].clone(),
-        price: parts[2].parse().unwrap_or(0),
-        change: parts[4].parse::<i64>().unwrap_or(0),
-        change_rate: parts[5].parse().unwrap_or(0.0),
-        volume: parts[6].parse::<u64>().unwrap_or(0),
-        ask_price: parts[8].parse().unwrap_or(0),
-        bid_price: parts[9].parse().unwrap_or(0),
-        open: parts[11].parse().unwrap_or(0),
-        high: parts[12].parse().unwrap_or(0),
-        low: parts[13].parse().unwrap_or(0),
+        stock_code: parts[EXEC_STOCK_CODE_IDX].clone(),
+        time: parts[EXEC_TIME_IDX].clone(),
+        price: parts[EXEC_PRICE_IDX].parse().unwrap_or(0),
+        change: parts[EXEC_CHANGE_IDX].parse::<i64>().unwrap_or(0),
+        change_rate: parts[EXEC_CHANGE_RATE_IDX].parse().unwrap_or(0.0),
+        // 누적거래량(9)이 아니라 직전 체결량(15)을 분봉 집계에 사용해야 중복 누적이 없다.
+        volume: parts[EXEC_TRADE_VOLUME_IDX].parse::<u64>().unwrap_or(0),
+        ask_price: parts[EXEC_ASK_PRICE_IDX].parse().unwrap_or(0),
+        bid_price: parts[EXEC_BID_PRICE_IDX].parse().unwrap_or(0),
+        open: parts[EXEC_OPEN_IDX].parse().unwrap_or(0),
+        high: parts[EXEC_HIGH_IDX].parse().unwrap_or(0),
+        low: parts[EXEC_LOW_IDX].parse().unwrap_or(0),
     }))
 }
 
 /// 실시간 호가 (H0STASP0) 파싱
 pub fn parse_orderbook(data: &DataMessage) -> Option<RealtimeData> {
-    if data.data_parts.len() < 43 {
+    if data.data_parts.len() < ORDERBOOK_MIN_FIELDS {
         return None;
     }
 
     let parts = &data.data_parts;
-    let stock_code = parts[0].clone();
+    let stock_code = parts[ORDERBOOK_STOCK_CODE_IDX].clone();
 
-    let mut asks = Vec::with_capacity(10);
-    let mut bids = Vec::with_capacity(10);
+    let mut asks = Vec::with_capacity(ORDERBOOK_LEVEL_COUNT);
+    let mut bids = Vec::with_capacity(ORDERBOOK_LEVEL_COUNT);
 
-    // 매도호가 1-10: index 1-10
-    // 매수호가 1-10: index 11-20
-    // 매도잔량 1-10: index 21-30
-    // 매수잔량 1-10: index 31-40
-    for i in 0..10 {
-        let ask_price: i64 = parts[1 + i].parse().unwrap_or(0);
-        let bid_price: i64 = parts[11 + i].parse().unwrap_or(0);
-        let ask_qty: i64 = parts[21 + i].parse().unwrap_or(0);
-        let bid_qty: i64 = parts[31 + i].parse().unwrap_or(0);
+    // 공식 문서 기준:
+    // - 매도호가 1~10: 3..12
+    // - 매수호가 1~10: 13..22
+    // - 매도잔량 1~10: 23..32
+    // - 매수잔량 1~10: 33..42
+    for i in 0..ORDERBOOK_LEVEL_COUNT {
+        let ask_price: i64 = parts[ORDERBOOK_ASK_START_IDX + i].parse().unwrap_or(0);
+        let bid_price: i64 = parts[ORDERBOOK_BID_START_IDX + i].parse().unwrap_or(0);
+        let ask_qty: i64 = parts[ORDERBOOK_ASK_QTY_START_IDX + i].parse().unwrap_or(0);
+        let bid_qty: i64 = parts[ORDERBOOK_BID_QTY_START_IDX + i].parse().unwrap_or(0);
         asks.push((ask_price, ask_qty));
         bids.push((bid_price, bid_qty));
     }
 
-    let total_ask: i64 = parts[41].parse().unwrap_or(0);
-    let total_bid: i64 = parts[42].parse().unwrap_or(0);
+    let total_ask: i64 = parts[ORDERBOOK_TOTAL_ASK_IDX].parse().unwrap_or(0);
+    let total_bid: i64 = parts[ORDERBOOK_TOTAL_BID_IDX].parse().unwrap_or(0);
 
     Some(RealtimeData::OrderBook(RealtimeOrderBook {
         stock_code,
@@ -143,12 +171,17 @@ pub fn parse_execution_notice(data: &DataMessage) -> Option<RealtimeData> {
     }
 
     let parts = &data.data_parts;
-    let is_filled = parts.get(13).map_or(false, |v| v == "2");
+    let is_filled = parts.get(13).is_some_and(|v| v == "2");
 
     Some(RealtimeData::ExecutionNotice(ExecutionNotice {
         order_no: parts[2].clone(),
         stock_code: parts[8].clone(),
-        stock_name: parts.get(24).cloned().unwrap_or_default().trim().to_string(),
+        stock_name: parts
+            .get(24)
+            .cloned()
+            .unwrap_or_default()
+            .trim()
+            .to_string(),
         side: parts[4].clone(),
         filled_qty: parts[9].parse().unwrap_or(0),
         filled_price: parts[10].parse().unwrap_or(0),
@@ -204,21 +237,68 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_pipe_message() {
-        // 간략화된 파이프 데이터 (14개 필드)
-        let pipe = "0|H0STCNT0|1|005930^093015^72300^2^500^0.70^150000^1082250000000^72500^72200^15000^72000^73000^71500";
+    fn test_parse_execution_uses_documented_indices() {
+        // 공식 문서 `docs/api/websocket.md`의 0-based 인덱스를 그대로 반영한 샘플.
+        let pipe = concat!(
+            "0|H0STCNT0|1|",
+            "005930^093015^72300^2^500^0.70^IGN6^IGN7^IGN8^999999^888888^IGN11^72500^72400^IGN14^321^IGN16^IGN17^IGN18^IGN19^IGN20^72000^73000^71500"
+        );
         let msg = parse_ws_message(pipe).unwrap();
         assert!(matches!(msg, WsMessage::Data(_)));
         if let WsMessage::Data(data) = msg {
             assert_eq!(data.tr_id, "H0STCNT0");
             assert!(!data.encrypted);
-            assert_eq!(data.data_parts[0], "005930");
+            assert_eq!(data.data_parts[EXEC_STOCK_CODE_IDX], "005930");
 
             let rt = parse_execution(&data).unwrap();
             if let RealtimeData::Execution(exec) = rt {
                 assert_eq!(exec.stock_code, "005930");
+                assert_eq!(exec.time, "093015");
                 assert_eq!(exec.price, 72300);
+                assert_eq!(exec.change, 500);
+                assert_eq!(exec.change_rate, 0.70);
+                assert_eq!(exec.volume, 321);
+                assert_eq!(exec.ask_price, 72500);
+                assert_eq!(exec.bid_price, 72400);
+                assert_eq!(exec.open, 72000);
+                assert_eq!(exec.high, 73000);
+                assert_eq!(exec.low, 71500);
             }
+        }
+    }
+
+    #[test]
+    fn test_parse_orderbook_uses_documented_indices() {
+        let mut parts = vec!["0".to_string(); ORDERBOOK_MIN_FIELDS];
+        parts[ORDERBOOK_STOCK_CODE_IDX] = "122630".to_string();
+
+        for level in 0..ORDERBOOK_LEVEL_COUNT {
+            parts[ORDERBOOK_ASK_START_IDX + level] = (100_000 + level as i64 * 5).to_string();
+            parts[ORDERBOOK_BID_START_IDX + level] = (99_995 - level as i64 * 5).to_string();
+            parts[ORDERBOOK_ASK_QTY_START_IDX + level] = (1_000 + level as i64).to_string();
+            parts[ORDERBOOK_BID_QTY_START_IDX + level] = (2_000 + level as i64).to_string();
+        }
+        parts[ORDERBOOK_TOTAL_ASK_IDX] = "15555".to_string();
+        parts[ORDERBOOK_TOTAL_BID_IDX] = "25555".to_string();
+
+        let data = DataMessage {
+            encrypted: false,
+            tr_id: "H0STASP0".to_string(),
+            count: 1,
+            data_parts: parts,
+        };
+
+        let rt = parse_orderbook(&data).unwrap();
+        if let RealtimeData::OrderBook(book) = rt {
+            assert_eq!(book.stock_code, "122630");
+            assert_eq!(book.asks.len(), ORDERBOOK_LEVEL_COUNT);
+            assert_eq!(book.bids.len(), ORDERBOOK_LEVEL_COUNT);
+            assert_eq!(book.asks[0], (100_000, 1_000));
+            assert_eq!(book.asks[9], (100_045, 1_009));
+            assert_eq!(book.bids[0], (99_995, 2_000));
+            assert_eq!(book.bids[9], (99_950, 2_009));
+            assert_eq!(book.total_ask_volume, 15_555);
+            assert_eq!(book.total_bid_volume, 25_555);
         }
     }
 }

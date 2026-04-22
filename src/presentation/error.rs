@@ -12,7 +12,9 @@ impl IntoResponse for AppError {
         let (status, message) = match &self.0 {
             KisError::InvalidStockCode(_) => (StatusCode::BAD_REQUEST, self.0.to_string()),
             KisError::OrderValidation(_) => (StatusCode::BAD_REQUEST, self.0.to_string()),
-            KisError::InsufficientBalance(_) => (StatusCode::UNPROCESSABLE_ENTITY, self.0.to_string()),
+            KisError::InsufficientBalance(_) => {
+                (StatusCode::UNPROCESSABLE_ENTITY, self.0.to_string())
+            }
             KisError::MarketClosed => (StatusCode::SERVICE_UNAVAILABLE, self.0.to_string()),
             KisError::RateLimited | KisError::TokenRateLimited => {
                 (StatusCode::TOO_MANY_REQUESTS, self.0.to_string())

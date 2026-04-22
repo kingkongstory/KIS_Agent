@@ -103,7 +103,7 @@ mod tests {
         assert_eq!(gaps.len(), 1);
         assert_eq!(gaps[0].direction, FvgDirection::Bullish);
         assert_eq!(gaps[0].bottom, 100); // A.high
-        assert_eq!(gaps[0].top, 105);    // C.low
+        assert_eq!(gaps[0].top, 105); // C.low
         assert_eq!(gaps[0].stop_loss, 85); // A.low
     }
 
@@ -118,7 +118,7 @@ mod tests {
         let gaps = detect_fvg(&candles);
         assert_eq!(gaps.len(), 1);
         assert_eq!(gaps[0].direction, FvgDirection::Bearish);
-        assert_eq!(gaps[0].top, 110);    // A.low
+        assert_eq!(gaps[0].top, 110); // A.low
         assert_eq!(gaps[0].bottom, 105); // C.high
         assert_eq!(gaps[0].stop_loss, 120); // A.high
     }

@@ -1,6 +1,7 @@
 use chrono::NaiveTime;
 
 use crate::domain::types::Environment;
+use crate::strategy::live_runner::ExecutionPolicyKind;
 
 /// 애플리케이션 설정.
 ///
@@ -50,12 +51,30 @@ pub struct AppConfig {
     pub ws_stale_message_secs: u64,
     /// 주기적 잔고/포지션 reconciliation 간격 (초). default 60.
     pub reconcile_secs: u64,
+    /// reconcile 불일치 감지 시 재확인 시도 횟수. default 3.
+    /// 2026-04-17 P1 — KIS `inquire-balance` 의 일시 지연을 흡수하기 위해
+    /// 재확인을 강화. 첫 일치 시 즉시 통과(early return).
+    pub reconcile_confirm_attempts: u32,
+    /// reconcile 재확인 시도 간 대기 (초). default 5.
+    /// 너무 짧으면 같은 캐시 응답을 반복 받아 의미가 없고, 너무 길면 진짜
+    /// hidden position 감지 지연이 커진다.
+    pub reconcile_confirm_interval_secs: u64,
     /// 실전 모드 신규 진입 마감 시각. default 15:00 (기존 15:20 보다 보수적).
     pub entry_cutoff_real: NaiveTime,
     /// 실전 모드에서 사용할 OR stage 목록.
     /// default `["15m"]` — 5m/30m stage 신호는 진입에 사용하지 않는다.
     /// 비워두면 모든 stage 허용 (모의투자 동작과 동일).
     pub real_or_stages: Vec<String>,
+    /// 라이브 실행 정책. 실전 기본은 시장성 지정가, 모의 기본은 passive.
+    pub live_execution_policy_kind: ExecutionPolicyKind,
+    /// 라이브 진입 체결 대기 timeout (ms).
+    pub live_entry_fill_timeout_ms: u64,
+    /// 라이브 청산 검증 budget (ms).
+    pub live_exit_verification_budget_ms: u64,
+    /// 라이브 신호 탐색 주기 (ms).
+    pub live_poll_interval_ms: u64,
+    /// 라이브 포지션 관리 주기 (ms).
+    pub live_manage_poll_interval_ms: u64,
 }
 
 impl AppConfig {
@@ -103,6 +122,47 @@ impl AppConfig {
             .and_then(|s| NaiveTime::parse_from_str(&format!("{s}:00"), "%H:%M:%S").ok())
             .unwrap_or_else(|| NaiveTime::from_hms_opt(15, 0, 0).unwrap());
 
+        let default_execution_policy_kind = if is_real_like {
+            ExecutionPolicyKind::MarketableLimit {
+                tick_offset: 1,
+                slippage_budget_pct: 0.003,
+            }
+        } else {
+            ExecutionPolicyKind::PassiveZoneEdge
+        };
+        let execution_policy = std::env::var("KIS_EXECUTION_POLICY")
+            .ok()
+            .map(|v| v.trim().to_lowercase())
+            .unwrap_or_else(|| match default_execution_policy_kind {
+                ExecutionPolicyKind::PassiveZoneEdge => "passive".to_string(),
+                ExecutionPolicyKind::MarketableLimit { .. } => "marketable".to_string(),
+            });
+        let marketable_tick_offset = env_u32("KIS_EXECUTION_MARKETABLE_TICK_OFFSET", 1).max(1);
+        let marketable_slippage_budget_pct =
+            env_f64("KIS_EXECUTION_SLIPPAGE_BUDGET_PCT", 0.003).clamp(0.0001, 0.05);
+        let live_execution_policy_kind = match execution_policy.as_str() {
+            "marketable" | "marketable_limit" | "marketable-limit" => {
+                ExecutionPolicyKind::MarketableLimit {
+                    tick_offset: marketable_tick_offset,
+                    slippage_budget_pct: marketable_slippage_budget_pct,
+                }
+            }
+            _ => ExecutionPolicyKind::PassiveZoneEdge,
+        };
+        let default_entry_fill_timeout_ms = match live_execution_policy_kind {
+            ExecutionPolicyKind::PassiveZoneEdge => 30_000,
+            ExecutionPolicyKind::MarketableLimit { .. } => 3_000,
+        };
+        let default_poll_interval_ms = match live_execution_policy_kind {
+            ExecutionPolicyKind::PassiveZoneEdge => 5_000,
+            ExecutionPolicyKind::MarketableLimit { .. } => 1_000,
+        };
+        let live_entry_fill_timeout_ms =
+            env_u64("KIS_ENTRY_FILL_TIMEOUT_MS", default_entry_fill_timeout_ms);
+        let live_exit_verification_budget_ms = env_u64("KIS_EXIT_VERIFICATION_BUDGET_MS", 15_000);
+        let live_poll_interval_ms = env_u64("KIS_POLL_INTERVAL_MS", default_poll_interval_ms);
+        let live_manage_poll_interval_ms = env_u64("KIS_MANAGE_POLL_INTERVAL_MS", 3_000);
+
         Ok(Self {
             appkey: env_required("KIS_APPKEY")?,
             appsecret: env_required("KIS_APPSECRET")?,
@@ -110,8 +170,7 @@ impl AppConfig {
             account_product_code: std::env::var("KIS_ACCOUNT_PRODUCT_CODE")
                 .unwrap_or_else(|_| "01".to_string()),
             environment,
-            server_host: std::env::var("SERVER_HOST")
-                .unwrap_or_else(|_| "127.0.0.1".to_string()),
+            server_host: std::env::var("SERVER_HOST").unwrap_or_else(|_| "127.0.0.1".to_string()),
             server_port: std::env::var("SERVER_PORT")
                 .ok()
                 .and_then(|p| p.parse().ok())
@@ -126,8 +185,15 @@ impl AppConfig {
             ws_stale_tick_secs: env_u64("KIS_WS_STALE_SECS", 120),
             ws_stale_message_secs: env_u64("KIS_WS_STALE_MESSAGE_SECS", 240),
             reconcile_secs: env_u64("KIS_RECONCILE_SECS", 60),
+            reconcile_confirm_attempts: env_u32("KIS_RECONCILE_CONFIRM_ATTEMPTS", 3),
+            reconcile_confirm_interval_secs: env_u64("KIS_RECONCILE_CONFIRM_INTERVAL", 5),
             entry_cutoff_real,
             real_or_stages,
+            live_execution_policy_kind,
+            live_entry_fill_timeout_ms,
+            live_exit_verification_budget_ms,
+            live_poll_interval_ms,
+            live_manage_poll_interval_ms,
         })
     }
 
@@ -186,6 +252,20 @@ fn env_u64(key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+fn env_u32(key: &str, default: u32) -> u32 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(default)
+}
+
+fn env_f64(key: &str, default: f64) -> f64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .unwrap_or(default)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,10 +281,21 @@ mod tests {
             "KIS_WS_STALE_SECS",
             "KIS_WS_STALE_MESSAGE_SECS",
             "KIS_RECONCILE_SECS",
+            "KIS_RECONCILE_CONFIRM_ATTEMPTS",
+            "KIS_RECONCILE_CONFIRM_INTERVAL",
             "KIS_ENTRY_CUTOFF_REAL",
             "KIS_REAL_OR_STAGES",
+            "KIS_EXECUTION_POLICY",
+            "KIS_EXECUTION_MARKETABLE_TICK_OFFSET",
+            "KIS_EXECUTION_SLIPPAGE_BUDGET_PCT",
+            "KIS_ENTRY_FILL_TIMEOUT_MS",
+            "KIS_EXIT_VERIFICATION_BUDGET_MS",
+            "KIS_POLL_INTERVAL_MS",
+            "KIS_MANAGE_POLL_INTERVAL_MS",
         ] {
-            unsafe { std::env::remove_var(k); }
+            unsafe {
+                std::env::remove_var(k);
+            }
         }
     }
 
@@ -271,8 +362,15 @@ mod tests {
             ws_stale_tick_secs: 120,
             ws_stale_message_secs: 240,
             reconcile_secs: 60,
+            reconcile_confirm_attempts: 3,
+            reconcile_confirm_interval_secs: 5,
             entry_cutoff_real: NaiveTime::from_hms_opt(15, 0, 0).unwrap(),
             real_or_stages: vec!["15m".to_string()],
+            live_execution_policy_kind: ExecutionPolicyKind::PassiveZoneEdge,
+            live_entry_fill_timeout_ms: 30_000,
+            live_exit_verification_budget_ms: 15_000,
+            live_poll_interval_ms: 5_000,
+            live_manage_poll_interval_ms: 3_000,
         }
     }
 }

@@ -16,10 +16,7 @@ impl TradingService {
     }
 
     /// 주문 실행
-    pub async fn place_order(
-        &self,
-        request: OrderRequest,
-    ) -> Result<OrderResponseDto, KisError> {
+    pub async fn place_order(&self, request: OrderRequest) -> Result<OrderResponseDto, KisError> {
         request.validate()?;
         let response = self.trading.place_order(&request).await?;
         Ok(OrderResponseDto::from(response))

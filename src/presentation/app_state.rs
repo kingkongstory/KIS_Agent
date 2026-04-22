@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use sqlx::postgres::PgPool;
+use std::sync::Arc;
 use tokio::sync::broadcast;
 
 use crate::application::services::account_service::AccountService;

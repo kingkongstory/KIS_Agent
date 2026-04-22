@@ -71,7 +71,9 @@ impl OrderRequest {
     /// 주문 유효성 검증
     pub fn validate(&self) -> Result<(), KisError> {
         if self.quantity == 0 {
-            return Err(KisError::OrderValidation("주문 수량은 0보다 커야 합니다".into()));
+            return Err(KisError::OrderValidation(
+                "주문 수량은 0보다 커야 합니다".into(),
+            ));
         }
 
         if self.order_type.requires_price() {

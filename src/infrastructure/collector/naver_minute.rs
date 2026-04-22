@@ -34,11 +34,7 @@ impl NaverMinuteCollector {
     }
 
     /// 종목의 분봉 수집 + DB 저장 (네이버에서 제공하는 전체 기간)
-    pub async fn collect(
-        &self,
-        stock_code: &str,
-        interval_min: i16,
-    ) -> Result<usize, KisError> {
+    pub async fn collect(&self, stock_code: &str, interval_min: i16) -> Result<usize, KisError> {
         // 1) 네이버에서 1분 틱 데이터 가져오기
         let ticks = self.fetch_minute_ticks(stock_code).await?;
         if ticks.is_empty() {
@@ -75,7 +71,10 @@ impl NaverMinuteCollector {
         }
 
         // 3) DB 저장
-        let count = self.store.save_minute_ohlcv(stock_code, &all_candles).await?;
+        let count = self
+            .store
+            .save_minute_ohlcv(stock_code, &all_candles)
+            .await?;
         info!(
             "네이버 분봉: {stock_code} {interval_min}분봉 {count}건 저장 ({} ~ {})",
             dates.first().unwrap(),

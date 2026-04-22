@@ -27,13 +27,11 @@ use crate::strategy::types::{ExitReason, PositionSide, TradeResult};
 
 use super::execution_policy::{ExecutionContext, ExecutionPolicy, FillFeedback, FillOutcome};
 use super::position_manager::{
-    gap_exit_reason, is_sl_hit, is_tp_hit, open_gap_breach, sl_exit_reason,
-    time_stop_breached_by_candles, update_best_and_trailing, PositionManagerConfig,
+    PositionManagerConfig, gap_exit_reason, is_sl_hit, is_tp_hit, open_gap_breach, sl_exit_reason,
+    time_stop_breached_by_candles, update_best_and_trailing,
 };
 use super::signal_engine::{SignalEngine, SignalEngineConfig};
-use super::types::{
-    CancelReason, EntryPlan, FillResolutionSource, FillStatus, SignalId, StageDef,
-};
+use super::types::{CancelReason, EntryPlan, FillResolutionSource, FillStatus, SignalId, StageDef};
 
 /// 파리티 백테스트 1일 러너.
 pub struct ParityDayRunner<E: SignalEngine, P: ExecutionPolicy> {
@@ -47,6 +45,7 @@ pub struct ParityDayRunner<E: SignalEngine, P: ExecutionPolicy> {
     pub force_exit: NaiveTime,
     pub pm_config: PositionManagerConfig,
     pub fvg_expiry_candles: usize,
+    pub min_or_breakout_pct: f64,
     pub long_only: bool,
     pub rr_ratio: f64,
     pub max_entry_drift_pct: Option<f64>,
@@ -142,7 +141,9 @@ impl<E: SignalEngine, P: ExecutionPolicy> ParityDayRunner<E, P> {
             }
             let scan_slice = &candles_5m[search_from..];
 
-            let require_or = trade_count == 0;
+            // 2026-04-17 v3 불변식 #1b: require_or_breakout 항상 true.
+            let require_or = true;
+            let _ = trade_count;
             let engine_cfg = SignalEngineConfig {
                 strategy_id: self.strategy_id.clone(),
                 stage_name: self.stage_name.clone(),
@@ -151,6 +152,7 @@ impl<E: SignalEngine, P: ExecutionPolicy> ParityDayRunner<E, P> {
                 fvg_expiry_candles: self.fvg_expiry_candles,
                 entry_cutoff: self.entry_cutoff,
                 require_or_breakout: require_or,
+                min_or_breakout_pct: self.min_or_breakout_pct,
                 long_only: self.long_only,
                 confirmed_side,
             };
@@ -186,11 +188,11 @@ impl<E: SignalEngine, P: ExecutionPolicy> ParityDayRunner<E, P> {
                     let side = plan.side;
 
                     // 방향 확인 (confirmed_side가 있으면 같은 방향만 허용).
-                    if let Some(cs) = confirmed_side {
-                        if side != cs {
-                            search_from = retrace_idx_abs + 1;
-                            continue;
-                        }
+                    if let Some(cs) = confirmed_side
+                        && side != cs
+                    {
+                        search_from = retrace_idx_abs + 1;
+                        continue;
                     }
 
                     info!(
@@ -252,7 +254,10 @@ impl<E: SignalEngine, P: ExecutionPolicy> ParityDayRunner<E, P> {
                     search_from = retrace_idx_abs + 1;
                 }
                 FillStatus::ManualIntervention(msg) => {
-                    info!("parity {}: manual_intervention — {}", retrace_candle.time, msg);
+                    info!(
+                        "parity {}: manual_intervention — {}",
+                        retrace_candle.time, msg
+                    );
                     break;
                 }
             }
@@ -372,8 +377,7 @@ impl<E: SignalEngine, P: ExecutionPolicy> ParityDayRunner<E, P> {
                     } else {
                         debug!(
                             "parity/live_like {} [{}]: 청산 시뮬레이션 결과 없음",
-                            retrace_candle.time,
-                            candidate.stage.name
+                            retrace_candle.time, candidate.stage.name
                         );
                         break;
                     }
@@ -381,27 +385,27 @@ impl<E: SignalEngine, P: ExecutionPolicy> ParityDayRunner<E, P> {
                 FillStatus::Cancelled(reason) => {
                     info!(
                         "parity/live_like {} [{}]: 체결 취소 — reason={:?}",
-                        retrace_candle.time,
-                        candidate.stage.name,
-                        reason
+                        retrace_candle.time, candidate.stage.name, reason
                     );
-                    advance_search_after(&mut state.search_after, candidate.detected.intent.signal_time);
+                    advance_search_after(
+                        &mut state.search_after,
+                        candidate.detected.intent.signal_time,
+                    );
                 }
                 FillStatus::Rejected(msg) => {
                     info!(
                         "parity/live_like {} [{}]: 체결 거부 — {}",
-                        retrace_candle.time,
-                        candidate.stage.name,
-                        msg
+                        retrace_candle.time, candidate.stage.name, msg
                     );
-                    advance_search_after(&mut state.search_after, candidate.detected.intent.signal_time);
+                    advance_search_after(
+                        &mut state.search_after,
+                        candidate.detected.intent.signal_time,
+                    );
                 }
                 FillStatus::ManualIntervention(msg) => {
                     info!(
                         "parity/live_like {} [{}]: manual_intervention — {}",
-                        retrace_candle.time,
-                        candidate.stage.name,
-                        msg
+                        retrace_candle.time, candidate.stage.name, msg
                     );
                     break;
                 }
@@ -453,7 +457,9 @@ impl<E: SignalEngine, P: ExecutionPolicy> ParityDayRunner<E, P> {
         stages: &[PreparedStage],
         state: &ParityLoopState,
     ) -> Option<StageCandidate> {
-        let require_or = state.trade_count == 0;
+        // 2026-04-17 v3 불변식 #1b: require_or_breakout 항상 true.
+        let require_or = true;
+        let _ = state.trade_count;
         let mut best: Option<StageCandidate> = None;
 
         for stage in stages {
@@ -478,6 +484,7 @@ impl<E: SignalEngine, P: ExecutionPolicy> ParityDayRunner<E, P> {
                 fvg_expiry_candles: self.fvg_expiry_candles,
                 entry_cutoff: self.entry_cutoff,
                 require_or_breakout: require_or,
+                min_or_breakout_pct: self.min_or_breakout_pct,
                 long_only: self.long_only,
                 confirmed_side: state.confirmed_side,
             };
@@ -528,8 +535,8 @@ fn simulate_fill(plan: &EntryPlan, candle: &MinuteCandle) -> FillFeedback {
             order_to_fill_ms: 0,
         },
         PassiveTopBottom { timeout_ms } => {
-            let touched = candle.low <= plan.intended_entry_price
-                && candle.high >= plan.intended_entry_price;
+            let touched =
+                candle.low <= plan.intended_entry_price && candle.high >= plan.intended_entry_price;
             if touched {
                 FillFeedback {
                     signal_id: plan.signal_id,
@@ -724,8 +731,14 @@ fn simulate_exit_with_pm(
             PositionSide::Short => c.low,
         };
         let _ = update_best_and_trailing(
-            side, entry_price, &mut best_price, &mut current_sl,
-            &mut reached_1r, original_risk, favorable, pm_config,
+            side,
+            entry_price,
+            &mut best_price,
+            &mut current_sl,
+            &mut reached_1r,
+            original_risk,
+            favorable,
+            pm_config,
         );
 
         // SL
@@ -809,7 +822,15 @@ mod tests {
     use super::super::types::{EntryMode, FillRecheckMode, StageDef};
     use super::*;
 
-    fn candle(hour: u32, min: u32, open: i64, high: i64, low: i64, close: i64, vol: u64) -> MinuteCandle {
+    fn candle(
+        hour: u32,
+        min: u32,
+        open: i64,
+        high: i64,
+        low: i64,
+        close: i64,
+        vol: u64,
+    ) -> MinuteCandle {
         MinuteCandle {
             date: NaiveDate::from_ymd_opt(2026, 4, 14).unwrap(),
             time: NaiveTime::from_hms_opt(hour, min, 0).unwrap(),
@@ -843,6 +864,7 @@ mod tests {
             force_exit: NaiveTime::from_hms_opt(15, 25, 0).unwrap(),
             pm_config: pm_cfg(),
             fvg_expiry_candles: 6,
+            min_or_breakout_pct: 0.001,
             long_only: true,
             rr_ratio: 2.5,
             max_entry_drift_pct: None,
@@ -863,6 +885,7 @@ mod tests {
             force_exit: NaiveTime::from_hms_opt(15, 25, 0).unwrap(),
             pm_config: pm_cfg(),
             fvg_expiry_candles: 6,
+            min_or_breakout_pct: 0.001,
             long_only: true,
             rr_ratio: 2.5,
             max_entry_drift_pct: None,
@@ -958,7 +981,10 @@ mod tests {
         ];
         let runner = runner_passive();
         let trades = runner.run_day(&candles);
-        assert!(trades.is_empty(), "intended_entry 미터치 → cancel 되어 거래 없음");
+        assert!(
+            trades.is_empty(),
+            "intended_entry 미터치 → cancel 되어 거래 없음"
+        );
     }
 
     #[test]

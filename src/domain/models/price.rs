@@ -60,99 +60,225 @@ pub struct InquirePrice {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AskingPrice {
     // 매도호가 1~10
-    #[serde(deserialize_with = "string_to_i64::deserialize", serialize_with = "string_to_i64::serialize")]
+    #[serde(
+        deserialize_with = "string_to_i64::deserialize",
+        serialize_with = "string_to_i64::serialize"
+    )]
     pub askp1: i64,
-    #[serde(deserialize_with = "string_to_i64::deserialize", serialize_with = "string_to_i64::serialize")]
+    #[serde(
+        deserialize_with = "string_to_i64::deserialize",
+        serialize_with = "string_to_i64::serialize"
+    )]
     pub askp2: i64,
-    #[serde(deserialize_with = "string_to_i64::deserialize", serialize_with = "string_to_i64::serialize")]
+    #[serde(
+        deserialize_with = "string_to_i64::deserialize",
+        serialize_with = "string_to_i64::serialize"
+    )]
     pub askp3: i64,
-    #[serde(deserialize_with = "string_to_i64::deserialize", serialize_with = "string_to_i64::serialize")]
+    #[serde(
+        deserialize_with = "string_to_i64::deserialize",
+        serialize_with = "string_to_i64::serialize"
+    )]
     pub askp4: i64,
-    #[serde(deserialize_with = "string_to_i64::deserialize", serialize_with = "string_to_i64::serialize")]
+    #[serde(
+        deserialize_with = "string_to_i64::deserialize",
+        serialize_with = "string_to_i64::serialize"
+    )]
     pub askp5: i64,
-    #[serde(deserialize_with = "string_to_i64::deserialize", serialize_with = "string_to_i64::serialize")]
+    #[serde(
+        deserialize_with = "string_to_i64::deserialize",
+        serialize_with = "string_to_i64::serialize"
+    )]
     pub askp6: i64,
-    #[serde(deserialize_with = "string_to_i64::deserialize", serialize_with = "string_to_i64::serialize")]
+    #[serde(
+        deserialize_with = "string_to_i64::deserialize",
+        serialize_with = "string_to_i64::serialize"
+    )]
     pub askp7: i64,
-    #[serde(deserialize_with = "string_to_i64::deserialize", serialize_with = "string_to_i64::serialize")]
+    #[serde(
+        deserialize_with = "string_to_i64::deserialize",
+        serialize_with = "string_to_i64::serialize"
+    )]
     pub askp8: i64,
-    #[serde(deserialize_with = "string_to_i64::deserialize", serialize_with = "string_to_i64::serialize")]
+    #[serde(
+        deserialize_with = "string_to_i64::deserialize",
+        serialize_with = "string_to_i64::serialize"
+    )]
     pub askp9: i64,
-    #[serde(deserialize_with = "string_to_i64::deserialize", serialize_with = "string_to_i64::serialize")]
+    #[serde(
+        deserialize_with = "string_to_i64::deserialize",
+        serialize_with = "string_to_i64::serialize"
+    )]
     pub askp10: i64,
 
     // 매수호가 1~10
-    #[serde(deserialize_with = "string_to_i64::deserialize", serialize_with = "string_to_i64::serialize")]
+    #[serde(
+        deserialize_with = "string_to_i64::deserialize",
+        serialize_with = "string_to_i64::serialize"
+    )]
     pub bidp1: i64,
-    #[serde(deserialize_with = "string_to_i64::deserialize", serialize_with = "string_to_i64::serialize")]
+    #[serde(
+        deserialize_with = "string_to_i64::deserialize",
+        serialize_with = "string_to_i64::serialize"
+    )]
     pub bidp2: i64,
-    #[serde(deserialize_with = "string_to_i64::deserialize", serialize_with = "string_to_i64::serialize")]
+    #[serde(
+        deserialize_with = "string_to_i64::deserialize",
+        serialize_with = "string_to_i64::serialize"
+    )]
     pub bidp3: i64,
-    #[serde(deserialize_with = "string_to_i64::deserialize", serialize_with = "string_to_i64::serialize")]
+    #[serde(
+        deserialize_with = "string_to_i64::deserialize",
+        serialize_with = "string_to_i64::serialize"
+    )]
     pub bidp4: i64,
-    #[serde(deserialize_with = "string_to_i64::deserialize", serialize_with = "string_to_i64::serialize")]
+    #[serde(
+        deserialize_with = "string_to_i64::deserialize",
+        serialize_with = "string_to_i64::serialize"
+    )]
     pub bidp5: i64,
-    #[serde(deserialize_with = "string_to_i64::deserialize", serialize_with = "string_to_i64::serialize")]
+    #[serde(
+        deserialize_with = "string_to_i64::deserialize",
+        serialize_with = "string_to_i64::serialize"
+    )]
     pub bidp6: i64,
-    #[serde(deserialize_with = "string_to_i64::deserialize", serialize_with = "string_to_i64::serialize")]
+    #[serde(
+        deserialize_with = "string_to_i64::deserialize",
+        serialize_with = "string_to_i64::serialize"
+    )]
     pub bidp7: i64,
-    #[serde(deserialize_with = "string_to_i64::deserialize", serialize_with = "string_to_i64::serialize")]
+    #[serde(
+        deserialize_with = "string_to_i64::deserialize",
+        serialize_with = "string_to_i64::serialize"
+    )]
     pub bidp8: i64,
-    #[serde(deserialize_with = "string_to_i64::deserialize", serialize_with = "string_to_i64::serialize")]
+    #[serde(
+        deserialize_with = "string_to_i64::deserialize",
+        serialize_with = "string_to_i64::serialize"
+    )]
     pub bidp9: i64,
-    #[serde(deserialize_with = "string_to_i64::deserialize", serialize_with = "string_to_i64::serialize")]
+    #[serde(
+        deserialize_with = "string_to_i64::deserialize",
+        serialize_with = "string_to_i64::serialize"
+    )]
     pub bidp10: i64,
 
     // 매도호가 잔량 1~10
-    #[serde(deserialize_with = "string_to_i64::deserialize", serialize_with = "string_to_i64::serialize")]
+    #[serde(
+        deserialize_with = "string_to_i64::deserialize",
+        serialize_with = "string_to_i64::serialize"
+    )]
     pub askp_rsqn1: i64,
-    #[serde(deserialize_with = "string_to_i64::deserialize", serialize_with = "string_to_i64::serialize")]
+    #[serde(
+        deserialize_with = "string_to_i64::deserialize",
+        serialize_with = "string_to_i64::serialize"
+    )]
     pub askp_rsqn2: i64,
-    #[serde(deserialize_with = "string_to_i64::deserialize", serialize_with = "string_to_i64::serialize")]
+    #[serde(
+        deserialize_with = "string_to_i64::deserialize",
+        serialize_with = "string_to_i64::serialize"
+    )]
     pub askp_rsqn3: i64,
-    #[serde(deserialize_with = "string_to_i64::deserialize", serialize_with = "string_to_i64::serialize")]
+    #[serde(
+        deserialize_with = "string_to_i64::deserialize",
+        serialize_with = "string_to_i64::serialize"
+    )]
     pub askp_rsqn4: i64,
-    #[serde(deserialize_with = "string_to_i64::deserialize", serialize_with = "string_to_i64::serialize")]
+    #[serde(
+        deserialize_with = "string_to_i64::deserialize",
+        serialize_with = "string_to_i64::serialize"
+    )]
     pub askp_rsqn5: i64,
-    #[serde(deserialize_with = "string_to_i64::deserialize", serialize_with = "string_to_i64::serialize")]
+    #[serde(
+        deserialize_with = "string_to_i64::deserialize",
+        serialize_with = "string_to_i64::serialize"
+    )]
     pub askp_rsqn6: i64,
-    #[serde(deserialize_with = "string_to_i64::deserialize", serialize_with = "string_to_i64::serialize")]
+    #[serde(
+        deserialize_with = "string_to_i64::deserialize",
+        serialize_with = "string_to_i64::serialize"
+    )]
     pub askp_rsqn7: i64,
-    #[serde(deserialize_with = "string_to_i64::deserialize", serialize_with = "string_to_i64::serialize")]
+    #[serde(
+        deserialize_with = "string_to_i64::deserialize",
+        serialize_with = "string_to_i64::serialize"
+    )]
     pub askp_rsqn8: i64,
-    #[serde(deserialize_with = "string_to_i64::deserialize", serialize_with = "string_to_i64::serialize")]
+    #[serde(
+        deserialize_with = "string_to_i64::deserialize",
+        serialize_with = "string_to_i64::serialize"
+    )]
     pub askp_rsqn9: i64,
-    #[serde(deserialize_with = "string_to_i64::deserialize", serialize_with = "string_to_i64::serialize")]
+    #[serde(
+        deserialize_with = "string_to_i64::deserialize",
+        serialize_with = "string_to_i64::serialize"
+    )]
     pub askp_rsqn10: i64,
 
     // 매수호가 잔량 1~10
-    #[serde(deserialize_with = "string_to_i64::deserialize", serialize_with = "string_to_i64::serialize")]
+    #[serde(
+        deserialize_with = "string_to_i64::deserialize",
+        serialize_with = "string_to_i64::serialize"
+    )]
     pub bidp_rsqn1: i64,
-    #[serde(deserialize_with = "string_to_i64::deserialize", serialize_with = "string_to_i64::serialize")]
+    #[serde(
+        deserialize_with = "string_to_i64::deserialize",
+        serialize_with = "string_to_i64::serialize"
+    )]
     pub bidp_rsqn2: i64,
-    #[serde(deserialize_with = "string_to_i64::deserialize", serialize_with = "string_to_i64::serialize")]
+    #[serde(
+        deserialize_with = "string_to_i64::deserialize",
+        serialize_with = "string_to_i64::serialize"
+    )]
     pub bidp_rsqn3: i64,
-    #[serde(deserialize_with = "string_to_i64::deserialize", serialize_with = "string_to_i64::serialize")]
+    #[serde(
+        deserialize_with = "string_to_i64::deserialize",
+        serialize_with = "string_to_i64::serialize"
+    )]
     pub bidp_rsqn4: i64,
-    #[serde(deserialize_with = "string_to_i64::deserialize", serialize_with = "string_to_i64::serialize")]
+    #[serde(
+        deserialize_with = "string_to_i64::deserialize",
+        serialize_with = "string_to_i64::serialize"
+    )]
     pub bidp_rsqn5: i64,
-    #[serde(deserialize_with = "string_to_i64::deserialize", serialize_with = "string_to_i64::serialize")]
+    #[serde(
+        deserialize_with = "string_to_i64::deserialize",
+        serialize_with = "string_to_i64::serialize"
+    )]
     pub bidp_rsqn6: i64,
-    #[serde(deserialize_with = "string_to_i64::deserialize", serialize_with = "string_to_i64::serialize")]
+    #[serde(
+        deserialize_with = "string_to_i64::deserialize",
+        serialize_with = "string_to_i64::serialize"
+    )]
     pub bidp_rsqn7: i64,
-    #[serde(deserialize_with = "string_to_i64::deserialize", serialize_with = "string_to_i64::serialize")]
+    #[serde(
+        deserialize_with = "string_to_i64::deserialize",
+        serialize_with = "string_to_i64::serialize"
+    )]
     pub bidp_rsqn8: i64,
-    #[serde(deserialize_with = "string_to_i64::deserialize", serialize_with = "string_to_i64::serialize")]
+    #[serde(
+        deserialize_with = "string_to_i64::deserialize",
+        serialize_with = "string_to_i64::serialize"
+    )]
     pub bidp_rsqn9: i64,
-    #[serde(deserialize_with = "string_to_i64::deserialize", serialize_with = "string_to_i64::serialize")]
+    #[serde(
+        deserialize_with = "string_to_i64::deserialize",
+        serialize_with = "string_to_i64::serialize"
+    )]
     pub bidp_rsqn10: i64,
 
     /// 총 매도호가 잔량
-    #[serde(deserialize_with = "string_to_i64::deserialize", serialize_with = "string_to_i64::serialize")]
+    #[serde(
+        deserialize_with = "string_to_i64::deserialize",
+        serialize_with = "string_to_i64::serialize"
+    )]
     pub total_askp_rsqn: i64,
 
     /// 총 매수호가 잔량
-    #[serde(deserialize_with = "string_to_i64::deserialize", serialize_with = "string_to_i64::serialize")]
+    #[serde(
+        deserialize_with = "string_to_i64::deserialize",
+        serialize_with = "string_to_i64::serialize"
+    )]
     pub total_bidp_rsqn: i64,
 }
 
@@ -199,23 +325,38 @@ pub struct DailyPriceItem {
     pub stck_bsop_date: chrono::NaiveDate,
 
     /// 시가
-    #[serde(deserialize_with = "string_to_i64::deserialize", serialize_with = "string_to_i64::serialize")]
+    #[serde(
+        deserialize_with = "string_to_i64::deserialize",
+        serialize_with = "string_to_i64::serialize"
+    )]
     pub stck_oprc: i64,
 
     /// 고가
-    #[serde(deserialize_with = "string_to_i64::deserialize", serialize_with = "string_to_i64::serialize")]
+    #[serde(
+        deserialize_with = "string_to_i64::deserialize",
+        serialize_with = "string_to_i64::serialize"
+    )]
     pub stck_hgpr: i64,
 
     /// 저가
-    #[serde(deserialize_with = "string_to_i64::deserialize", serialize_with = "string_to_i64::serialize")]
+    #[serde(
+        deserialize_with = "string_to_i64::deserialize",
+        serialize_with = "string_to_i64::serialize"
+    )]
     pub stck_lwpr: i64,
 
     /// 종가
-    #[serde(deserialize_with = "string_to_i64::deserialize", serialize_with = "string_to_i64::serialize")]
+    #[serde(
+        deserialize_with = "string_to_i64::deserialize",
+        serialize_with = "string_to_i64::serialize"
+    )]
     pub stck_clpr: i64,
 
     /// 누적 거래량
-    #[serde(deserialize_with = "string_to_i64::deserialize", serialize_with = "string_to_i64::serialize")]
+    #[serde(
+        deserialize_with = "string_to_i64::deserialize",
+        serialize_with = "string_to_i64::serialize"
+    )]
     pub acml_vol: i64,
 
     /// 누적 거래대금

@@ -1,0 +1,27 @@
+{
+  "session_date_kst": "YYYY-MM-DD",
+  "scenario_id": "armed-timeout | entry-fill-timeout | exit-fill-timeout",
+  "environment": "paper",
+  "stock_code": "122630",
+  "run_id": null,
+  "run_started_at_kst": null,
+  "run_ended_at_kst": null,
+  "window_minutes": 15,
+  "server_base_url": "http://127.0.0.1:3000",
+  "db_url": "postgres://postgres@localhost:5433/kis_agent",
+  "server_log_file": "logs/server.log",
+  "git_commit": null,
+  "collected_files": {
+    "health": "health.json",
+    "strategy_status_before": "strategy-status-before.json",
+    "strategy_status_after": "strategy-status-after.json",
+    "armed_stats_before": "armed-stats-before.json",
+    "armed_stats_after": "armed-stats-after.json",
+    "active_positions_before": "active-positions-before.json",
+    "active_positions_after": "active-positions-after.json",
+    "event_log": "event-log.csv",
+    "execution_journal": "execution-journal.csv",
+    "server_log": "server.log"
+  },
+  "notes_file": "notes.md"
+}

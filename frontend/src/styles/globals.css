@@ -1,35 +1,217 @@
 @import "tailwindcss";
 
+/* ================================================================
+   디자인 토큰 — 트레이딩 데스크 다크 테마
+   - 색상: 다크 베이스 + 그린(상승) / 오렌지(하락) / 블루(액션)
+   - 의도: 정보 밀도 높음, 명확한 위계, 미세한 광택과 그림자
+   ================================================================ */
 @theme {
-  --color-app-bg: #0A0A0A;
-  --color-card: #111111;
-  --color-chart-bg: #1A1A1A;
-  --color-border: #2A2A2A;
-  --color-text-primary: #F5F5F5;
-  --color-text-muted: #A0A0A0;
-  --color-rise: #00D084;
-  --color-fall: #FF6B35;
-  --color-flat: #666666;
-  --color-accent: #3B82F6;
+  /* --- 표면 (배경 레이어) --- */
+  --color-app-bg: #07090C;
+  --color-card: #0F1217;
+  --color-surface: #0F1217;
+  --color-surface-2: #14181F;
+  --color-surface-3: #1B2029;
+  --color-chart-bg: #0B0E13;
+
+  /* --- 보더 --- */
+  --color-border: #20252E;
+  --color-border-strong: #2F3642;
+  --color-border-subtle: #161A21;
+
+  /* --- 텍스트 --- */
+  --color-text-primary: #ECEEF2;
+  --color-text-secondary: #B7BCC7;
+  --color-text-muted: #7A828F;
+  --color-text-disabled: #4E5663;
+
+  /* --- 시맨틱 (상승/하락/중립/액션) --- */
+  --color-rise: #1FCB8B;
+  --color-rise-strong: #16A372;
+  --color-rise-soft: rgba(31, 203, 139, 0.12);
+  --color-rise-border: rgba(31, 203, 139, 0.35);
+
+  --color-fall: #FF7245;
+  --color-fall-strong: #E65A2D;
+  --color-fall-soft: rgba(255, 114, 69, 0.12);
+  --color-fall-border: rgba(255, 114, 69, 0.35);
+
+  --color-flat: #6B7280;
+
+  --color-accent: #5B8DEF;
+  --color-accent-strong: #4B7AD8;
+  --color-accent-soft: rgba(91, 141, 239, 0.14);
+  --color-accent-border: rgba(91, 141, 239, 0.4);
+
+  --color-warn: #F5B14A;
+  --color-warn-soft: rgba(245, 177, 74, 0.14);
+  --color-info: #38BDF8;
+  --color-danger: #F25555;
+  --color-danger-soft: rgba(242, 85, 85, 0.14);
+
+  /* --- 라운드 --- */
+  --radius-xs: 4px;
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-xl: 16px;
+  --radius-2xl: 20px;
+  --radius-pill: 999px;
+
+  /* --- 그림자 --- */
+  --shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-sm: 0 2px 6px rgba(0, 0, 0, 0.35);
+  --shadow-md: 0 6px 16px rgba(0, 0, 0, 0.4);
+  --shadow-lg: 0 14px 40px rgba(0, 0, 0, 0.55);
+  --shadow-glow-rise: 0 0 0 1px rgba(31, 203, 139, 0.4), 0 0 18px rgba(31, 203, 139, 0.18);
+  --shadow-glow-fall: 0 0 0 1px rgba(255, 114, 69, 0.4), 0 0 18px rgba(255, 114, 69, 0.18);
+  --shadow-glow-accent: 0 0 0 1px rgba(91, 141, 239, 0.45), 0 0 18px rgba(91, 141, 239, 0.22);
+
+  /* --- 타이포그래피 (트레이딩 화면 — 약간 컴팩트) --- */
+  --text-2xs: 10px;
+  --text-xs: 11px;
+  --text-sm: 12px;
+  --text-base: 13px;
+  --text-md: 14px;
+  --text-lg: 16px;
+  --text-xl: 20px;
+  --text-2xl: 26px;
+  --text-3xl: 32px;
+  --text-4xl: 40px;
+
+  /* --- 폰트 패밀리 --- */
+  --font-sans: 'Pretendard', 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+/* ================================================================
+   글로벌 베이스
+   ================================================================ */
+html, body, #root {
+  height: 100%;
 }
 
 body {
-  background-color: var(--color-app-bg);
+  background: radial-gradient(ellipse at top, #0E1218 0%, var(--color-app-bg) 60%);
   color: var(--color-text-primary);
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  font-family: var(--font-sans);
+  font-size: var(--text-base);
+  font-feature-settings: 'cv11', 'ss01', 'ss02';
   margin: 0;
   padding: 0;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
 }
 
-/* 스크롤바 */
+/* 숫자는 항상 tabular */
+.tabular,
+table,
+.font-mono {
+  font-variant-numeric: tabular-nums;
+}
+
+/* 선택 컬러 */
+::selection {
+  background: var(--color-accent-soft);
+  color: var(--color-text-primary);
+}
+
+/* 포커스 링 */
+:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+/* 버튼/입력 기본값 초기화 (브라우저 의존 제거) */
+button {
+  font-family: inherit;
+  font-size: inherit;
+  color: inherit;
+}
+input, select, textarea {
+  font-family: inherit;
+  font-size: inherit;
+  color: inherit;
+  background: transparent;
+}
+
+/* 숫자 입력의 스피너 제거 */
+input[type='number']::-webkit-outer-spin-button,
+input[type='number']::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+input[type='number'] {
+  -moz-appearance: textfield;
+}
+
+/* ================================================================
+   스크롤바 (다크 + 미세)
+   ================================================================ */
 ::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+  width: 8px;
+  height: 8px;
 }
 ::-webkit-scrollbar-track {
-  background: var(--color-app-bg);
+  background: transparent;
 }
 ::-webkit-scrollbar-thumb {
   background: var(--color-border);
-  border-radius: 3px;
+  border-radius: 999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-border-strong);
+}
+
+/* ================================================================
+   애니메이션
+   ================================================================ */
+@keyframes pulse-rise {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(31, 203, 139, 0.45); }
+  50% { box-shadow: 0 0 0 6px rgba(31, 203, 139, 0); }
+}
+@keyframes pulse-fall {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(255, 114, 69, 0.45); }
+  50% { box-shadow: 0 0 0 6px rgba(255, 114, 69, 0); }
+}
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+@keyframes fade-in {
+  from { opacity: 0; transform: translateY(2px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.animate-pulse-rise { animation: pulse-rise 2s ease-out infinite; }
+.animate-pulse-fall { animation: pulse-fall 2s ease-out infinite; }
+.animate-fade-in    { animation: fade-in 200ms ease-out; }
+
+.skeleton {
+  background: linear-gradient(
+    90deg,
+    var(--color-surface-2) 0%,
+    var(--color-surface-3) 50%,
+    var(--color-surface-2) 100%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.6s linear infinite;
+  border-radius: var(--radius-sm);
+}
+
+/* ================================================================
+   재사용 가능한 시각 효과 (커스텀 유틸리티)
+   ================================================================ */
+.surface-card {
+  background: linear-gradient(180deg, var(--color-surface) 0%, var(--color-surface-2) 100%);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+}
+.surface-card-hover:hover {
+  border-color: var(--color-border-strong);
+  background: linear-gradient(180deg, var(--color-surface-2) 0%, var(--color-surface-3) 100%);
+}
+.divider-soft {
+  border-top: 1px solid var(--color-border-subtle);
 }

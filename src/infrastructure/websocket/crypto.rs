@@ -1,8 +1,8 @@
 use aes::Aes256;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use cbc::cipher::{BlockDecryptMut, KeyIvInit};
 use cbc::cipher::block_padding::Pkcs7;
+use cbc::cipher::{BlockDecryptMut, KeyIvInit};
 
 use crate::domain::error::KisError;
 
@@ -18,16 +18,19 @@ pub fn aes_cbc_base64_decrypt(key: &str, iv: &str, cipher_text: &str) -> Result<
 
     if key_bytes.len() != 32 {
         return Err(KisError::Internal(format!(
-            "AES key 길이 오류: {} (32바이트 필요)", key_bytes.len()
+            "AES key 길이 오류: {} (32바이트 필요)",
+            key_bytes.len()
         )));
     }
     if iv_bytes.len() != 16 {
         return Err(KisError::Internal(format!(
-            "AES IV 길이 오류: {} (16바이트 필요)", iv_bytes.len()
+            "AES IV 길이 오류: {} (16바이트 필요)",
+            iv_bytes.len()
         )));
     }
 
-    let encrypted = BASE64.decode(cipher_text)
+    let encrypted = BASE64
+        .decode(cipher_text)
         .map_err(|e| KisError::ParseError(format!("Base64 디코딩 실패: {e}")))?;
 
     let decryptor = Aes256CbcDec::new_from_slices(key_bytes, iv_bytes)

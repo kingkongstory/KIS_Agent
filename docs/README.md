@@ -6,6 +6,20 @@ KIS_Agent 프로젝트의 개발 참조 문서이다. 한국투자증권 Open Tr
 
 ## 문서 목차
 
+### 전략 문서
+
+| 문서 | 설명 |
+|------|------|
+| [ORB+FVG 전략](strategy/ORB_FVG_STRATEGY.md) | 현재 ORB+FVG 전략 규칙, 백테스트 결과, 운영 절차 |
+| [레버리지·인버스 ETF 규칙 초안](strategy/etf-leverage-inverse-rule-draft.md) | ETF 전용 지수 레짐, NAV 괴리, 호가 품질 필터를 추가한 보완 초안 |
+
+### 운영 점검
+
+| 문서 | 설명 |
+|------|------|
+| [실행 타이밍 점검](monitoring/2026-04-18-execution-timing-review.md) | 신호, 주문, 체결, 포지션 반영, 청산 반영이 실제로 얼마나 정합적으로 동작하는지 점검한 문서 |
+| [실행 타이밍 구현 계획](monitoring/2026-04-18-execution-timing-implementation-plan.md) | 실행 타이밍 점검 후속 구현 계획. 상태 전이 불변식, 금지사항, 구현 단계, 수용 기준 포함 |
+
 ### API 레퍼런스
 
 | 문서 | 설명 |

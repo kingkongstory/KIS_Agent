@@ -1,8 +1,14 @@
+pub mod armed_taxonomy;
 pub mod backtest;
 pub mod candle;
+pub mod execution_actor;
 pub mod fvg;
+pub mod gate_producer;
 pub mod live_runner;
+pub mod nav_gate_engine;
 pub mod orb_fvg;
 pub mod orb_vwap_pullback;
 pub mod parity;
+pub mod regime_engine;
+pub mod restart_recovery;
 pub mod types;

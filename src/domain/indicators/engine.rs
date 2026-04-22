@@ -38,7 +38,10 @@ impl IndicatorEngine {
                 Some(Box::new(Ema::new(period)))
             }
             "rsi" => {
-                let period = parts.get(1).and_then(|p| p.parse::<usize>().ok()).unwrap_or(14);
+                let period = parts
+                    .get(1)
+                    .and_then(|p| p.parse::<usize>().ok())
+                    .unwrap_or(14);
                 Some(Box::new(Rsi::new(period)))
             }
             "macd" => Some(Box::new(Macd::standard())),
@@ -94,8 +97,7 @@ mod tests {
 
         let candles: Vec<Candle> = (0..30)
             .map(|i| Candle {
-                date: NaiveDate::from_ymd_opt(2025, 1, 1).unwrap()
-                    + chrono::Duration::days(i),
+                date: NaiveDate::from_ymd_opt(2025, 1, 1).unwrap() + chrono::Duration::days(i),
                 open: 100 + i as i64,
                 high: 105 + i as i64,
                 low: 95 + i as i64,

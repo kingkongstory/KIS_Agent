@@ -44,11 +44,7 @@ impl SqliteCache {
     }
 
     /// 캔들 데이터 저장 (UPSERT)
-    pub async fn save_candles(
-        &self,
-        stock_code: &str,
-        candles: &[Candle],
-    ) -> Result<(), KisError> {
+    pub async fn save_candles(&self, stock_code: &str, candles: &[Candle]) -> Result<(), KisError> {
         for candle in candles {
             sqlx::query(
                 "INSERT OR REPLACE INTO ohlcv (stock_code, date, open, high, low, close, volume)

@@ -2,6 +2,17 @@ import { useState, useCallback, useRef, useEffect } from 'react';
 import { searchStocks } from '../../api/quotations';
 import { useStockStore } from '../../stores/stockStore';
 import type { StockSearchResult } from '../../types/stock';
+import { Input } from '../ui';
+import { cn } from '../../utils/cn';
+
+function SearchIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="w-4 h-4">
+      <circle cx="11" cy="11" r="7" />
+      <path d="M21 21l-4.35-4.35" strokeLinecap="round" />
+    </svg>
+  );
+}
 
 export function StockSearch() {
   const [query, setQuery] = useState('');
@@ -10,30 +21,30 @@ export function StockSearch() {
   const inputRef = useRef<HTMLInputElement>(null);
   const { setSelectedCode } = useStockStore();
 
-  const handleSearch = useCallback(async (q: string) => {
-    setQuery(q);
-    if (q.length < 2) {
-      setResults([]);
-      setOpen(false);
-      return;
-    }
-
-    // 6자리 숫자면 바로 종목코드로 설정
-    if (/^\d{6}$/.test(q)) {
-      setSelectedCode(q);
-      setQuery('');
-      setOpen(false);
-      return;
-    }
-
-    try {
-      const data = await searchStocks(q);
-      setResults(data);
-      setOpen(data.length > 0);
-    } catch {
-      setResults([]);
-    }
-  }, [setSelectedCode]);
+  const handleSearch = useCallback(
+    async (q: string) => {
+      setQuery(q);
+      if (q.length < 2) {
+        setResults([]);
+        setOpen(false);
+        return;
+      }
+      if (/^\d{6}$/.test(q)) {
+        setSelectedCode(q);
+        setQuery('');
+        setOpen(false);
+        return;
+      }
+      try {
+        const data = await searchStocks(q);
+        setResults(data);
+        setOpen(data.length > 0);
+      } catch {
+        setResults([]);
+      }
+    },
+    [setSelectedCode],
+  );
 
   const handleSelect = (code: string) => {
     setSelectedCode(code);
@@ -41,7 +52,6 @@ export function StockSearch() {
     setOpen(false);
   };
 
-  // Ctrl+K 단축키
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
@@ -59,24 +69,33 @@ export function StockSearch() {
 
   return (
     <div className="relative">
-      <input
+      <Input
         ref={inputRef}
-        type="text"
         value={query}
         onChange={(e) => handleSearch(e.target.value)}
-        placeholder="종목 검색 (Ctrl+K)"
-        className="w-full bg-app-bg border border-border rounded px-3 py-1 text-sm text-text-primary placeholder-text-muted focus:outline-none focus:border-accent"
+        placeholder="종목 검색"
+        leftIcon={<SearchIcon />}
+        rightAddon={
+          <kbd className="px-1.5 py-0.5 rounded bg-surface-3 border border-border text-2xs font-mono text-text-muted">
+            Ctrl+K
+          </kbd>
+        }
       />
       {open && results.length > 0 && (
-        <ul className="absolute top-full left-0 right-0 mt-1 bg-card border border-border rounded shadow-lg z-50 max-h-60 overflow-auto">
+        <ul
+          className={cn(
+            'absolute top-full left-0 right-0 mt-1.5 z-50',
+            'surface-card shadow-md p-1 max-h-72 overflow-auto',
+          )}
+        >
           {results.map((r) => (
             <li
               key={r.stock_code}
               onClick={() => handleSelect(r.stock_code)}
-              className="px-3 py-2 hover:bg-border/50 cursor-pointer flex justify-between text-sm"
+              className="px-2.5 py-2 rounded-sm hover:bg-surface-3 cursor-pointer flex items-center justify-between text-sm transition-colors"
             >
-              <span>{r.stock_name}</span>
-              <span className="text-text-muted">{r.stock_code}</span>
+              <span className="text-text-primary">{r.stock_name}</span>
+              <span className="text-text-muted font-mono text-xs">{r.stock_code}</span>
             </li>
           ))}
         </ul>

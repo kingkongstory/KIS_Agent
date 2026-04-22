@@ -138,14 +138,17 @@ async fn get_health(State(state): State<AppState>) -> Json<HealthResponse> {
     // 활성 러너 목록
     let active_runners: Vec<String> = {
         let statuses = state.strategy_manager.statuses.read().await;
-        statuses.values()
+        statuses
+            .values()
             .filter(|s| s.active)
             .map(|s| s.code.clone())
             .collect()
     };
 
     // EventLogger 실패 카운터
-    let event_logger_fail_count = state.strategy_manager.event_logger
+    let event_logger_fail_count = state
+        .strategy_manager
+        .event_logger
         .as_ref()
         .map(|el| el.fail_count())
         .unwrap_or(0);
@@ -163,7 +166,13 @@ async fn get_health(State(state): State<AppState>) -> Json<HealthResponse> {
         .await
         .unwrap_or_default();
 
-        let get = |t: &str| counts.iter().find(|(k, _)| k == t).map(|(_, v)| *v).unwrap_or(0);
+        let get = |t: &str| {
+            counts
+                .iter()
+                .find(|(k, _)| k == t)
+                .map(|(_, v)| *v)
+                .unwrap_or(0)
+        };
         EventSummary {
             ws_reconnect: get("ws_reconnect"),
             api_error: get("api_error"),
@@ -173,7 +182,14 @@ async fn get_health(State(state): State<AppState>) -> Json<HealthResponse> {
             exit_market: get("exit_market"),
         }
     } else {
-        EventSummary { ws_reconnect: 0, api_error: 0, ws_tick_gap: 0, entry_executed: 0, exit_tp: 0, exit_market: 0 }
+        EventSummary {
+            ws_reconnect: 0,
+            api_error: 0,
+            ws_tick_gap: 0,
+            entry_executed: 0,
+            exit_tp: 0,
+            exit_market: 0,
+        }
     };
 
     // WS 상태 스냅샷. AppState 에 ws_client 가 주입된 경우에만 채워진다.
@@ -190,7 +206,11 @@ async fn get_health(State(state): State<AppState>) -> Json<HealthResponse> {
             .unwrap_or(120);
         let tick_stale = match snap.tick_age_secs() {
             Some(age) => in_market && age > threshold,
-            None => in_market && (now_t - chrono::NaiveTime::from_hms_opt(9, 10, 0).unwrap()).num_seconds() > 0,
+            None => {
+                in_market
+                    && (now_t - chrono::NaiveTime::from_hms_opt(9, 10, 0).unwrap()).num_seconds()
+                        > 0
+            }
         };
         (Some(snap), tick_stale)
     } else {
@@ -217,12 +237,15 @@ async fn get_daily_report(
     };
 
     let today = chrono::Local::now().date_naive();
-    let from = q.from.as_deref()
+    let from = q
+        .from
+        .as_deref()
         .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
         .unwrap_or(today);
-    let to = q.to.as_deref()
-        .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
-        .unwrap_or(today);
+    let to =
+        q.to.as_deref()
+            .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
+            .unwrap_or(today);
 
     let rows: Vec<DailyReportRow> = sqlx::query_as(
         "SELECT date, stock_code, total_trades, wins, losses, win_rate, total_pnl_pct,
@@ -240,9 +263,21 @@ async fn get_daily_report(
     Json(rows)
 }
 
+/// 2026-04-19 PR #2.e: 전체 러너의 armed watch 지표.
+///
+/// `ArmedWatchStats` (이유별 카운터 + duration + outcome별 평균) 를 그대로 노출.
+/// 운영 대시보드에서 drift_exceeded / preflight_failed / cutoff / stopped 빈도와
+/// ready/aborted 평균 지연을 즉시 확인할 수 있다.
+async fn get_armed_stats(
+    State(state): State<AppState>,
+) -> Json<Vec<crate::presentation::routes::strategy::ArmedStatsEntry>> {
+    Json(state.strategy_manager.snapshot_armed_stats().await)
+}
+
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/v1/monitoring/events", get(get_events))
         .route("/api/v1/monitoring/health", get(get_health))
         .route("/api/v1/monitoring/daily-report", get(get_daily_report))
+        .route("/api/v1/monitoring/armed-stats", get(get_armed_stats))
 }

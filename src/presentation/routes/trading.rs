@@ -19,9 +19,9 @@ async fn place_order(
     State(state): State<AppState>,
     Json(dto): Json<OrderRequestDto>,
 ) -> Result<Json<OrderResponseDto>, AppError> {
-    let request = dto.into_domain().map_err(|e| {
-        AppError(crate::domain::error::KisError::OrderValidation(e))
-    })?;
+    let request = dto
+        .into_domain()
+        .map_err(|e| AppError(crate::domain::error::KisError::OrderValidation(e)))?;
     let response = state.trading.place_order(request).await?;
     Ok(Json(response))
 }
@@ -45,7 +45,7 @@ async fn modify_order(
         _ => {
             return Err(AppError(crate::domain::error::KisError::OrderValidation(
                 format!("잘못된 주문 유형: {}", body.order_type),
-            )))
+            )));
         }
     };
 

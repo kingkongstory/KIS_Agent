@@ -214,7 +214,14 @@ mod tests {
         // 같은 호출 안에서 1) BE(sl→entry)로 이동, 2) 트레일링 개선(sl→best-5) 이 연쇄된다.
         // trailing_dist = 0.05R * 100 = 5, new_sl = 10020 - 5 = 10015 ≥ entry → 개선.
         let u = update_best_and_trailing(
-            PositionSide::Long, entry, &mut best, &mut sl, &mut reached, original_risk, 10_020, &cfg,
+            PositionSide::Long,
+            entry,
+            &mut best,
+            &mut sl,
+            &mut reached,
+            original_risk,
+            10_020,
+            &cfg,
         );
         assert!(u.reached_1r_newly);
         assert!(u.trailing_changed);
@@ -239,7 +246,14 @@ mod tests {
 
         // 현재 favorable 10_050 (후퇴). best 변경 없음, sl 개선 없음.
         let u = update_best_and_trailing(
-            PositionSide::Long, entry, &mut best, &mut sl, &mut reached, original_risk, 10_050, &cfg,
+            PositionSide::Long,
+            entry,
+            &mut best,
+            &mut sl,
+            &mut reached,
+            original_risk,
+            10_050,
+            &cfg,
         );
         assert!(!u.best_price_changed);
         assert!(!u.trailing_changed);

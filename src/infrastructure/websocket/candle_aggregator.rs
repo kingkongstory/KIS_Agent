@@ -82,6 +82,13 @@ pub struct CompletedCandle {
     /// true = WebSocket 실시간 수집 (OHLCV 정확), false = 외부 백필 (종가 근사)
     #[serde(skip)]
     pub is_realtime: bool,
+    /// 2026-04-17 v3 불변식 #2 P1: 이 캔들의 시간 단위 (분).
+    /// WS tick 집계 = 1, Yahoo/Naver 5 분봉 백필 = 5, DB preload 는 저장값.
+    /// canonical 5m 정규화에서 1m→5m 집계 대상과 그대로 사용 대상을 구분.
+    /// `is_realtime` 과 독립 — is_realtime 은 "실시간 vs 백필", interval_min 은
+    /// 순수 granularity 메타.
+    #[serde(skip)]
+    pub interval_min: u32,
 }
 
 /// WebSocket 틱 → 1분봉 실시간 집계기
@@ -94,6 +101,24 @@ pub struct CandleAggregator {
     store: Option<Arc<PostgresStore>>,
     /// Yahoo OR 교체 실패 단계 (프론트엔드 경고 표시용)
     or_refresh_failures: Arc<RwLock<Vec<String>>>,
+}
+
+/// 동일 시각이라도 granularity(1m/5m)가 다르면 함께 유지한다.
+/// canonical merge 단계가 `interval_min` 으로 최종 우선순위를 결정한다.
+fn upsert_completed_bar(existing: &mut Vec<CompletedCandle>, bar: CompletedCandle) {
+    existing.retain(|e| !(e.time == bar.time && e.interval_min == bar.interval_min));
+    existing.push(bar);
+    existing.sort_by(|a, b| {
+        a.time
+            .cmp(&b.time)
+            .then_with(|| a.interval_min.cmp(&b.interval_min))
+    });
+}
+
+impl Default for CandleAggregator {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CandleAggregator {
@@ -118,7 +143,10 @@ impl CandleAggregator {
 
     /// Yahoo OR 교체 실패 기록 (프론트엔드 경고 표시용)
     pub async fn mark_or_refresh_failed(&self, stage: &str) {
-        self.or_refresh_failures.write().await.push(stage.to_string());
+        self.or_refresh_failures
+            .write()
+            .await
+            .push(stage.to_string());
     }
 
     /// Yahoo OR 교체 실패 목록 조회
@@ -167,8 +195,7 @@ impl CandleAggregator {
                     let parts: Vec<&str> = c.time.split(':').collect();
                     let h: u32 = parts.first().and_then(|s| s.parse().ok()).unwrap_or(99);
                     let m: u32 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-                    NaiveTime::from_hms_opt(h, m, 0)
-                        .is_some_and(|t| t >= or_start && t < or_end)
+                    NaiveTime::from_hms_opt(h, m, 0).is_some_and(|t| t >= or_start && t < or_end)
                 })
             })
         })
@@ -188,20 +215,29 @@ impl CandleAggregator {
         for code in stock_codes {
             match store.get_minute_ohlcv(code, start, end, 1).await {
                 Ok(candles) if !candles.is_empty() => {
-                    let bars: Vec<CompletedCandle> = candles.iter().map(|c| {
-                        // OHLC에 범위가 있으면 실시간 데이터 (FVG 탐색 허용)
-                        let has_range = c.open != c.close || c.high != c.low;
-                        CompletedCandle {
-                            stock_code: code.to_string(),
-                            time: format!("{:02}:{:02}", c.datetime.time().hour(), c.datetime.time().minute()),
-                            open: c.open,
-                            high: c.high,
-                            low: c.low,
-                            close: c.close,
-                            volume: c.volume as u64,
-                            is_realtime: has_range,
-                        }
-                    }).collect();
+                    let bars: Vec<CompletedCandle> = candles
+                        .iter()
+                        .map(|c| {
+                            // OHLC에 범위가 있으면 실시간 데이터 (FVG 탐색 허용)
+                            let has_range = c.open != c.close || c.high != c.low;
+                            CompletedCandle {
+                                stock_code: code.to_string(),
+                                time: format!(
+                                    "{:02}:{:02}",
+                                    c.datetime.time().hour(),
+                                    c.datetime.time().minute()
+                                ),
+                                open: c.open,
+                                high: c.high,
+                                low: c.low,
+                                close: c.close,
+                                volume: c.volume as u64,
+                                is_realtime: has_range,
+                                // v3 P1: DB 1분봉 preload
+                                interval_min: 1,
+                            }
+                        })
+                        .collect();
                     let count = bars.len();
                     completed.insert(code.to_string(), bars);
                     total += count;
@@ -294,21 +330,18 @@ impl CandleAggregator {
                                 close: c.close,
                                 volume: c.volume as u64,
                                 is_realtime: false,
+                                // v3 P1: DB 5분봉 preload (Yahoo/Naver 백필)
+                                interval_min: 5,
                             })
                             .collect();
 
                         let count = bars.len();
                         let existing = completed.entry((*code).to_string()).or_default();
                         for bar in bars {
-                            // 실시간(ws) 캔들이 동일 시각에 있으면 유지, 외부 백필 자리는 덮어쓰기
-                            let has_ws = existing.iter().any(|e| e.time == bar.time && e.is_realtime);
-                            if has_ws {
-                                continue;
-                            }
-                            existing.retain(|e| e.time != bar.time);
-                            existing.push(bar);
+                            // 1m WS와 5m backfill을 같은 시각에 함께 유지한다.
+                            // 과거 완료 버킷의 진짜 우선순위 결정은 canonical merge가 담당.
+                            upsert_completed_bar(existing, bar);
                         }
-                        existing.sort_by(|a, b| a.time.cmp(&b.time));
                         info!("{}: Yahoo 5m → 캐시 리로드 {}건", code, count);
                     }
                     Ok(_) => {
@@ -329,13 +362,15 @@ impl CandleAggregator {
         all_ok
     }
 
-    /// 장중 Yahoo OR 교체 — OR 구간(09:00~09:30) 캔들을 Yahoo 5분봉으로 강제 교체.
+    /// 장중 Yahoo OR 교체 — OR 구간(09:00~09:30) 품질 보정을 위해 Yahoo 5분봉을 갱신.
     ///
     /// WS 집계 5분봉은 동시호가 데이터를 포함하지 않아 OR OHLC가 백테스트(Yahoo)와 다를 수 있음.
-    /// 이 메서드는 OR 구간만 Yahoo로 교체하고, 09:30 이후 WS 캔들은 유지.
+    /// 1분 WS 캔들은 유지하고, 같은 시각의 5분 backfill만 교체/보강한다.
     /// 비동기 fire-and-forget으로 호출되며, 실패해도 기존 WS OR이 유지됨 (안전망).
     pub async fn refresh_or_from_yahoo(&self, stock_codes: &[&str]) -> bool {
-        let Some(ref store) = self.store else { return false };
+        let Some(ref store) = self.store else {
+            return false;
+        };
 
         let collector = YahooMinuteCollector::new(Arc::clone(store));
         let mut any_replaced = false;
@@ -344,8 +379,14 @@ impl CandleAggregator {
             // Yahoo 5분봉 수집 → DB 저장
             match collector.collect(code, "5m", "1d", 5).await {
                 Ok(n) if n > 0 => info!("{}: Yahoo OR 교체용 {}건 수집", code, n),
-                Ok(_) => { warn!("{}: Yahoo OR 교체 — 응답 0건, WS 유지", code); continue; }
-                Err(e) => { warn!("{}: Yahoo OR 교체 실패: {e}, WS 유지", code); continue; }
+                Ok(_) => {
+                    warn!("{}: Yahoo OR 교체 — 응답 0건, WS 유지", code);
+                    continue;
+                }
+                Err(e) => {
+                    warn!("{}: Yahoo OR 교체 실패: {e}, WS 유지", code);
+                    continue;
+                }
             }
 
             // DB에서 5분봉 리로드 → OR 구간(09:00~09:30)만 강제 교체
@@ -356,34 +397,54 @@ impl CandleAggregator {
 
             match store.get_minute_ohlcv(code, start, end, 5).await {
                 Ok(candles) if !candles.is_empty() => {
-                    let bars: Vec<CompletedCandle> = candles.iter().map(|c| CompletedCandle {
-                        stock_code: code.to_string(),
-                        time: format!("{:02}:{:02}", c.datetime.time().hour(), c.datetime.time().minute()),
-                        open: c.open, high: c.high, low: c.low, close: c.close,
-                        volume: c.volume as u64,
-                        is_realtime: false,
-                    }).collect();
+                    let bars: Vec<CompletedCandle> = candles
+                        .iter()
+                        .map(|c| CompletedCandle {
+                            stock_code: code.to_string(),
+                            time: format!(
+                                "{:02}:{:02}",
+                                c.datetime.time().hour(),
+                                c.datetime.time().minute()
+                            ),
+                            open: c.open,
+                            high: c.high,
+                            low: c.low,
+                            close: c.close,
+                            volume: c.volume as u64,
+                            is_realtime: false,
+                            // v3 P1: Yahoo OR refresh, 5분봉 DB reload
+                            interval_min: 5,
+                        })
+                        .collect();
 
                     let mut completed = self.completed.write().await;
                     let existing = completed.entry(code.to_string()).or_default();
                     let mut replaced = 0;
                     for bar in &bars {
                         if bar.time.as_str() <= or_cutoff {
-                            // OR 구간: WS 캔들 제거 → Yahoo로 교체
-                            let before = existing.len();
-                            existing.retain(|e| e.time != bar.time);
-                            if existing.len() < before { replaced += 1; }
-                            existing.push(bar.clone());
+                            // OR 구간: 같은 5m backfill만 Yahoo로 교체한다.
+                            // 1m WS는 유지하고 canonical precedence에서 5m를 우선한다.
+                            if existing
+                                .iter()
+                                .any(|e| e.time == bar.time && e.interval_min == 5)
+                            {
+                                replaced += 1;
+                            }
+                            upsert_completed_bar(existing, bar.clone());
                         }
-                        // 09:30 이후: WS 있으면 유지, 없으면 Yahoo 추가 (기존 로직)
-                        else if !existing.iter().any(|e| e.time == bar.time && e.is_realtime) {
-                            existing.retain(|e| e.time != bar.time);
-                            existing.push(bar.clone());
+                        // 09:30 이후도 completed 5m backfill을 유지한다.
+                        // 1m WS는 함께 남겨 두고 canonical merge가 완료 버킷에서 5m를 선택한다.
+                        else {
+                            upsert_completed_bar(existing, bar.clone());
                         }
                     }
-                    existing.sort_by(|a, b| a.time.cmp(&b.time));
-                    info!("{}: Yahoo OR 교체 완료 — {}건 교체 (09:00~09:30)", code, replaced);
-                    if replaced > 0 { any_replaced = true; }
+                    info!(
+                        "{}: Yahoo OR 교체 완료 — {}건 교체 (09:00~09:30)",
+                        code, replaced
+                    );
+                    if replaced > 0 {
+                        any_replaced = true;
+                    }
                 }
                 _ => warn!("{}: Yahoo OR 교체 — DB 리로드 실패, WS 유지", code),
             }
@@ -405,17 +466,24 @@ impl CandleAggregator {
         for code in stock_codes {
             match fetch_naver_today_ticks(&client, code).await {
                 Ok(ticks) if !ticks.is_empty() => {
-                    let bars: Vec<CompletedCandle> = ticks.iter()
+                    let bars: Vec<CompletedCandle> = ticks
+                        .iter()
                         .filter(|t| t.datetime.date() == today)
                         .map(|t| CompletedCandle {
                             stock_code: code.to_string(),
-                            time: format!("{:02}:{:02}", t.datetime.time().hour(), t.datetime.time().minute()),
+                            time: format!(
+                                "{:02}:{:02}",
+                                t.datetime.time().hour(),
+                                t.datetime.time().minute()
+                            ),
                             open: t.close,
                             high: t.close,
                             low: t.close,
                             close: t.close,
                             volume: 0,
                             is_realtime: false,
+                            // v3 P1: Naver tick 데이터 (분 단위)
+                            interval_min: 1,
                         })
                         .collect();
 
@@ -426,17 +494,24 @@ impl CandleAggregator {
 
                     // DB에도 저장 (다음 재시작 시 활용)
                     if let Some(ref store) = self.store {
-                        let db_candles: Vec<MinuteCandle> = bars.iter().map(|b| {
-                            let parts: Vec<&str> = b.time.split(':').collect();
-                            let h: u32 = parts[0].parse().unwrap_or(0);
-                            let m: u32 = parts[1].parse().unwrap_or(0);
-                            let time = NaiveTime::from_hms_opt(h, m, 0).unwrap_or_default();
-                            MinuteCandle {
-                                datetime: NaiveDateTime::new(today, time),
-                                open: b.open, high: b.high, low: b.low, close: b.close,
-                                volume: 0, interval_min: 1,
-                            }
-                        }).collect();
+                        let db_candles: Vec<MinuteCandle> = bars
+                            .iter()
+                            .map(|b| {
+                                let parts: Vec<&str> = b.time.split(':').collect();
+                                let h: u32 = parts[0].parse().unwrap_or(0);
+                                let m: u32 = parts[1].parse().unwrap_or(0);
+                                let time = NaiveTime::from_hms_opt(h, m, 0).unwrap_or_default();
+                                MinuteCandle {
+                                    datetime: NaiveDateTime::new(today, time),
+                                    open: b.open,
+                                    high: b.high,
+                                    low: b.low,
+                                    close: b.close,
+                                    volume: 0,
+                                    interval_min: 1,
+                                }
+                            })
+                            .collect();
                         if let Err(e) = store.save_minute_ohlcv(code, &db_candles).await {
                             warn!("{}: 네이버 분봉 DB 저장 실패: {e}", code);
                         }
@@ -484,7 +559,7 @@ impl CandleAggregator {
                         let (slot, _) = parse_tick_time(&exec.time);
 
                         // 장중 시간 필터 (09:00 ~ 15:30)
-                        if slot < 540 || slot > 930 {
+                        if !(540..=930).contains(&slot) {
                             continue;
                         }
 
@@ -505,9 +580,14 @@ impl CandleAggregator {
                                 let closed = partial.to_update(true);
                                 debug!(
                                     "분봉 완성: {} {} O={} H={} L={} C={} V={} ({}틱)",
-                                    closed.stock_code, closed.time,
-                                    closed.open, closed.high, closed.low, closed.close,
-                                    closed.volume, partial.tick_count
+                                    closed.stock_code,
+                                    closed.time,
+                                    closed.open,
+                                    closed.high,
+                                    closed.low,
+                                    closed.close,
+                                    closed.volume,
+                                    partial.tick_count
                                 );
 
                                 // 완성 캔들 저장
@@ -525,6 +605,8 @@ impl CandleAggregator {
                                             close: closed.close,
                                             volume: closed.volume,
                                             is_realtime: true,
+                                            // v3 P1: WS tick 집계 1분봉 완성
+                                            interval_min: 1,
                                         });
                                 }
 
@@ -561,25 +643,28 @@ impl CandleAggregator {
                                 let closed = partial.to_update(true);
                                 info!(
                                     "강제 완성: {} {} O={} H={} L={} C={} V={}",
-                                    closed.stock_code, closed.time,
-                                    closed.open, closed.high, closed.low, closed.close,
+                                    closed.stock_code,
+                                    closed.time,
+                                    closed.open,
+                                    closed.high,
+                                    closed.low,
+                                    closed.close,
                                     closed.volume,
                                 );
                                 {
                                     let mut mem = completed.write().await;
-                                    mem
-                                        .entry(code)
-                                        .or_default()
-                                        .push(CompletedCandle {
-                                            stock_code: closed.stock_code.clone(),
-                                            time: closed.time.clone(),
-                                            open: closed.open,
-                                            high: closed.high,
-                                            low: closed.low,
-                                            close: closed.close,
-                                            volume: closed.volume,
-                                            is_realtime: true,
-                                        });
+                                    mem.entry(code).or_default().push(CompletedCandle {
+                                        stock_code: closed.stock_code.clone(),
+                                        time: closed.time.clone(),
+                                        open: closed.open,
+                                        high: closed.high,
+                                        low: closed.low,
+                                        close: closed.close,
+                                        volume: closed.volume,
+                                        is_realtime: true,
+                                        // v3 P1: 강제 완성 1분봉 (60s 무활동 경로)
+                                        interval_min: 1,
+                                    });
                                 }
                                 if let Some(ref db) = store {
                                     save_candle_to_db(db, &closed).await;
@@ -602,36 +687,53 @@ struct NaverTick {
 }
 
 /// 네이버 금융에서 당일 1분 틱 조회
-async fn fetch_naver_today_ticks(client: &reqwest::Client, stock_code: &str) -> Result<Vec<NaverTick>, String> {
+async fn fetch_naver_today_ticks(
+    client: &reqwest::Client,
+    stock_code: &str,
+) -> Result<Vec<NaverTick>, String> {
     let url = format!(
         "https://fchart.stock.naver.com/siseJson.naver?symbol={stock_code}&requestType=1&startTime=20260101&endTime=20261231&timeframe=minute"
     );
 
-    let resp = client.get(&url)
+    let resp = client
+        .get(&url)
         .header("User-Agent", "Mozilla/5.0")
-        .send().await
+        .send()
+        .await
         .map_err(|e| format!("네이버 요청 실패: {e}"))?;
 
-    let raw = resp.text().await.map_err(|e| format!("응답 읽기 실패: {e}"))?;
+    let raw = resp
+        .text()
+        .await
+        .map_err(|e| format!("응답 읽기 실패: {e}"))?;
     let cleaned = raw.replace('\'', "\"");
 
-    let parsed: Vec<Vec<serde_json::Value>> = serde_json::from_str(&cleaned)
-        .map_err(|e| format!("파싱 실패: {e}"))?;
+    let parsed: Vec<Vec<serde_json::Value>> =
+        serde_json::from_str(&cleaned).map_err(|e| format!("파싱 실패: {e}"))?;
 
     let market_open = NaiveTime::from_hms_opt(9, 0, 0).unwrap();
     let market_close = NaiveTime::from_hms_opt(15, 30, 0).unwrap();
 
-    let ticks: Vec<NaverTick> = parsed.into_iter()
+    let ticks: Vec<NaverTick> = parsed
+        .into_iter()
         .skip(1)
         .filter_map(|row| {
-            if row.len() < 6 { return None; }
+            if row.len() < 6 {
+                return None;
+            }
             let dt_str = row[0].as_str()?.trim().trim_matches('"');
-            if dt_str.len() != 12 { return None; }
+            if dt_str.len() != 12 {
+                return None;
+            }
             let datetime = NaiveDateTime::parse_from_str(dt_str, "%Y%m%d%H%M").ok()?;
             let time = datetime.time();
-            if time < market_open || time > market_close { return None; }
+            if time < market_open || time > market_close {
+                return None;
+            }
             let close = row[4].as_i64()?;
-            if close <= 0 { return None; }
+            if close <= 0 {
+                return None;
+            }
             Some(NaverTick { datetime, close })
         })
         .collect();
@@ -681,9 +783,26 @@ fn parse_tick_time(time_str: &str) -> (u32, String) {
 mod tests {
     use super::*;
 
+    fn completed(time: &str, interval_min: u32, is_realtime: bool) -> CompletedCandle {
+        CompletedCandle {
+            stock_code: "122630".to_string(),
+            time: time.to_string(),
+            open: 100,
+            high: 110,
+            low: 90,
+            close: 105,
+            volume: 1,
+            is_realtime,
+            interval_min,
+        }
+    }
+
     #[test]
     fn test_parse_tick_time() {
-        assert_eq!(parse_tick_time("093015"), (9 * 60 + 30, "09:30".to_string()));
+        assert_eq!(
+            parse_tick_time("093015"),
+            (9 * 60 + 30, "09:30".to_string())
+        );
         assert_eq!(parse_tick_time("150000"), (15 * 60, "15:00".to_string()));
         assert_eq!(parse_tick_time("090000"), (540, "09:00".to_string()));
     }
@@ -829,5 +948,44 @@ mod tests {
         assert_eq!(candles[0].low, 72000);
         assert_eq!(candles[0].close, 72500);
         assert_eq!(candles[0].volume, 300);
+    }
+
+    #[test]
+    fn upsert_keeps_ws_1m_and_backfill_5m_on_same_timestamp() {
+        let mut bars = vec![completed("09:40", 1, true)];
+        upsert_completed_bar(&mut bars, completed("09:40", 5, false));
+
+        assert_eq!(bars.len(), 2, "1m WS와 5m backfill은 공존해야 함");
+        assert!(
+            bars.iter()
+                .any(|b| b.time == "09:40" && b.interval_min == 1)
+        );
+        assert!(
+            bars.iter()
+                .any(|b| b.time == "09:40" && b.interval_min == 5)
+        );
+    }
+
+    #[test]
+    fn upsert_replaces_only_same_granularity() {
+        let mut bars = vec![completed("09:40", 1, true), completed("09:40", 5, false)];
+        let replacement = CompletedCandle {
+            high: 120,
+            ..completed("09:40", 5, false)
+        };
+
+        upsert_completed_bar(&mut bars, replacement);
+
+        assert_eq!(bars.len(), 2, "같은 granularity만 교체되어야 함");
+        assert_eq!(
+            bars.iter()
+                .find(|b| b.time == "09:40" && b.interval_min == 5)
+                .map(|b| b.high),
+            Some(120)
+        );
+        assert!(
+            bars.iter()
+                .any(|b| b.time == "09:40" && b.interval_min == 1)
+        );
     }
 }

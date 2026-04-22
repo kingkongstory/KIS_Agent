@@ -48,6 +48,8 @@ pub struct SignalEngineConfig {
     pub entry_cutoff: NaiveTime,
     /// OR 돌파 필수 여부 (1차 진입은 true, 2차 이후 false).
     pub require_or_breakout: bool,
+    /// OR 돌파 최소 강도. 0.001 = 0.1%.
+    pub min_or_breakout_pct: f64,
     /// Long 전용 모드 (Short FVG 무시).
     pub long_only: bool,
     /// 이전 거래 방향. Some 이면 그 방향만 허용.
@@ -127,10 +129,15 @@ pub fn detect_next_fvg_signal(
 
             // Bullish FVG
             if b.is_bullish() && a.high < c.low && body_ok {
-                let or_ok = !config.require_or_breakout || b.close > config.or_high;
+                let or_breakout_pct = match breakout_pct(config, PositionSide::Long, b.close) {
+                    Some(v) => v,
+                    None => continue,
+                };
+                let or_ok = !config.require_or_breakout
+                    || (b.close > config.or_high && or_breakout_pct >= config.min_or_breakout_pct);
                 let side_ok = config
                     .confirmed_side
-                    .map_or(true, |s| s == PositionSide::Long);
+                    .is_none_or(|s| s == PositionSide::Long);
                 if or_ok && side_ok {
                     pending_fvg = Some(FairValueGap {
                         direction: FvgDirection::Bullish,
@@ -147,10 +154,15 @@ pub fn detect_next_fvg_signal(
 
             // Bearish FVG
             if !config.long_only && b.is_bearish() && a.low > c.high && body_ok {
-                let or_ok = !config.require_or_breakout || b.close < config.or_low;
+                let or_breakout_pct = match breakout_pct(config, PositionSide::Short, b.close) {
+                    Some(v) => v,
+                    None => continue,
+                };
+                let or_ok = !config.require_or_breakout
+                    || (b.close < config.or_low && or_breakout_pct >= config.min_or_breakout_pct);
                 let side_ok = config
                     .confirmed_side
-                    .map_or(true, |s| s == PositionSide::Short);
+                    .is_none_or(|s| s == PositionSide::Short);
                 if or_ok && side_ok {
                     pending_fvg = Some(FairValueGap {
                         direction: FvgDirection::Bearish,
@@ -220,15 +232,7 @@ fn build_meta(
 ) -> PendingMeta {
     let a_range_safe = a_range_raw.max(1);
     let b_body_ratio = b.body_size() as f64 / a_range_safe as f64;
-    let or_breakout_pct = match side {
-        PositionSide::Long if config.or_high > 0 => {
-            (b.close - config.or_high) as f64 / config.or_high as f64
-        }
-        PositionSide::Short if config.or_low > 0 => {
-            (config.or_low - b.close) as f64 / config.or_low as f64
-        }
-        _ => 0.0,
-    };
+    let or_breakout_pct = breakout_pct(config, side, b.close).unwrap_or(0.0);
     let _ = a; // A 캔들 자체는 현재 메타에 넣지 않지만 시그니처 유지용으로 받음.
     PendingMeta {
         b_time: b.time,
@@ -237,6 +241,18 @@ fn build_meta(
         or_breakout_pct,
         b_close: b.close,
         a_range: a_range_raw,
+    }
+}
+
+fn breakout_pct(config: &SignalEngineConfig, side: PositionSide, close: i64) -> Option<f64> {
+    match side {
+        PositionSide::Long if config.or_high > 0 => {
+            Some((close - config.or_high) as f64 / config.or_high as f64)
+        }
+        PositionSide::Short if config.or_low > 0 => {
+            Some((config.or_low - close) as f64 / config.or_low as f64)
+        }
+        _ => None,
     }
 }
 
@@ -283,7 +299,15 @@ mod tests {
 
     use super::*;
 
-    fn candle(hour: u32, min: u32, open: i64, high: i64, low: i64, close: i64, vol: u64) -> MinuteCandle {
+    fn candle(
+        hour: u32,
+        min: u32,
+        open: i64,
+        high: i64,
+        low: i64,
+        close: i64,
+        vol: u64,
+    ) -> MinuteCandle {
         MinuteCandle {
             date: NaiveDate::from_ymd_opt(2026, 4, 14).unwrap(),
             time: NaiveTime::from_hms_opt(hour, min, 0).unwrap(),
@@ -304,6 +328,7 @@ mod tests {
             fvg_expiry_candles: 6,
             entry_cutoff: NaiveTime::from_hms_opt(15, 20, 0).unwrap(),
             require_or_breakout: true,
+            min_or_breakout_pct: 0.0,
             long_only: true,
             confirmed_side: None,
         }
@@ -348,13 +373,33 @@ mod tests {
     }
 
     #[test]
+    fn min_or_breakout_pct_blocks_weak_breakout() {
+        let candles = vec![
+            candle(9, 15, 9_950, 10_000, 9_900, 9_980, 1_000),
+            candle(9, 20, 9_980, 10_120, 9_980, 10_105, 2_000), // +0.0495%
+            candle(9, 25, 10_130, 10_150, 10_130, 10_140, 1_500),
+            candle(9, 30, 10_140, 10_150, 10_020, 10_060, 1_300),
+        ];
+        let mut cfg = base_config();
+        cfg.or_high = 10_100;
+        cfg.min_or_breakout_pct = 0.001; // 0.1%
+        assert!(
+            detect_next_fvg_signal(&candles, &cfg).is_none(),
+            "약한 돌파는 최소 breakout 임계에서 차단되어야 함"
+        );
+
+        cfg.min_or_breakout_pct = 0.0;
+        assert!(detect_next_fvg_signal(&candles, &cfg).is_some());
+    }
+
+    #[test]
     fn long_only_filters_bearish() {
         // Bearish FVG: A.low > C.high
         let candles = vec![
             candle(9, 15, 10_100, 10_150, 10_080, 10_120, 1_000), // A (low=10080)
-            candle(9, 20, 10_120, 10_120, 9_900, 9_920, 2_000),    // B — bearish body
-            candle(9, 25, 9_920, 9_950, 9_880, 9_900, 1_500),      // C — high=9950 < A.low=10080
-            candle(9, 30, 9_900, 10_020, 9_870, 9_920, 1_300),     // retrace: c5.high=10020 ∈ [9950, 10080]
+            candle(9, 20, 10_120, 10_120, 9_900, 9_920, 2_000),   // B — bearish body
+            candle(9, 25, 9_920, 9_950, 9_880, 9_900, 1_500),     // C — high=9950 < A.low=10080
+            candle(9, 30, 9_900, 10_020, 9_870, 9_920, 1_300), // retrace: c5.high=10020 ∈ [9950, 10080]
         ];
         let mut cfg = base_config();
         cfg.or_low = 10_000;

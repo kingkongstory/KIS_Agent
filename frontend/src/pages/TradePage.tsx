@@ -2,10 +2,11 @@ import { useState } from 'react';
 import { placeOrder } from '../api/trading';
 import { useStockStore } from '../stores/stockStore';
 import { StockPrice } from '../components/stock/StockPrice';
+import { StockSearch } from '../components/stock/StockSearch';
 import { useStockPrice } from '../hooks/useStockPrice';
 import { formatKRW } from '../utils/format';
 import { tickSize } from '../utils/tickSize';
-import { cn } from '../utils/cn';
+import { Card, CardHeader, Button, Input, SegmentedControl, Badge, IconButton } from '../components/ui';
 import type { OrderRequest } from '../types/order';
 
 export function TradePage() {
@@ -22,13 +23,20 @@ export function TradePage() {
 
   const currentPrice = priceData?.price ?? 0;
   const tick = tickSize(currentPrice);
+  const qtyNum = parseInt(quantity) || 0;
+  const priceNum = orderType === 'limit' ? parseInt(price) || currentPrice : currentPrice;
+  const totalAmount = qtyNum * priceNum;
+
+  const adjustPrice = (delta: number) => {
+    const base = parseInt(price) || currentPrice;
+    setPrice(String(Math.max(0, base + delta)));
+  };
 
   const handleSubmit = async () => {
     setError(null);
     setResult(null);
 
-    const qty = parseInt(quantity);
-    if (!qty || qty <= 0) {
+    if (!qtyNum || qtyNum <= 0) {
       setError('주문 수량을 입력하세요');
       return;
     }
@@ -37,7 +45,7 @@ export function TradePage() {
       stock_code: selectedCode,
       side,
       order_type: orderType,
-      quantity: qty,
+      quantity: qtyNum,
       price: orderType === 'limit' ? parseInt(price) : undefined,
     };
 
@@ -55,111 +63,125 @@ export function TradePage() {
   };
 
   return (
-    <div className="flex gap-4">
-      <div className="flex-1">
-        <StockPrice />
+    <div className="flex flex-col gap-4">
+      <div className="max-w-md">
+        <StockSearch />
       </div>
-      <div className="w-80 bg-card rounded-lg border border-border p-4">
-        <h2 className="text-sm font-semibold mb-4">주문</h2>
 
-        {/* 매수/매도 탭 */}
-        <div className="flex gap-1 mb-4">
-          <button
-            onClick={() => setSide('buy')}
-            className={cn(
-              'flex-1 py-2 rounded text-sm font-medium transition-colors',
-              side === 'buy' ? 'bg-rise text-white' : 'bg-border/50 text-text-muted',
-            )}
-          >
-            매수
-          </button>
-          <button
-            onClick={() => setSide('sell')}
-            className={cn(
-              'flex-1 py-2 rounded text-sm font-medium transition-colors',
-              side === 'sell' ? 'bg-fall text-white' : 'bg-border/50 text-text-muted',
-            )}
-          >
-            매도
-          </button>
+      <div className="grid grid-cols-1 lg:grid-cols-[1fr_360px] gap-4">
+        <div className="min-w-0">
+          <StockPrice />
         </div>
 
-        {/* 주문 유형 */}
-        <div className="flex gap-2 mb-4">
-          {(['limit', 'market'] as const).map((type) => (
-            <button
-              key={type}
-              onClick={() => setOrderType(type)}
-              className={cn(
-                'px-3 py-1 text-xs rounded',
-                orderType === type
-                  ? 'bg-accent text-white'
-                  : 'bg-border/50 text-text-muted',
-              )}
-            >
-              {type === 'limit' ? '지정가' : '시장가'}
-            </button>
-          ))}
-        </div>
+        <Card padding="md">
+          <CardHeader
+            title="주문"
+            subtitle={priceData?.name || selectedCode}
+            action={
+              <Badge tone={side === 'buy' ? 'rise' : 'fall'} variant="soft" size="sm">
+                {side === 'buy' ? '매수' : '매도'}
+              </Badge>
+            }
+          />
 
-        {/* 가격 입력 */}
-        {orderType === 'limit' && (
-          <div className="mb-3">
-            <label className="text-xs text-text-muted block mb-1">
-              가격 (호가단위: {formatKRW(tick)})
-            </label>
-            <div className="flex gap-1">
-              <button
-                onClick={() => setPrice(String(Math.max(0, (parseInt(price) || currentPrice) - tick)))}
-                className="px-2 bg-border/50 rounded text-text-muted"
-              >
-                -
-              </button>
-              <input
-                type="number"
-                value={price}
-                onChange={(e) => setPrice(e.target.value)}
-                placeholder={currentPrice.toString()}
-                className="flex-1 bg-app-bg border border-border rounded px-2 py-1 text-sm text-text-primary text-right"
-              />
-              <button
-                onClick={() => setPrice(String((parseInt(price) || currentPrice) + tick))}
-                className="px-2 bg-border/50 rounded text-text-muted"
-              >
-                +
-              </button>
+          <SegmentedControl
+            options={[
+              { value: 'buy', label: '매수', tone: 'rise' },
+              { value: 'sell', label: '매도', tone: 'fall' },
+            ]}
+            value={side}
+            onChange={setSide}
+            size="md"
+            fullWidth
+            className="mb-3"
+          />
+
+          <SegmentedControl
+            options={[
+              { value: 'limit', label: '지정가' },
+              { value: 'market', label: '시장가' },
+            ]}
+            value={orderType}
+            onChange={setOrderType}
+            size="sm"
+            fullWidth
+            className="mb-4"
+          />
+
+          {orderType === 'limit' && (
+            <div className="mb-3">
+              <div className="flex items-end justify-between mb-1">
+                <label className="text-xs text-text-muted font-medium tracking-wide">가격</label>
+                <span className="text-2xs text-text-disabled tabular-nums">
+                  호가단위 {formatKRW(tick)}
+                </span>
+              </div>
+              <div className="flex gap-1.5">
+                <IconButton
+                  label="가격 -"
+                  variant="secondary"
+                  onClick={() => adjustPrice(-tick)}
+                >
+                  −
+                </IconButton>
+                <Input
+                  type="number"
+                  value={price}
+                  onChange={(e) => setPrice(e.target.value)}
+                  placeholder={currentPrice.toString()}
+                  rightAddon="원"
+                />
+                <IconButton
+                  label="가격 +"
+                  variant="secondary"
+                  onClick={() => adjustPrice(tick)}
+                >
+                  +
+                </IconButton>
+              </div>
             </div>
-          </div>
-        )}
+          )}
 
-        {/* 수량 입력 */}
-        <div className="mb-4">
-          <label className="text-xs text-text-muted block mb-1">수량</label>
-          <input
+          <Input
+            label="수량"
             type="number"
             value={quantity}
             onChange={(e) => setQuantity(e.target.value)}
             placeholder="0"
-            className="w-full bg-app-bg border border-border rounded px-2 py-1 text-sm text-text-primary text-right"
+            rightAddon="주"
+            className="mb-3"
           />
-        </div>
 
-        {/* 에러/결과 */}
-        {error && <div className="text-fall text-xs mb-2">{error}</div>}
-        {result && <div className="text-rise text-xs mb-2">{result}</div>}
-
-        {/* 주문 버튼 */}
-        <button
-          onClick={handleSubmit}
-          disabled={submitting}
-          className={cn(
-            'w-full py-2 rounded font-medium text-sm text-white transition-colors',
-            side === 'buy' ? 'bg-rise hover:bg-rise/80' : 'bg-fall hover:bg-fall/80',
-            submitting && 'opacity-50 cursor-not-allowed',
+          {qtyNum > 0 && (
+            <div className="flex items-center justify-between text-xs mb-3 px-3 py-2 rounded-md bg-surface-2 border border-border-subtle">
+              <span className="text-text-muted">예상 주문금액</span>
+              <span className="font-semibold tabular-nums text-text-primary">
+                {formatKRW(totalAmount)}원
+              </span>
+            </div>
           )}
-        >
-          {submitting ? '처리 중...' : side === 'buy' ? '매수 주문' : '매도 주문'}
-        </button>
+
+          {error && (
+            <div className="text-xs text-fall mb-2 px-3 py-2 rounded-md bg-fall-soft border border-fall/30">
+              {error}
+            </div>
+          )}
+          {result && (
+            <div className="text-xs text-rise mb-2 px-3 py-2 rounded-md bg-rise-soft border border-rise/30">
+              {result}
+            </div>
+          )}
+
+          <Button
+            variant={side === 'buy' ? 'rise' : 'fall'}
+            size="lg"
+            fullWidth
+            loading={submitting}
+            onClick={handleSubmit}
+          >
+            {side === 'buy' ? '매수 주문' : '매도 주문'}
+          </Button>
+        </Card>
       </div>
     </div>
   );
