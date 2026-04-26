@@ -1,7 +1,8 @@
+use chrono::Local;
 use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{RwLock, broadcast};
 use tokio::time::{Duration, sleep};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -13,10 +14,15 @@ use super::parser::{
 };
 use super::subscription::SubscriptionManager;
 use crate::domain::error::KisError;
+use crate::domain::market_session::{MarketSessionPolicy, select_reconnect_backoff};
 use crate::domain::ports::realtime::RealtimeData;
 use crate::domain::types::Environment;
 use crate::infrastructure::kis_client::auth::TokenManager;
 use crate::infrastructure::monitoring::event_logger::EventLogger;
+
+/// 2026-04-24 P0-1: `ws_reconnect_deferred_off_hours` 이벤트 중복 억제 윈도우.
+/// 동일 종류 이벤트를 이 간격 내에 반복 발행하지 않는다.
+const OFF_HOURS_DEFER_EVENT_DEDUP_WINDOW: Duration = Duration::from_secs(600);
 
 /// WS 운영 상태 스냅샷 — watchdog / /monitoring/health 용.
 ///
@@ -82,6 +88,17 @@ pub struct KisWebSocketClient {
     retry_count: Arc<AtomicU32>,
     /// 연결이 영구 종료됐는지 (`run` 이 max_retries 초과로 break 했을 때 true).
     terminated: Arc<AtomicBool>,
+    /// 2026-04-24 P0-1: 시장 세션 정책. 기본값은 feature flag off 라 기존 동작 유지.
+    session_policy: Arc<RwLock<MarketSessionPolicy>>,
+    /// 2026-04-24 P0-1 보강: 장외 backoff 확대가 안전한 상태인지 상위 레이어가 계산한 플래그.
+    ///
+    /// 기본값은 false 이다. `ManualHeld` / pending / open 상태를 WebSocket 계층이
+    /// 직접 알 수 없으므로, `StrategyManager` 가 flat/free/no-position 상태일 때만
+    /// true 로 갱신한다. 이 값이 false 이면 env flag 가 켜져 있어도 backoff 를 늘리지 않는다.
+    off_hours_backoff_state_safe: Arc<AtomicBool>,
+    /// 2026-04-24 P0-1: `ws_reconnect_deferred_off_hours` 이벤트 마지막 기록 시각.
+    /// 10분 내 중복 발행을 막아 로그 노이즈를 최소화한다.
+    last_off_hours_defer_logged_at: Arc<RwLock<Option<Instant>>>,
 }
 
 impl KisWebSocketClient {
@@ -103,6 +120,86 @@ impl KisWebSocketClient {
             last_notification_epoch_secs: Arc::new(RwLock::new(None)),
             retry_count: Arc::new(AtomicU32::new(0)),
             terminated: Arc::new(AtomicBool::new(false)),
+            session_policy: Arc::new(RwLock::new(MarketSessionPolicy::default_off())),
+            off_hours_backoff_state_safe: Arc::new(AtomicBool::new(false)),
+            last_off_hours_defer_logged_at: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    /// 2026-04-24 P0-1: 시장 세션 정책 주입 (feature flag / 장외 backoff 확대).
+    ///
+    /// `main.rs` 에서 `AppConfig::market_session` 을 전달한다. 주입하지 않으면
+    /// `default_off()` 가 사용돼 기존 재연결 동작이 그대로 유지된다.
+    pub fn with_session_policy(self, policy: MarketSessionPolicy) -> Self {
+        // 즉시 적용: 기본값 대신 주입된 정책으로 교체.
+        // `session_policy` 는 `Arc<RwLock<...>>` 이라 async 문맥이 필요하지만
+        // 빌더 시점에는 다른 task 가 접근하기 전이라 blocking 으로 교체해도 안전.
+        if let Ok(mut guard) = self.session_policy.try_write() {
+            *guard = policy;
+        } else {
+            // try_write 실패는 초기화 레이스에서만 가능. 방어적으로 경고 후 무시.
+            warn!("with_session_policy: session_policy lock busy at init — ignoring");
+        }
+        self
+    }
+
+    /// 2026-04-24 P0-1 보강: 장외 backoff 안전 플래그 주입.
+    ///
+    /// 상위 운영 레이어가 `manual_intervention_required=false`, shared lock free,
+    /// 모든 runner flat/no-position 임을 확인한 경우에만 true 로 갱신한다.
+    pub fn with_off_hours_backoff_safety_flag(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.off_hours_backoff_state_safe = flag;
+        self
+    }
+
+    /// 2026-04-24 P0-1: 장외 backoff 확대가 적용된 경우 운영 이벤트를 남긴다.
+    ///
+    /// 동일 이벤트가 `OFF_HOURS_DEFER_EVENT_DEDUP_WINDOW` (10분) 내에 반복되면
+    /// 로그 노이즈가 커지므로 첫 발생 + 이후 10분 이상 간격에만 기록한다.
+    /// 일반 `ws_reconnect` 이벤트는 기존대로 계속 기록되므로 관측성을 잃지 않는다.
+    async fn log_off_hours_defer_if_due(
+        &self,
+        retry_count: u32,
+        max_retries: u32,
+        base_delay: Duration,
+        effective_delay: Duration,
+        err: &KisError,
+    ) {
+        let now = Instant::now();
+        let should_log = {
+            let mut guard = self.last_off_hours_defer_logged_at.write().await;
+            match *guard {
+                Some(last) if now.duration_since(last) < OFF_HOURS_DEFER_EVENT_DEDUP_WINDOW => {
+                    false
+                }
+                _ => {
+                    *guard = Some(now);
+                    true
+                }
+            }
+        };
+        if !should_log {
+            return;
+        }
+        if let Some(ref el) = self.event_logger {
+            el.log_event(
+                "",
+                "system",
+                "ws_reconnect_deferred_off_hours",
+                "info",
+                &format!(
+                    "장외 재연결 backoff 확대: {:?} → {:?}",
+                    base_delay, effective_delay
+                ),
+                serde_json::json!({
+                    "retry_count": retry_count,
+                    "max_retries": max_retries,
+                    "base_delay_ms": base_delay.as_millis() as u64,
+                    "effective_delay_ms": effective_delay.as_millis() as u64,
+                    "dedup_window_secs": OFF_HOURS_DEFER_EVENT_DEDUP_WINDOW.as_secs(),
+                    "error": err.to_string(),
+                }),
+            );
         }
     }
 
@@ -194,7 +291,30 @@ impl KisWebSocketClient {
                         break;
                     }
 
-                    let delay = exponential_backoff(retry_count);
+                    let base_delay = exponential_backoff(retry_count);
+                    // 2026-04-24 P0-1: 장외 + feature flag on 이면 backoff 확대.
+                    // flag off 또는 장중이면 base_delay 그대로 반환돼 기존 동작 유지.
+                    let policy = self.session_policy.read().await.clone();
+                    let now_time = Local::now().time();
+                    let state_backoff_safe =
+                        self.off_hours_backoff_state_safe.load(Ordering::Relaxed);
+                    let delay =
+                        select_reconnect_backoff(&policy, base_delay, now_time, state_backoff_safe);
+                    let off_hours_expanded =
+                        policy.suppression_enabled && state_backoff_safe && delay > base_delay;
+                    let off_hours_blocked_by_state = policy.suppression_enabled
+                        && policy.is_off_hours(now_time)
+                        && !state_backoff_safe;
+                    if off_hours_expanded {
+                        self.log_off_hours_defer_if_due(
+                            retry_count,
+                            max_retries,
+                            base_delay,
+                            delay,
+                            &e,
+                        )
+                        .await;
+                    }
                     warn!(
                         "WebSocket 연결 실패 (시도 {retry_count}/{max_retries}): {e}, {delay:?} 후 재연결"
                     );
@@ -209,6 +329,10 @@ impl KisWebSocketClient {
                                 "retry_count": retry_count,
                                 "max_retries": max_retries,
                                 "delay_ms": delay.as_millis() as u64,
+                                "base_delay_ms": base_delay.as_millis() as u64,
+                                "off_hours_deferred": off_hours_expanded,
+                                "off_hours_backoff_state_safe": state_backoff_safe,
+                                "off_hours_backoff_blocked_by_state": off_hours_blocked_by_state,
                                 "error": e.to_string(),
                             }),
                         );

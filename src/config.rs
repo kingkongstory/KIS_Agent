@@ -1,5 +1,6 @@
 use chrono::NaiveTime;
 
+use crate::domain::market_session::MarketSessionPolicy;
 use crate::domain::types::Environment;
 use crate::strategy::live_runner::ExecutionPolicyKind;
 
@@ -75,6 +76,12 @@ pub struct AppConfig {
     pub live_poll_interval_ms: u64,
     /// 라이브 포지션 관리 주기 (ms).
     pub live_manage_poll_interval_ms: u64,
+    /// 2026-04-24 P0-1: 시장 세션 정책 (장외 WS backoff 확대 등).
+    ///
+    /// `KIS_OFF_HOURS_SUPPRESSION_ENABLED=false` 기본이므로 이 값이 존재해도
+    /// 기존 동작을 바꾸지 않는다. env 로만 정책을 조정하고 코드 재시작 없이
+    /// 원복할 수 있도록 feature flag 로 관리한다.
+    pub market_session: MarketSessionPolicy,
 }
 
 impl AppConfig {
@@ -150,7 +157,9 @@ impl AppConfig {
             _ => ExecutionPolicyKind::PassiveZoneEdge,
         };
         let default_entry_fill_timeout_ms = match live_execution_policy_kind {
-            ExecutionPolicyKind::PassiveZoneEdge => 30_000,
+            // 2026-04-24 P1-1: paper passive 지정가 체결 tail 이 52.9초까지 관측되어
+            // 기본 timeout 을 60초로 늘린다. 실전 marketable 경로는 별도 3초 유지.
+            ExecutionPolicyKind::PassiveZoneEdge => 60_000,
             ExecutionPolicyKind::MarketableLimit { .. } => 3_000,
         };
         let default_poll_interval_ms = match live_execution_policy_kind {
@@ -194,6 +203,7 @@ impl AppConfig {
             live_exit_verification_budget_ms,
             live_poll_interval_ms,
             live_manage_poll_interval_ms,
+            market_session: MarketSessionPolicy::from_env(),
         })
     }
 
@@ -292,6 +302,12 @@ mod tests {
             "KIS_EXIT_VERIFICATION_BUDGET_MS",
             "KIS_POLL_INTERVAL_MS",
             "KIS_MANAGE_POLL_INTERVAL_MS",
+            "KIS_OFF_HOURS_SUPPRESSION_ENABLED",
+            "KIS_PRE_OPEN_CONNECT_AT",
+            "KIS_REGULAR_OPEN_AT",
+            "KIS_REGULAR_CLOSE_AT",
+            "KIS_CLOSE_SETTLE_END_AT",
+            "KIS_OFF_HOURS_WS_BACKOFF_MS",
         ] {
             unsafe {
                 std::env::remove_var(k);
@@ -367,10 +383,11 @@ mod tests {
             entry_cutoff_real: NaiveTime::from_hms_opt(15, 0, 0).unwrap(),
             real_or_stages: vec!["15m".to_string()],
             live_execution_policy_kind: ExecutionPolicyKind::PassiveZoneEdge,
-            live_entry_fill_timeout_ms: 30_000,
+            live_entry_fill_timeout_ms: 60_000,
             live_exit_verification_budget_ms: 15_000,
             live_poll_interval_ms: 5_000,
             live_manage_poll_interval_ms: 3_000,
+            market_session: MarketSessionPolicy::default_off(),
         }
     }
 }

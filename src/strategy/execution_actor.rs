@@ -506,6 +506,9 @@ pub fn apply_execution_event(
 /// - `Degraded ↔ {Open, Flat, SignalArmed}`: preflight health 변화에 따른 외부 전이.
 ///   `transition_to_degraded` / `clear_degraded_if_healthy` 가 strategy/data 계층
 ///   판단으로 수행하므로 actor event 로 표현 안 됨.
+/// - `Flat → EntryPartial`: timeout/cancel 직후 뒤늦은 체결을 balance 로 확인한
+///   복구 전이. 주문 lifecycle 은 이미 취소 경로에 들어갔지만 실제 보유 수량이
+///   생긴 경우이므로 유령 포지션 방지를 위해 정상 복구 경로로 인정한다.
 pub fn is_actor_allowed_transition(prev: ExecutionState, new: ExecutionState) -> bool {
     // Idempotent — transition_execution_state 는 prev==new 일 때 early return 하지만
     // 혹시 호출되면 safe.
@@ -527,6 +530,9 @@ pub fn is_actor_allowed_transition(prev: ExecutionState, new: ExecutionState) ->
         ExecutionState::Flat | ExecutionState::SignalArmed | ExecutionState::Open
     ) && new == ExecutionState::Degraded
     {
+        return true;
+    }
+    if prev == ExecutionState::Flat && new == ExecutionState::EntryPartial {
         return true;
     }
 
@@ -1166,6 +1172,15 @@ mod tests {
         assert!(is_actor_allowed_transition(
             ExecutionState::EntryPending,
             ExecutionState::Flat,
+        ));
+    }
+
+    #[test]
+    fn allowed_transition_covers_cancel_fill_race_partial_recovery() {
+        // timeout/cancel 직후 balance 로 부분체결을 발견하면 Flat 에서 EntryPartial 로 복구한다.
+        assert!(is_actor_allowed_transition(
+            ExecutionState::Flat,
+            ExecutionState::EntryPartial,
         ));
     }
 

@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use clap::{Parser, Subcommand};
 use tokio::sync::broadcast;
@@ -309,11 +310,16 @@ async fn run_trade(config: &AppConfig, stock_code: &str, _rr: f64, _qty: u64) {
     // WebSocket 실시간 스트리밍
     {
         use kis_agent::infrastructure::websocket::connection::KisWebSocketClient;
-        let ws_client = Arc::new(KisWebSocketClient::new(
-            Arc::clone(&token_manager),
-            config.environment,
-            realtime_tx.clone(),
-        ));
+        // 2026-04-24 P0-1: CLI 단독 경로도 server 와 동일하게 세션 정책 주입.
+        // feature flag off 면 기존 동작 유지.
+        let ws_client = Arc::new(
+            KisWebSocketClient::new(
+                Arc::clone(&token_manager),
+                config.environment,
+                realtime_tx.clone(),
+            )
+            .with_session_policy(config.market_session.clone()),
+        );
         let sub_mgr = ws_client.subscription_manager();
         sub_mgr.add("H0STCNT0", stock_code).await;
         sub_mgr.add("H0STASP0", stock_code).await;
@@ -776,12 +782,7 @@ async fn run_collect_minute(config: &AppConfig) {
 }
 
 /// KIS 주식일별분봉조회 — 과거 분봉 수집 (최대 1년)
-async fn run_collect_kis_history(
-    config: &AppConfig,
-    codes: &str,
-    date: &str,
-    interval: i16,
-) {
+async fn run_collect_kis_history(config: &AppConfig, codes: &str, date: &str, interval: i16) {
     info!("=== KIS 주식일별분봉조회 수집 시작 ({date}, {interval}m) ===");
 
     // 날짜 입력 유효성 (YYYYMMDD, 8자리 숫자)
@@ -814,7 +815,11 @@ async fn run_collect_kis_history(
 
     let collector = KisMinuteCollector::new(http_client, store);
 
-    let stocks: Vec<&str> = codes.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+    let stocks: Vec<&str> = codes
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
 
     match collector
         .collect_historical_batch(&stocks, date, interval)
@@ -924,6 +929,10 @@ async fn run_server(config: AppConfig) {
     let allowed_codes = config.effective_allowed_codes();
     info!("자동매매 허용 종목: {:?}", allowed_codes);
 
+    // 2026-04-24 P0-1 보강: 장외 WS backoff 확대 안전 플래그.
+    // StrategyManager 가 flat/free/no-position 상태를 확인한 뒤에만 true 로 갱신한다.
+    let off_hours_ws_backoff_safe = Arc::new(AtomicBool::new(false));
+
     // KIS WebSocket 실시간 스트리밍 (체결 + 호가)
     // 2026-04-16 P0: ws_client handle을 유지하여 체결통보 health gate에서 사용.
     let ws_client_handle = {
@@ -937,6 +946,11 @@ async fn run_server(config: AppConfig) {
         if let Some(ref el) = event_logger {
             ws_client = ws_client.with_event_logger(Arc::clone(el));
         }
+        ws_client =
+            ws_client.with_off_hours_backoff_safety_flag(Arc::clone(&off_hours_ws_backoff_safe));
+        // 2026-04-24 P0-1: 장외 WS backoff 확대 정책 주입. feature flag off
+        // (기본) 이면 기존 재연결 동작이 그대로 유지된다.
+        ws_client = ws_client.with_session_policy(config.market_session.clone());
         let ws_client = Arc::new(ws_client);
 
         // 대상 종목 구독 등록 (연결 시 자동 전송)
@@ -1106,6 +1120,18 @@ async fn run_server(config: AppConfig) {
         );
         mgr
     };
+
+    {
+        let manager_for_ws_backoff = strategy_manager.clone();
+        let safe_flag = Arc::clone(&off_hours_ws_backoff_safe);
+        tokio::spawn(async move {
+            loop {
+                let safe = manager_for_ws_backoff.off_hours_ws_backoff_safe().await;
+                safe_flag.store(safe, Ordering::Relaxed);
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            }
+        });
+    }
 
     // 2026-04-16 Task 4/5 — 실전 운용 제약 주입.
     // 허용 종목, LiveRunnerConfig, 실전 opt-in 차단 사유를 StrategyManager 로 내려보낸다.

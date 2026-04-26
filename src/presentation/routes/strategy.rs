@@ -17,7 +17,9 @@ use crate::infrastructure::cache::postgres_store::PostgresStore;
 use crate::infrastructure::kis_client::http_client::{HttpMethod, KisHttpClient, KisResponse};
 use crate::infrastructure::monitoring::event_logger::EventLogger;
 use crate::infrastructure::websocket::candle_aggregator::{CandleAggregator, CompletedCandle};
-use crate::strategy::live_runner::{LiveRunner, LiveRunnerConfig, PositionLockState};
+use crate::strategy::live_runner::{
+    ExecutionState, LiveRunner, LiveRunnerConfig, PositionLockState,
+};
 
 /// 종목별 전략 실행 상태
 #[derive(Debug, Clone, Serialize)]
@@ -148,6 +150,8 @@ pub struct StrategyManager {
     /// 무기한 유예가 hidden position 을 못 보는 위험을 차단한다.
     reconcile_inconclusive_streaks: Arc<RwLock<HashMap<String, u32>>>,
 }
+
+const RECONCILE_POST_FLAT_SETTLE_WINDOW_SECS: u64 = 10;
 
 impl Default for StrategyManager {
     fn default() -> Self {
@@ -338,6 +342,71 @@ impl StrategyManager {
     pub async fn has_active_runners(&self) -> bool {
         let statuses = self.statuses.read().await;
         statuses.values().any(|s| s.active)
+    }
+
+    /// 2026-04-24 P0-1 보강: 장외 WS backoff 확대가 안전한 상태인지 계산한다.
+    ///
+    /// WebSocket 계층은 `ManualHeld` / pending / open 상태를 직접 알 수 없으므로
+    /// 운영 레이어가 주기적으로 이 값을 계산해 `KisWebSocketClient` 의 안전 플래그를
+    /// 갱신한다. 하나라도 상태가 불명확하거나 포지션 관련 위험이 있으면 fail-closed 한다.
+    pub async fn off_hours_ws_backoff_safe(&self) -> bool {
+        if !matches!(
+            *self.active_position_lock.read().await,
+            PositionLockState::Free
+        ) {
+            return false;
+        }
+
+        let (active_codes, known_codes) = {
+            let statuses = self.statuses.read().await;
+            let mut active_codes = Vec::new();
+            let mut known_codes = Vec::new();
+            for status in statuses.values() {
+                known_codes.push(status.code.clone());
+                if status.manual_intervention_required || status.degraded {
+                    return false;
+                }
+                if status.active {
+                    active_codes.push(status.code.clone());
+                }
+            }
+            (active_codes, known_codes)
+        };
+
+        if let Some(store) = &self.db_store {
+            for code in &known_codes {
+                match store.get_active_position(code).await {
+                    Ok(Some(_)) => return false,
+                    Ok(None) => {}
+                    Err(_) => {
+                        // DB 상태를 확인하지 못하면 hidden position 가능성을 배제할 수 없으므로 차단한다.
+                        return false;
+                    }
+                }
+            }
+        }
+
+        let runners = self.runners.read().await;
+        for code in &active_codes {
+            if !runners.contains_key(code) {
+                // status 는 active 인데 runner handle 이 아직 없으면 시작/종료 race 로 보고 보수적으로 차단.
+                return false;
+            }
+        }
+
+        for handle in runners.values() {
+            let state = handle.runner_state.read().await;
+            if state.manual_intervention_required
+                || state.degraded
+                || state.exit_pending
+                || state.current_position.is_some()
+                || state.execution_state != ExecutionState::Flat
+            {
+                return false;
+            }
+        }
+
+        true
     }
 
     /// 2026-04-19 PR #2.e: 전체 러너의 armed watch 지표 스냅샷.
@@ -980,7 +1049,7 @@ impl StrategyManager {
 
         for (code, rs, stop_flag, stop_notify) in snapshots {
             // manual 이미 전환된 러너는 반복 기록 피하기
-            let (runner_qty, already_manual) = {
+            let (runner_qty, already_manual, post_flat_remaining_ms) = {
                 let guard = rs.read().await;
                 (
                     guard
@@ -989,9 +1058,28 @@ impl StrategyManager {
                         .map(|p| p.quantity)
                         .unwrap_or(0),
                     guard.manual_intervention_required,
+                    reconcile_post_flat_remaining_ms(&guard),
                 )
             };
             if already_manual {
+                continue;
+            }
+            if let Some(remaining_ms) = post_flat_remaining_ms {
+                self.reset_reconcile_inconclusive_streak(&code).await;
+                if let Some(ref el) = self.event_logger {
+                    el.log_event(
+                        &code,
+                        "position",
+                        "reconcile_skipped_post_flat_window",
+                        "info",
+                        "flat 직후 settle window 동안 reconcile 승격 유예",
+                        serde_json::json!({
+                            "runner_qty": runner_qty,
+                            "remaining_ms": remaining_ms,
+                            "window_secs": RECONCILE_POST_FLAT_SETTLE_WINDOW_SECS,
+                        }),
+                    );
+                }
                 continue;
             }
             // 2026-04-17 v3 불변식 #3: Pending(self) / ManualHeld(self) 이면 skip.
@@ -1238,6 +1326,28 @@ pub(crate) fn should_skip_reconcile_for_lock(lock_state: &PositionLockState, cod
     ) || matches!(lock_state,
         PositionLockState::ManualHeld(c) if c == code
     )
+}
+
+/// 청산 직후 flat 전이와 KIS 잔고 반영 사이의 짧은 race window.
+///
+/// 오늘 사고처럼 `execution_state=flat` 으로 먼저 전이되고 `current_position` 정리와
+/// 잔고 API 반영이 약간 뒤따르는 경우가 있어, 이 짧은 구간의 mismatch 는 즉시
+/// manual 승격하지 않고 settle 시간을 준다.
+#[inline]
+pub(crate) fn reconcile_post_flat_remaining_ms(
+    state: &crate::strategy::live_runner::RunnerState,
+) -> Option<u64> {
+    if state.execution_state != crate::strategy::live_runner::ExecutionState::Flat {
+        return None;
+    }
+    let transitioned_at = state.last_flat_transition_at?;
+    let window = std::time::Duration::from_secs(RECONCILE_POST_FLAT_SETTLE_WINDOW_SECS);
+    let elapsed = transitioned_at.elapsed();
+    if elapsed >= window {
+        None
+    } else {
+        Some((window - elapsed).as_millis() as u64)
+    }
 }
 
 /// 2026-04-17 v3 fixups K: reconcile cycle 결정 분류.
@@ -1830,6 +1940,8 @@ mod notification_health_tests {
             execution_state: crate::strategy::live_runner::ExecutionState::Flat,
             preflight_metadata: crate::strategy::live_runner::PreflightMetadata::default(),
             last_external_gate_stale: false,
+            last_flat_transition_at: None,
+            last_quote_sanity_issue: None,
             armed_stats: crate::strategy::live_runner::ArmedWatchStats::default(),
             current_armed_signal_id: None,
         }));
@@ -2226,6 +2338,168 @@ mod reconcile_lock_skip_tests {
     fn free_does_not_skip() {
         let state = PositionLockState::Free;
         assert!(!should_skip_reconcile_for_lock(&state, "122630"));
+    }
+}
+
+/// 2026-04-24 P0-1 보강: 장외 WS backoff 안전 플래그 회귀 테스트.
+#[cfg(test)]
+mod off_hours_ws_backoff_safety_tests {
+    use super::*;
+    use crate::strategy::live_runner::{
+        ArmedWatchStats, ExecutionState, PreflightMetadata, RunnerState,
+    };
+
+    fn runner_state(execution_state: ExecutionState) -> Arc<RwLock<RunnerState>> {
+        Arc::new(RwLock::new(RunnerState {
+            phase: "장 시작 대기".to_string(),
+            today_trades: Vec::new(),
+            today_pnl: 0.0,
+            current_position: None,
+            or_high: None,
+            or_low: None,
+            or_stages: Vec::new(),
+            market_halted: false,
+            degraded: false,
+            manual_intervention_required: false,
+            degraded_reason: None,
+            exit_pending: false,
+            execution_state,
+            preflight_metadata: PreflightMetadata::default(),
+            last_external_gate_stale: false,
+            last_flat_transition_at: None,
+            last_quote_sanity_issue: None,
+            armed_stats: ArmedWatchStats::default(),
+            current_armed_signal_id: None,
+        }))
+    }
+
+    async fn insert_runner(mgr: &StrategyManager, code: &str, state: Arc<RwLock<RunnerState>>) {
+        mgr.runners.write().await.insert(
+            code.to_string(),
+            RunnerHandle {
+                stop_flag: Arc::new(AtomicBool::new(false)),
+                stop_notify: Arc::new(tokio::sync::Notify::new()),
+                runner_state: state,
+            },
+        );
+        if let Some(status) = mgr.statuses.write().await.get_mut(code) {
+            status.active = true;
+        }
+    }
+
+    #[tokio::test]
+    async fn safe_when_all_runners_are_flat_and_lock_free() {
+        let mgr = StrategyManager::new();
+        insert_runner(&mgr, "122630", runner_state(ExecutionState::Flat)).await;
+
+        assert!(
+            mgr.off_hours_ws_backoff_safe().await,
+            "flat/free/no-position 상태에서는 장외 backoff 확대가 가능해야 한다"
+        );
+    }
+
+    #[tokio::test]
+    async fn unsafe_when_lock_is_manual_held() {
+        let mgr = StrategyManager::new();
+        *mgr.active_position_lock.write().await =
+            PositionLockState::ManualHeld("122630".to_string());
+
+        assert!(
+            !mgr.off_hours_ws_backoff_safe().await,
+            "ManualHeld 는 execution_state 와 무관하게 WS backoff 확대를 막아야 한다"
+        );
+    }
+
+    #[tokio::test]
+    async fn unsafe_when_runner_is_entry_pending() {
+        let mgr = StrategyManager::new();
+        insert_runner(&mgr, "122630", runner_state(ExecutionState::EntryPending)).await;
+
+        assert!(
+            !mgr.off_hours_ws_backoff_safe().await,
+            "EntryPending 은 체결통보가 필요하므로 장외 backoff 확대 금지"
+        );
+    }
+
+    #[tokio::test]
+    async fn unsafe_when_status_is_manual_intervention() {
+        let mgr = StrategyManager::new();
+        if let Some(status) = mgr.statuses.write().await.get_mut("122630") {
+            status.manual_intervention_required = true;
+            status.degraded = true;
+        }
+
+        assert!(
+            !mgr.off_hours_ws_backoff_safe().await,
+            "status manual_intervention 이면 runner 가 없어도 fail-closed 해야 한다"
+        );
+    }
+}
+
+/// 2026-04-23 안정화: flat 직후 settle window 회귀 테스트.
+#[cfg(test)]
+mod reconcile_post_flat_window_tests {
+    use super::reconcile_post_flat_remaining_ms;
+    use crate::strategy::live_runner::{
+        ArmedWatchStats, ExecutionState, PreflightMetadata, RunnerState,
+    };
+
+    fn make_state(
+        execution_state: ExecutionState,
+        last_flat_transition_at: Option<std::time::Instant>,
+    ) -> RunnerState {
+        RunnerState {
+            phase: String::new(),
+            today_trades: Vec::new(),
+            today_pnl: 0.0,
+            current_position: None,
+            or_high: None,
+            or_low: None,
+            or_stages: Vec::new(),
+            market_halted: false,
+            degraded: false,
+            manual_intervention_required: false,
+            degraded_reason: None,
+            exit_pending: false,
+            execution_state,
+            preflight_metadata: PreflightMetadata::default(),
+            last_external_gate_stale: false,
+            last_flat_transition_at,
+            last_quote_sanity_issue: None,
+            armed_stats: ArmedWatchStats::default(),
+            current_armed_signal_id: None,
+        }
+    }
+
+    #[test]
+    fn flat_transition_inside_window_skips_reconcile() {
+        let state = make_state(
+            ExecutionState::Flat,
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(3)),
+        );
+        let remaining = reconcile_post_flat_remaining_ms(&state);
+        assert!(
+            remaining.is_some_and(|ms| ms > 0 && ms <= 10_000),
+            "10초 settle window 안이면 남은 시간이 계산돼야 한다"
+        );
+    }
+
+    #[test]
+    fn flat_transition_outside_window_does_not_skip() {
+        let state = make_state(
+            ExecutionState::Flat,
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(11)),
+        );
+        assert_eq!(reconcile_post_flat_remaining_ms(&state), None);
+    }
+
+    #[test]
+    fn non_flat_state_does_not_skip() {
+        let state = make_state(
+            ExecutionState::Open,
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(1)),
+        );
+        assert_eq!(reconcile_post_flat_remaining_ms(&state), None);
     }
 }
 

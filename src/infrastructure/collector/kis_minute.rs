@@ -398,7 +398,10 @@ mod tests {
         let out = aggregate_ohlc(&input, day, 5);
         assert_eq!(out.len(), 2);
         // 첫 버킷 09:00: open=100, high=113, low=99, close=112, volume=150
-        assert_eq!(out[0].datetime.time(), NaiveTime::from_hms_opt(9, 0, 0).unwrap());
+        assert_eq!(
+            out[0].datetime.time(),
+            NaiveTime::from_hms_opt(9, 0, 0).unwrap()
+        );
         assert_eq!(out[0].open, 100);
         assert_eq!(out[0].high, 113);
         assert_eq!(out[0].low, 99);
@@ -406,7 +409,10 @@ mod tests {
         assert_eq!(out[0].volume, 150);
         assert_eq!(out[0].interval_min, 5);
         // 두 번째 버킷 09:05: 1건
-        assert_eq!(out[1].datetime.time(), NaiveTime::from_hms_opt(9, 5, 0).unwrap());
+        assert_eq!(
+            out[1].datetime.time(),
+            NaiveTime::from_hms_opt(9, 5, 0).unwrap()
+        );
         assert_eq!(out[1].close, 114);
     }
 

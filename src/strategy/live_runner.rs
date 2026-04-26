@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::{DateTime, Local, NaiveDate, NaiveTime, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Notify, RwLock, broadcast, watch};
 use tracing::{debug, error, info, warn};
 
@@ -105,6 +105,14 @@ pub struct RunnerState {
     /// stale 로 관측되었는지. flip (false→true 또는 true→false) 에서만 event_log 에
     /// 기록하여 폭주 방지.
     pub last_external_gate_stale: bool,
+    /// 2026-04-23 장마감 후속조치: `Flat` 전이 시각.
+    /// reconcile 이 청산 직후 잔고 전파 지연을 hidden position 으로 오판하지 않도록
+    /// 짧은 settle window 판정에 사용한다.
+    pub last_flat_transition_at: Option<std::time::Instant>,
+    /// 2026-04-23 parser 후속 방어선: 최근 비정상 호가 사유.
+    /// 마지막 정상 호가를 유지하더라도 신규 진입은 차단하고, preflight 사유를
+    /// `spread_exceeded` 대신 `quote_invalid` 로 분리하기 위해 상태에 남긴다.
+    pub last_quote_sanity_issue: Option<String>,
     /// 2026-04-19 PR #2.b: armed watch 종료 사유별 집계 + duration 통계.
     pub armed_stats: ArmedWatchStats,
     /// 2026-04-19 PR #2.c: 현재 armed watch 가 감시 중인 signal_id.
@@ -315,11 +323,11 @@ pub struct LiveRunnerConfig {
     /// 패시브 지정가 → 시장성 지정가 정책 전환 시 함께 낮출 수 있다.
     ///
     /// 권장 방향 (문서 Phase 3):
-    /// - 현재 라이브: 30_000 ms (기존 동작 유지).
+    /// - paper/passive 기본: 60_000 ms.
     /// - `MarketableLimitWithBudget` 정책 도입 후: 2_000 ~ 3_000 ms.
     /// - 최대 5_000 ms 를 넘기지 않는다.
     ///
-    /// 기본값은 paper 에서 기존 동작을 보존하기 위해 30_000.
+    /// 기본값은 paper 패시브 지정가의 느린 모의 체결을 흡수하기 위해 60_000.
     /// real 기본은 `for_real_mode()` / `AppConfig` 가 3_000 으로 낮춘다.
     pub entry_fill_timeout_ms: u64,
     /// 2026-04-18 Phase 3: 청산 검증 budget (ms).
@@ -838,6 +846,9 @@ pub struct PreflightMetadata {
     pub active_instrument: Option<String>,
     /// 실시간 구독 health (체결/호가/NAV/지수). 하나라도 비정상이면 false — 신규 진입 차단.
     pub subscription_health_ok: bool,
+    /// 마지막 호가 sanity 실패 사유. `Some` 이면 오래된 정상 호가가 남아 있어도
+    /// 신규 진입은 차단하고 운영 로그를 `quote_invalid` 로 분리한다.
+    pub quote_issue: Option<String>,
 }
 
 impl Default for PreflightMetadata {
@@ -855,6 +866,7 @@ impl Default for PreflightMetadata {
             regime_confirmed: true,
             active_instrument: None,
             subscription_health_ok: true,
+            quote_issue: None,
         }
     }
 }
@@ -863,7 +875,11 @@ impl PreflightMetadata {
     /// 모든 preflight gate 가 통과한 상태인가.
     /// Phase 3/4 에서 entry actor 의 진입 조건으로 사용 예정.
     pub fn all_ok(&self) -> bool {
-        self.spread_ok && self.nav_gate_ok && self.regime_confirmed && self.subscription_health_ok
+        self.spread_ok
+            && self.nav_gate_ok
+            && self.regime_confirmed
+            && self.subscription_health_ok
+            && self.quote_issue.is_none()
     }
 
     pub fn entry_cutoff_ok(&self, now: NaiveTime) -> bool {
@@ -904,6 +920,80 @@ struct SpreadGateEvaluation {
     spread_raw: Option<i64>,
     spread_tick: Option<i64>,
     spread_threshold_ticks: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuoteSanityEvaluation {
+    Valid,
+    Invalid(&'static str),
+}
+
+fn validate_quote_sanity(ask: i64, bid: i64, current_price: Option<i64>) -> QuoteSanityEvaluation {
+    if ask <= 0 || bid <= 0 {
+        return QuoteSanityEvaluation::Invalid("nonpositive");
+    }
+    if ask < bid {
+        return QuoteSanityEvaluation::Invalid("inverted");
+    }
+
+    if let Some(price) = current_price.filter(|price| *price > 0) {
+        let mid = ((ask + bid) / 2).max(1);
+        let deviation_pct =
+            (((mid as i128 - price as i128).abs() * 100) / i128::from(price.max(1))) as i64;
+        if deviation_pct > 5 {
+            return QuoteSanityEvaluation::Invalid("off_market");
+        }
+    }
+
+    QuoteSanityEvaluation::Valid
+}
+
+/// 비정상 호가를 spread gate 와 분리해 추적한다.
+///
+/// parser 회귀나 WS 이상치가 들어와도 마지막 정상 호가를 덮어쓰지 않고,
+/// preflight 는 `RunnerState.last_quote_sanity_issue` 를 보고 신규 진입을 차단한다.
+async fn apply_quote_update(
+    latest_quote: &Arc<RwLock<Option<(i64, i64, tokio::time::Instant)>>>,
+    state: &Arc<RwLock<RunnerState>>,
+    event_logger: Option<&Arc<EventLogger>>,
+    stock_code: &str,
+    source: &'static str,
+    ask: i64,
+    bid: i64,
+    current_price: Option<i64>,
+    now: tokio::time::Instant,
+) {
+    match validate_quote_sanity(ask, bid, current_price) {
+        QuoteSanityEvaluation::Valid => {
+            *latest_quote.write().await = Some((ask, bid, now));
+            let mut guard = state.write().await;
+            guard.last_quote_sanity_issue = None;
+        }
+        QuoteSanityEvaluation::Invalid(reason) => {
+            let changed = {
+                let mut guard = state.write().await;
+                let changed = guard.last_quote_sanity_issue.as_deref() != Some(reason);
+                guard.last_quote_sanity_issue = Some(reason.to_string());
+                changed
+            };
+            if changed && let Some(el) = event_logger {
+                el.log_event(
+                    stock_code,
+                    "market",
+                    "quote_invalid",
+                    "warn",
+                    &format!("비정상 호가 수신 — source={source}, reason={reason}"),
+                    serde_json::json!({
+                        "source": source,
+                        "reason": reason,
+                        "ask": ask,
+                        "bid": bid,
+                        "current_price": current_price,
+                    }),
+                );
+            }
+        }
+    }
 }
 
 fn evaluate_spread_gate(
@@ -1024,6 +1114,9 @@ pub(crate) struct ExitVerification {
     pub resolution_source: ExitResolutionSource,
     /// WS 체결통보 수신 여부 — 분석/로그용.
     pub ws_received: bool,
+    /// REST 체결조회 시도별 진단 정보.
+    /// `balance_only` 로 내려간 경우에도 왜 REST 가 체결가를 못 줬는지 사후 분석하기 위해 남긴다.
+    pub rest_execution_attempts: Vec<ExecutionQueryDiagnostics>,
 }
 
 impl ExitVerification {
@@ -1044,6 +1137,124 @@ impl ExitVerification {
             Some(_) => true,
             None => true, // balance 조회 실패 — 안전하게 잔량 있다고 간주 (불변식 5)
         }
+    }
+
+    pub fn rest_execution_last_status(&self) -> Option<&str> {
+        self.rest_execution_attempts
+            .last()
+            .map(|attempt| attempt.status.as_str())
+    }
+
+    pub fn rest_execution_diagnostics_json(&self) -> serde_json::Value {
+        serde_json::to_value(&self.rest_execution_attempts)
+            .unwrap_or_else(|_| serde_json::json!([]))
+    }
+}
+
+/// REST 체결조회 1회 시도의 결과 진단.
+///
+/// 기존 `query_execution` 은 `None` 만 반환해 HTTP 실패, 응답 없음, 주문번호 불일치,
+/// 0수량/0가격을 구분할 수 없었다. 청산이 `balance_only` 로 내려간 원인을 DB metadata 에
+/// 남기기 위해 이 구조체를 사용한다.
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub(crate) struct ExecutionQueryDiagnostics {
+    pub phase: String,
+    pub attempt: u32,
+    pub order_no: String,
+    pub status: String,
+    pub output_rows: usize,
+    pub matched_rows: usize,
+    pub matched_qty: u64,
+    pub priced_qty: u64,
+    pub avg_price: Option<i64>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ExecutionQueryOutcome {
+    fill: Option<(i64, u64)>,
+    diagnostics: ExecutionQueryDiagnostics,
+}
+
+fn json_field_as_string(item: &serde_json::Value, key: &str) -> Option<String> {
+    item.get(key).and_then(|value| {
+        value
+            .as_str()
+            .map(|s| s.trim().to_string())
+            .or_else(|| value.as_i64().map(|n| n.to_string()))
+            .or_else(|| value.as_u64().map(|n| n.to_string()))
+            .or_else(|| value.as_f64().map(|n| n.to_string()))
+    })
+}
+
+fn parse_execution_query_items(
+    order_no: &str,
+    phase: &str,
+    attempt: u32,
+    items: &[serde_json::Value],
+) -> ExecutionQueryOutcome {
+    let mut diagnostics = ExecutionQueryDiagnostics {
+        phase: phase.to_string(),
+        attempt,
+        order_no: order_no.to_string(),
+        status: "order_not_found".to_string(),
+        output_rows: items.len(),
+        ..ExecutionQueryDiagnostics::default()
+    };
+    let mut weighted_price_sum = 0.0_f64;
+
+    for item in items {
+        let odno = json_field_as_string(item, "odno").unwrap_or_default();
+        if odno != order_no {
+            continue;
+        }
+
+        diagnostics.matched_rows += 1;
+        let qty = json_field_as_string(item, "tot_ccld_qty")
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        let avg = json_field_as_string(item, "avg_prvs")
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(0.0);
+
+        diagnostics.matched_qty = diagnostics.matched_qty.saturating_add(qty);
+        if qty > 0 && avg > 0.0 {
+            diagnostics.priced_qty = diagnostics.priced_qty.saturating_add(qty);
+            weighted_price_sum += avg * qty as f64;
+        }
+    }
+
+    if diagnostics.matched_rows == 0 {
+        return ExecutionQueryOutcome {
+            fill: None,
+            diagnostics,
+        };
+    }
+    if diagnostics.matched_qty == 0 {
+        diagnostics.status = "matched_zero_qty".to_string();
+        return ExecutionQueryOutcome {
+            fill: None,
+            diagnostics,
+        };
+    }
+    if diagnostics.priced_qty == 0 {
+        diagnostics.status = "matched_no_price".to_string();
+        return ExecutionQueryOutcome {
+            fill: None,
+            diagnostics,
+        };
+    }
+
+    let avg_price = (weighted_price_sum / diagnostics.priced_qty as f64).round() as i64;
+    diagnostics.avg_price = Some(avg_price);
+    diagnostics.status = if diagnostics.priced_qty == diagnostics.matched_qty {
+        "filled".to_string()
+    } else {
+        "filled_partial_price".to_string()
+    };
+    ExecutionQueryOutcome {
+        fill: Some((avg_price, diagnostics.matched_qty)),
+        diagnostics,
     }
 }
 
@@ -1321,13 +1532,13 @@ mod live_runner_config_default_tests {
 
     /// 2026-04-18 Phase 3: entry_fill_timeout 기본값 + clamp 회귀.
     #[test]
-    fn entry_fill_timeout_default_is_30_seconds() {
+    fn entry_fill_timeout_default_is_60_seconds() {
         let cfg = LiveRunnerConfig::default();
         assert_eq!(
-            cfg.entry_fill_timeout_ms, 30_000,
-            "Phase 3 도입 후에도 기본값은 30초 (운영자 opt-in 으로만 단축)"
+            cfg.entry_fill_timeout_ms, 60_000,
+            "paper passive 기본값은 60초 — 52.9초 tail 체결을 흡수해야 한다"
         );
-        assert_eq!(cfg.entry_fill_timeout(), std::time::Duration::from_secs(30));
+        assert_eq!(cfg.entry_fill_timeout(), std::time::Duration::from_secs(60));
     }
 
     #[test]
@@ -1969,8 +2180,8 @@ impl Default for LiveRunnerConfig {
             enable_real_orders: true,
             real_mode: false,
             global_trade_gate: None,
-            // Phase 3: 기존 `fill_timeout = Duration::from_secs(30)` 보존.
-            entry_fill_timeout_ms: 30_000,
+            // 2026-04-24 P1-1: paper 패시브 지정가 tail 체결을 흡수하기 위해 60초로 상향.
+            entry_fill_timeout_ms: 60_000,
             // Phase 3: verify_exit_completion 내부 3단 검증 예상 소요 + 여유.
             exit_verification_budget_ms: 15_000,
             // Phase 4: 기존 5초 폴링 보존 (운영자 opt-in 으로만 단축).
@@ -2239,6 +2450,8 @@ impl LiveRunner {
                 execution_state: ExecutionState::Flat,
                 preflight_metadata: PreflightMetadata::default(),
                 last_external_gate_stale: false,
+                last_flat_transition_at: None,
+                last_quote_sanity_issue: None,
                 armed_stats: ArmedWatchStats::default(),
                 current_armed_signal_id: None,
             })),
@@ -3783,6 +3996,7 @@ impl LiveRunner {
             let latest_quote = Arc::clone(&self.latest_quote);
             let state = Arc::clone(&self.state);
             let notify = Arc::clone(&self.stop_notify);
+            let event_logger = self.event_logger.clone();
             let breakeven_r = self.strategy.config.breakeven_r;
             let trailing_r = self.strategy.config.trailing_r;
 
@@ -3807,9 +4021,19 @@ impl LiveRunner {
                         Ok(RealtimeData::Execution(exec)) if exec.stock_code == code => {
                             let now = tokio::time::Instant::now();
                             *latest.write().await = Some((exec.price, now));
-                            if exec.ask_price > 0 && exec.bid_price > 0 {
-                                *latest_quote.write().await =
-                                    Some((exec.ask_price, exec.bid_price, now));
+                            if exec.ask_price != 0 || exec.bid_price != 0 {
+                                apply_quote_update(
+                                    &latest_quote,
+                                    &state,
+                                    event_logger.as_ref(),
+                                    &code,
+                                    "execution",
+                                    exec.ask_price,
+                                    exec.bid_price,
+                                    Some(exec.price),
+                                    now,
+                                )
+                                .await;
                             }
 
                             // 백테스트 simulate_exit Step 2+3 틱 재현
@@ -3883,9 +4107,21 @@ impl LiveRunner {
                         Ok(RealtimeData::OrderBook(book)) if book.stock_code == code => {
                             let best_ask = book.asks.first().map(|(price, _)| *price).unwrap_or(0);
                             let best_bid = book.bids.first().map(|(price, _)| *price).unwrap_or(0);
-                            if best_ask > 0 && best_bid > 0 {
-                                *latest_quote.write().await =
-                                    Some((best_ask, best_bid, tokio::time::Instant::now()));
+                            if best_ask != 0 || best_bid != 0 {
+                                let current_price =
+                                    latest.read().await.as_ref().map(|(price, _)| *price);
+                                apply_quote_update(
+                                    &latest_quote,
+                                    &state,
+                                    event_logger.as_ref(),
+                                    &code,
+                                    "orderbook",
+                                    best_ask,
+                                    best_bid,
+                                    current_price,
+                                    tokio::time::Instant::now(),
+                                )
+                                .await;
                             }
                         }
                         Err(broadcast::error::RecvError::Closed) => break,
@@ -3926,7 +4162,11 @@ impl LiveRunner {
     async fn latest_quote_snapshot(&self) -> Option<(i64, i64)> {
         let snapshot = *self.latest_quote.read().await;
         snapshot.and_then(|(ask, bid, updated_at)| {
-            if updated_at.elapsed() < std::time::Duration::from_secs(30) && ask > 0 && bid > 0 {
+            if updated_at.elapsed() < std::time::Duration::from_secs(30)
+                && ask > 0
+                && bid > 0
+                && ask >= bid
+            {
                 Some((ask, bid))
             } else {
                 None
@@ -4418,12 +4658,13 @@ impl LiveRunner {
                 .is_some_and(|(_, updated_at)| {
                     updated_at.elapsed() < std::time::Duration::from_secs(30)
                 });
+        let quote_issue = self.state.read().await.last_quote_sanity_issue.clone();
         let spread_eval = evaluate_spread_gate(
             self.latest_quote_snapshot().await,
             self.live_cfg.real_mode,
             DEFAULT_SPREAD_THRESHOLD_TICKS,
         );
-        let internal_spread_ok = spread_eval.spread_ok;
+        let internal_spread_ok = spread_eval.spread_ok && quote_issue.is_none();
 
         // 2026-04-19 PR #1.b: external_gates 가 주입되어 있으면 Signal Engine 의 값 사용.
         // 정책 및 합성은 `apply_external_gates` 순수 함수가 담당 (unit test 가능).
@@ -4501,6 +4742,7 @@ impl LiveRunner {
             regime_confirmed,
             active_instrument,
             subscription_health_ok,
+            quote_issue,
         };
 
         let prev_stale = {
@@ -4694,26 +4936,10 @@ impl LiveRunner {
         // 잔존 포지션 확인
         self.check_and_restore_position().await;
 
-        // 재시작 회귀 방지: DB에서 오늘 trades 상태를 읽어 signal_state.search_after 복구.
-        // 핫픽스 commit 후 cargo build + restart 로 새 binary 가 시작될 때 (예: 2026-04-10 13:38:53),
-        // 메인 루프 로컬 변수(trade_count / confirmed_side) 가 0/None 으로 reset 되어
-        // 같은 5분봉의 같은 FVG 가 청산 후 다시 잡히는 것을 막기 위함.
-        let today = Local::now().date_naive();
-        if let Some(ref store) = self.db_store
-            && let Ok(Some(t)) = store
-                .get_last_trade_exit_today(self.stock_code.as_str(), today)
-                .await
-        {
-            self.signal_state.write().await.search_after = Some(t);
-            info!(
-                "{}: 재시작 복구 — signal_state.search_after = {} (DB)",
-                self.stock_name, t
-            );
-        }
-
         // 장 시작 대기
         self.update_phase("장 시작 대기").await;
-        self.wait_until(cfg.or_start).await;
+        self.wait_until_session_milestone(cfg.or_start, cfg.force_exit)
+            .await;
         if self.is_stopped() {
             return Ok(Vec::new());
         }
@@ -4817,7 +5043,8 @@ impl LiveRunner {
         let or_5m_end = NaiveTime::from_hms_opt(9, 5, 0).unwrap();
 
         self.update_phase("OR 수집 중 (5분)").await;
-        self.wait_until(or_5m_end).await;
+        self.wait_until_session_milestone(or_5m_end, cfg.force_exit)
+            .await;
         if self.is_stopped() {
             return Ok(Vec::new());
         }
@@ -4825,6 +5052,19 @@ impl LiveRunner {
         // 메인 루프: 분봉 폴링 → 전략 평가 → 주문 실행
         // 재시작 복구: trade_count / confirmed_side 를 DB의 오늘 거래에서 복원하여
         // 백테스트와 라이브의 일별 상태가 항상 일치하도록 한다.
+        // 야간 기동 후 다음날 09:00 까지 대기할 수 있으므로, 일자는 대기 이후 다시 계산한다.
+        let today = Local::now().date_naive();
+        if let Some(ref store) = self.db_store
+            && let Ok(Some(t)) = store
+                .get_last_trade_exit_today(self.stock_code.as_str(), today)
+                .await
+        {
+            self.signal_state.write().await.search_after = Some(t);
+            info!(
+                "{}: 재시작 복구 — signal_state.search_after = {} (DB)",
+                self.stock_name, t
+            );
+        }
         let mut all_trades: Vec<TradeResult> = Vec::new();
         let mut trade_count: usize = if let Some(ref store) = self.db_store {
             store
@@ -5207,6 +5447,8 @@ impl LiveRunner {
         if !preflight.all_ok() {
             let reason = if !preflight.subscription_health_ok {
                 "subscription_health_stale"
+            } else if preflight.quote_issue.is_some() {
+                "quote_invalid"
             } else if !preflight.spread_ok {
                 "spread_exceeded"
             } else if !preflight.nav_gate_ok {
@@ -5234,6 +5476,7 @@ impl LiveRunner {
                         "spread_tick": preflight.spread_tick,
                         "spread_in_ticks": preflight.spread_in_ticks(),
                         "spread_threshold_ticks": preflight.spread_threshold_ticks,
+                        "quote_issue": preflight.quote_issue,
                         "nav_gate_ok": preflight.nav_gate_ok,
                         "regime_confirmed": preflight.regime_confirmed,
                         "subscription_health_ok": preflight.subscription_health_ok,
@@ -6569,6 +6812,7 @@ impl LiveRunner {
             }
         };
         let submit_ack_at = Utc::now();
+        let submit_ack_elapsed_ms = order_start.elapsed().as_millis() as u64;
 
         if resp.rt_cd != "0" {
             // 주문 실패 로그
@@ -6800,8 +7044,8 @@ impl LiveRunner {
         self.track_order_and_guard_repeat(limit_price).await;
 
         // ── 체결 대기 루프 (LiveRunnerConfig.entry_fill_timeout_ms, WebSocket 우선 + REST 폴백) ──
-        // 2026-04-18 Phase 3: 기존 하드코딩 30초 → `live_cfg.entry_fill_timeout()` 으로 설정화.
-        // 기본값은 30_000 ms 로 기존 동작 보존. 운영자가 CLI/env 로 단축 가능.
+        // 2026-04-18 Phase 3: 하드코딩 timeout 을 설정화.
+        // 2026-04-24 P1-1: paper passive 기본값은 60_000 ms 로 상향했다.
         let (entry_fill_phase, fill_timeout) = self
             .execution_timeout_for_state(ExecutionState::EntryPending)
             .unwrap_or((TimeoutPhase::EntryFill, self.live_cfg.entry_fill_timeout()));
@@ -6811,12 +7055,15 @@ impl LiveRunner {
 
         let mut was_preempted = false;
         let mut entry_fill_timed_out = false;
+        let mut timeout_elapsed_ms: Option<u64> = None;
+        let mut first_fill_notice_at_ms: Option<u64> = None;
         loop {
             if self.is_stopped() {
                 break;
             }
             if order_start.elapsed() >= fill_timeout {
                 entry_fill_timed_out = true;
+                timeout_elapsed_ms = Some(order_start.elapsed().as_millis() as u64);
                 break;
             }
             if Local::now().time() >= entry_deadline {
@@ -6847,6 +7094,8 @@ impl LiveRunner {
 
             // WebSocket 체결 통보 대기 (최대 5초 단위)
             if let Some((price, qty)) = self.wait_execution_notice(&order_no, wait_dur).await {
+                first_fill_notice_at_ms
+                    .get_or_insert_with(|| order_start.elapsed().as_millis() as u64);
                 fill_price = price;
                 filled_qty = qty;
                 if filled_qty >= actual_qty {
@@ -6869,86 +7118,197 @@ impl LiveRunner {
         // ── 미체결/부분 체결 처리 ──
         if filled_qty < actual_qty {
             if entry_fill_timed_out {
-                self.handle_execution_timeout_expired(
-                    entry_fill_phase,
-                    "execute_entry_fill_timeout",
-                )
-                .await;
-            }
-            let was_partial = filled_qty > 0;
-            if was_partial {
-                info!(
-                    "{}: 부분 체결 {}주/{}주 — 잔량 취소 시도",
-                    self.stock_name, filled_qty, actual_qty
-                );
-            } else {
-                info!(
-                    "{}: 미체결 — 주문 취소 시도 (주문번호={})",
-                    self.stock_name, order_no
-                );
+                let mut timeout_partial_source: Option<&'static str> = None;
+                let mut timeout_holding_after: Option<u64> = None;
+
+                // 2026-04-24 P1-1: timeout 직후 곧바로 Flat+cancel 로 내리면,
+                // 뒤늦은 부분체결이 `Flat -> EntryPartial` race 로 보인다.
+                // 먼저 REST/잔고를 확인해 이미 체결된 수량은 EntryPartial 로 정상 전이한다.
+                if filled_qty < actual_qty
+                    && let Some((price, qty)) = self.query_execution(&order_no).await
+                {
+                    fill_price = price;
+                    filled_qty = qty.min(actual_qty);
+                    if filled_qty > 0 {
+                        timeout_partial_source = Some("rest_execution_before_cancel");
+                    }
+                }
+
+                if filled_qty == 0 {
+                    match self.fetch_holding_snapshot().await {
+                        Ok(Some((qty_after, avg_opt))) if qty_after > holding_before => {
+                            let gained = (qty_after - holding_before).min(actual_qty);
+                            filled_qty = gained;
+                            fill_price = avg_opt.unwrap_or(limit_price);
+                            timeout_holding_after = Some(qty_after);
+                            timeout_partial_source = Some("balance_before_cancel");
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            warn!(
+                                "{}: timeout 직후 balance 확인 실패 — cancel 후 재검증으로 넘김: {e}",
+                                self.stock_name
+                            );
+                        }
+                    }
+                }
+
+                if filled_qty > 0 && filled_qty < actual_qty {
+                    self.transition_execution_state(
+                        ExecutionState::EntryPartial,
+                        "entry_timeout_partial_detected",
+                    )
+                    .await;
+                    if let Some(ref el) = self.event_logger {
+                        el.log_event(
+                            self.stock_code.as_str(),
+                            "order",
+                            "entry_timeout_partial_detected",
+                            "warning",
+                            &format!(
+                                "timeout 직후 부분체결 확인 — {}주/{}주, 잔량 취소 진행",
+                                filled_qty, actual_qty
+                            ),
+                            serde_json::json!({
+                                "order_no": &order_no,
+                                "limit_price": limit_price,
+                                "filled_qty": filled_qty,
+                                "expected_qty": actual_qty,
+                                "source": timeout_partial_source,
+                                "holding_before": holding_before,
+                                "holding_after": timeout_holding_after,
+                                "timeout_elapsed_ms": timeout_elapsed_ms,
+                                "first_fill_notice_at_ms": first_fill_notice_at_ms,
+                                "entry_fill_timeout_ms_cfg": self.live_cfg.entry_fill_timeout_ms,
+                            }),
+                        );
+                    }
+                    if let Some(ref store) = self.db_store {
+                        let resolution_source = match timeout_partial_source {
+                            Some("rest_execution_before_cancel") => "rest_execution",
+                            Some("balance_before_cancel") => "balance_only",
+                            _ => "unknown",
+                        };
+                        let entry = ExecutionJournalEntry {
+                            stock_code: self.stock_code.as_str().to_string(),
+                            execution_id: order_no.clone(),
+                            signal_id: signal_id.to_string(),
+                            broker_order_id: order_no.clone(),
+                            phase: "entry_partial".into(),
+                            side: side_str.clone(),
+                            intended_price: Some(entry_price),
+                            submitted_price: Some(limit_price),
+                            filled_price: Some(if fill_price > 0 {
+                                fill_price
+                            } else {
+                                limit_price
+                            }),
+                            filled_qty: Some(filled_qty as i64),
+                            holdings_before: Some(holding_before as i64),
+                            holdings_after: timeout_holding_after.map(|qty| qty as i64),
+                            resolution_source: resolution_source.into(),
+                            reason: "entry_timeout_partial_detected".into(),
+                            error_message: String::new(),
+                            metadata: serde_json::json!({
+                                "expected_qty": actual_qty,
+                                "source": timeout_partial_source,
+                            }),
+                            sent_at: Some(submit_sent_at),
+                            ack_at: Some(submit_ack_at),
+                            first_fill_at: Some(Utc::now()),
+                            final_fill_at: Some(Utc::now()),
+                        };
+                        let _ = store.append_execution_journal(&entry).await;
+                    }
+                } else if filled_qty < actual_qty {
+                    self.handle_execution_timeout_expired(
+                        entry_fill_phase,
+                        "execute_entry_fill_timeout",
+                    )
+                    .await;
+                }
             }
 
-            // 미체결 잔량 취소 (cancel_tp_order는 범용 취소 — 동일 API).
-            // cancel 3회 재시도 모두 실패 시 cancel_all fallback으로 이 종목의 모든 미체결 정리.
-            // 이 지점은 체결 확정 전 + TP 발주 전이라 이 종목의 정상 TP는 존재하지 않음 → 안전.
-            if let Err(e) = self.cancel_tp_order(&order_no, &krx_orgno).await {
-                warn!(
-                    "{}: 주문 취소 3회 실패 — cancel_all fallback: {e}",
-                    self.stock_name
-                );
-                if let Some(ref el) = self.event_logger {
-                    el.log_event(
-                        self.stock_code.as_str(),
-                        "order",
-                        "cancel_fallback",
-                        "warn",
-                        &format!(
-                            "주문 {} cancel 실패 → cancel_all_pending_orders 실행",
-                            order_no
-                        ),
-                        serde_json::json!({"order_no": &order_no}),
+            if filled_qty < actual_qty {
+                let was_partial = filled_qty > 0;
+                if was_partial {
+                    info!(
+                        "{}: 부분 체결 {}주/{}주 — 잔량 취소 시도",
+                        self.stock_name, filled_qty, actual_qty
+                    );
+                } else {
+                    info!(
+                        "{}: 미체결 — 주문 취소 시도 (주문번호={})",
+                        self.stock_name, order_no
                     );
                 }
-                if let Err(e) = self
-                    .cancel_all_pending_orders("entry_cancel_fallback")
-                    .await
-                {
-                    warn!("{}: entry_cancel_fallback 실패: {e}", self.stock_name);
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
-            // 취소 직후 체결 재조회 (레이스 컨디션 방지: 취소 직전 체결 가능)
-            if let Some((price, qty)) = self.query_execution(&order_no).await {
-                fill_price = price;
-                filled_qty = qty;
-            }
-
-            if filled_qty == 0 {
-                // ── balance 재검증 (2026-04-15 사고 대응) ──
-                // query_execution 이 0을 반환해도 실제로는 체결된 후 cancel 이 된 상황 가능.
-                // inquire-balance 로 보유 수량 증가를 직접 확인하여 유령 포지션을 방지한다.
-                //
-                // 2026-04-15 Codex re-review: qty>0 이면 avg 제공 여부와 관계없이
-                // race 로 판정해야 한다 (과거 `fetch_holding_qty` 가 avg>0 까지 요구해
-                // 이 경로를 블라인드 스팟으로 남겼음 — `fetch_holding_snapshot` 으로 일원화).
-                match self.fetch_holding_snapshot().await {
-                    Ok(Some((qty_after, avg_opt))) if qty_after > holding_before => {
-                        let gained = qty_after - holding_before;
-                        // avg 미제공 시 지정가를 fallback 체결가로 사용 (슬리피지 0 가정).
-                        let fill_price_resolved = avg_opt.unwrap_or(limit_price);
-                        error!(
-                            "{}: ⚠ cancel/fill race 감지 — filled_qty=0 이지만 보유 {}주 증가 (before={}, after={}, avg={})",
-                            self.stock_name,
-                            gained,
-                            holding_before,
-                            qty_after,
-                            avg_opt
-                                .map(|v| format!("{}원", v))
-                                .unwrap_or_else(|| "미제공".to_string())
+                // 미체결 잔량 취소 (cancel_tp_order는 범용 취소 — 동일 API).
+                // cancel 3회 재시도 모두 실패 시 cancel_all fallback으로 이 종목의 모든 미체결 정리.
+                // 이 지점은 체결 확정 전 + TP 발주 전이라 이 종목의 정상 TP는 존재하지 않음 → 안전.
+                let cancel_attempted_at_ms = order_start.elapsed().as_millis() as u64;
+                if let Err(e) = self.cancel_tp_order(&order_no, &krx_orgno).await {
+                    warn!(
+                        "{}: 주문 취소 3회 실패 — cancel_all fallback: {e}",
+                        self.stock_name
+                    );
+                    if let Some(ref el) = self.event_logger {
+                        el.log_event(
+                            self.stock_code.as_str(),
+                            "order",
+                            "cancel_fallback",
+                            "warn",
+                            &format!(
+                                "주문 {} cancel 실패 → cancel_all_pending_orders 실행",
+                                order_no
+                            ),
+                            serde_json::json!({"order_no": &order_no}),
                         );
-                        if let Some(ref el) = self.event_logger {
-                            el.log_event(
+                    }
+                    if let Err(e) = self
+                        .cancel_all_pending_orders("entry_cancel_fallback")
+                        .await
+                    {
+                        warn!("{}: entry_cancel_fallback 실패: {e}", self.stock_name);
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+                // 취소 직후 체결 재조회 (레이스 컨디션 방지: 취소 직전 체결 가능)
+                if let Some((price, qty)) = self.query_execution(&order_no).await {
+                    if qty > filled_qty {
+                        fill_price = price;
+                        filled_qty = qty.min(actual_qty);
+                    } else if fill_price == 0 && price > 0 {
+                        fill_price = price;
+                    }
+                }
+
+                if filled_qty == 0 {
+                    // ── balance 재검증 (2026-04-15 사고 대응) ──
+                    // query_execution 이 0을 반환해도 실제로는 체결된 후 cancel 이 된 상황 가능.
+                    // inquire-balance 로 보유 수량 증가를 직접 확인하여 유령 포지션을 방지한다.
+                    //
+                    // 2026-04-15 Codex re-review: qty>0 이면 avg 제공 여부와 관계없이
+                    // race 로 판정해야 한다 (과거 `fetch_holding_qty` 가 avg>0 까지 요구해
+                    // 이 경로를 블라인드 스팟으로 남겼음 — `fetch_holding_snapshot` 으로 일원화).
+                    match self.fetch_holding_snapshot().await {
+                        Ok(Some((qty_after, avg_opt))) if qty_after > holding_before => {
+                            let gained = qty_after - holding_before;
+                            // avg 미제공 시 지정가를 fallback 체결가로 사용 (슬리피지 0 가정).
+                            let fill_price_resolved = avg_opt.unwrap_or(limit_price);
+                            error!(
+                                "{}: ⚠ cancel/fill race 감지 — filled_qty=0 이지만 보유 {}주 증가 (before={}, after={}, avg={})",
+                                self.stock_name,
+                                gained,
+                                holding_before,
+                                qty_after,
+                                avg_opt
+                                    .map(|v| format!("{}원", v))
+                                    .unwrap_or_else(|| "미제공".to_string())
+                            );
+                            if let Some(ref el) = self.event_logger {
+                                el.log_event(
                                 self.stock_code.as_str(),
                                 "order",
                                 "cancel_fill_race_detected",
@@ -6965,169 +7325,179 @@ impl LiveRunner {
                                     "gained": gained,
                                     "avg_price": avg_opt,
                                     "fill_price_resolved": fill_price_resolved,
+                                    "submit_ack_elapsed_ms": submit_ack_elapsed_ms,
+                                    "timeout_elapsed_ms": timeout_elapsed_ms,
+                                    "first_fill_notice_at_ms": first_fill_notice_at_ms,
+                                    "cancel_attempted_at_ms": cancel_attempted_at_ms,
+                                    "entry_fill_timeout_ms_cfg": self.live_cfg.entry_fill_timeout_ms,
                                 }),
                             );
+                            }
+                            // 2026-04-19 Doc revision P2: EntryPartial 실 전이.
+                            // cancel/fill race 에서 확인된 체결이 expected 미달이면 EntryPartial 로
+                            // 명시한다. 체결 확정 경로로 fall-through 하면 execute_entry 끝에서
+                            // Open 전이가 적용되어 최종적으로 Open 으로 수렴하지만, 중간 phase 가
+                            // journal 에 남아 holdings 증가 기준 "부분 체결 확정" 사건을 분석 가능.
+                            if gained < actual_qty {
+                                self.transition_execution_state(
+                                    ExecutionState::EntryPartial,
+                                    "cancel_fill_race_partial",
+                                )
+                                .await;
+                                if let Some(ref store) = self.db_store {
+                                    let entry = ExecutionJournalEntry {
+                                        stock_code: self.stock_code.as_str().to_string(),
+                                        execution_id: order_no.clone(),
+                                        signal_id: signal_id.to_string(),
+                                        broker_order_id: order_no.clone(),
+                                        phase: "entry_partial".into(),
+                                        side: format!("{:?}", order_side),
+                                        intended_price: Some(entry_price),
+                                        submitted_price: Some(limit_price),
+                                        filled_price: Some(fill_price_resolved),
+                                        filled_qty: Some(gained as i64),
+                                        holdings_before: Some(holding_before as i64),
+                                        holdings_after: Some(qty_after as i64),
+                                        resolution_source: "balance_only".into(),
+                                        reason: "cancel_fill_race_partial".into(),
+                                        error_message: String::new(),
+                                        metadata: serde_json::json!({
+                                            "expected_qty": actual_qty,
+                                            "gained": gained,
+                                        }),
+                                        sent_at: Some(submit_sent_at),
+                                        ack_at: Some(submit_ack_at),
+                                        first_fill_at: Some(Utc::now()),
+                                        final_fill_at: Some(Utc::now()),
+                                    };
+                                    let _ = store.append_execution_journal(&entry).await;
+                                }
+                            }
+                            // 실제 체결된 것으로 처리 → 체결 확정 경로로 fall-through.
+                            filled_qty = gained.min(actual_qty);
+                            fill_price = fill_price_resolved;
+                            // 아래 "체결 확정" 블록으로 진행
                         }
-                        // 2026-04-19 Doc revision P2: EntryPartial 실 전이.
-                        // cancel/fill race 에서 확인된 체결이 expected 미달이면 EntryPartial 로
-                        // 명시한다. 체결 확정 경로로 fall-through 하면 execute_entry 끝에서
-                        // Open 전이가 적용되어 최종적으로 Open 으로 수렴하지만, 중간 phase 가
-                        // journal 에 남아 holdings 증가 기준 "부분 체결 확정" 사건을 분석 가능.
-                        if gained < actual_qty {
-                            self.transition_execution_state(
-                                ExecutionState::EntryPartial,
-                                "cancel_fill_race_partial",
-                            )
-                            .await;
+                        Ok(_) => {
+                            // 잔고 증가 없음 → 정상 미체결
+                            let cancel_reason = if was_preempted {
+                                "선점으로 미체결 취소"
+                            } else {
+                                "지정가 매수 미체결 확정"
+                            };
+                            info!(
+                                "{}: {} — 주문 {} 취소 완료",
+                                self.stock_name, cancel_reason, order_no
+                            );
                             if let Some(ref store) = self.db_store {
+                                store
+                                    .save_order_log(
+                                        self.stock_code.as_str(),
+                                        "진입",
+                                        &side_str,
+                                        actual_qty as i64,
+                                        limit_price,
+                                        &order_no,
+                                        "미체결취소",
+                                        "",
+                                    )
+                                    .await;
+
+                                let _ =
+                                    store.delete_active_position(self.stock_code.as_str()).await;
                                 let entry = ExecutionJournalEntry {
                                     stock_code: self.stock_code.as_str().to_string(),
                                     execution_id: order_no.clone(),
                                     signal_id: signal_id.to_string(),
                                     broker_order_id: order_no.clone(),
-                                    phase: "entry_partial".into(),
-                                    side: format!("{:?}", order_side),
+                                    phase: "entry_cancelled".into(),
+                                    side: side_str.clone(),
                                     intended_price: Some(entry_price),
                                     submitted_price: Some(limit_price),
-                                    filled_price: Some(fill_price_resolved),
-                                    filled_qty: Some(gained as i64),
+                                    filled_price: None,
+                                    filled_qty: Some(0),
                                     holdings_before: Some(holding_before as i64),
-                                    holdings_after: Some(qty_after as i64),
+                                    holdings_after: Some(holding_before as i64),
                                     resolution_source: "balance_only".into(),
-                                    reason: "cancel_fill_race_partial".into(),
+                                    reason: if was_preempted {
+                                        "entry_preempted_cancelled".into()
+                                    } else {
+                                        "entry_timeout_cancelled".into()
+                                    },
                                     error_message: String::new(),
                                     metadata: serde_json::json!({
-                                        "expected_qty": actual_qty,
-                                        "gained": gained,
+                                        "preempted": was_preempted,
+                                        "holding_verified": true,
                                     }),
                                     sent_at: Some(submit_sent_at),
                                     ack_at: Some(submit_ack_at),
-                                    first_fill_at: Some(Utc::now()),
-                                    final_fill_at: Some(Utc::now()),
+                                    first_fill_at: None,
+                                    final_fill_at: None,
                                 };
                                 let _ = store.append_execution_journal(&entry).await;
                             }
-                        }
-                        // 실제 체결된 것으로 처리 → 체결 확정 경로로 fall-through.
-                        filled_qty = gained.min(actual_qty);
-                        fill_price = fill_price_resolved;
-                        // 아래 "체결 확정" 블록으로 진행
-                    }
-                    Ok(_) => {
-                        // 잔고 증가 없음 → 정상 미체결
-                        let cancel_reason = if was_preempted {
-                            "선점으로 미체결 취소"
-                        } else {
-                            "지정가 매수 미체결 확정"
-                        };
-                        info!(
-                            "{}: {} — 주문 {} 취소 완료",
-                            self.stock_name, cancel_reason, order_no
-                        );
-                        if let Some(ref store) = self.db_store {
-                            store
-                                .save_order_log(
+                            if let Some(ref el) = self.event_logger {
+                                el.log_event(
                                     self.stock_code.as_str(),
-                                    "진입",
-                                    &side_str,
-                                    actual_qty as i64,
-                                    limit_price,
-                                    &order_no,
-                                    "미체결취소",
-                                    "",
-                                )
-                                .await;
-
-                            let _ = store.delete_active_position(self.stock_code.as_str()).await;
-                            let entry = ExecutionJournalEntry {
-                                stock_code: self.stock_code.as_str().to_string(),
-                                execution_id: order_no.clone(),
-                                signal_id: signal_id.to_string(),
-                                broker_order_id: order_no.clone(),
-                                phase: "entry_cancelled".into(),
-                                side: side_str.clone(),
-                                intended_price: Some(entry_price),
-                                submitted_price: Some(limit_price),
-                                filled_price: None,
-                                filled_qty: Some(0),
-                                holdings_before: Some(holding_before as i64),
-                                holdings_after: Some(holding_before as i64),
-                                resolution_source: "balance_only".into(),
-                                reason: if was_preempted {
-                                    "entry_preempted_cancelled".into()
-                                } else {
-                                    "entry_timeout_cancelled".into()
-                                },
-                                error_message: String::new(),
-                                metadata: serde_json::json!({
-                                    "preempted": was_preempted,
-                                    "holding_verified": true,
-                                }),
-                                sent_at: Some(submit_sent_at),
-                                ack_at: Some(submit_ack_at),
-                                first_fill_at: None,
-                                final_fill_at: None,
-                            };
-                            let _ = store.append_execution_journal(&entry).await;
+                                    "order",
+                                    "entry_cancelled",
+                                    "info",
+                                    &format!(
+                                        "{} — {}원 {}주",
+                                        cancel_reason, limit_price, actual_qty
+                                    ),
+                                    serde_json::json!({
+                                        "order_no": &order_no,
+                                        "limit_price": limit_price,
+                                        "quantity": actual_qty,
+                                        "preempted": was_preempted,
+                                        "holding_verified": true,
+                                    }),
+                                );
+                            }
+                            if was_preempted {
+                                return Err(KisError::Preempted);
+                            }
+                            return Err(KisError::Internal("지정가 매수 미체결".into()));
                         }
-                        if let Some(ref el) = self.event_logger {
-                            el.log_event(
-                                self.stock_code.as_str(),
-                                "order",
-                                "entry_cancelled",
-                                "info",
-                                &format!("{} — {}원 {}주", cancel_reason, limit_price, actual_qty),
-                                serde_json::json!({
-                                    "order_no": &order_no,
-                                    "limit_price": limit_price,
-                                    "quantity": actual_qty,
-                                    "preempted": was_preempted,
-                                    "holding_verified": true,
-                                }),
+                        Err(e) => {
+                            // balance 조회 실패 → 실제 보유 여부 모름 → manual_intervention.
+                            // 2026-04-15 Codex review #4 대응: `KisError::ManualIntervention` 로
+                            // 반환해 상위 `poll_and_enter` 가 일반 진입 실패로 abort_entry 호출 +
+                            // shared lock 해제하는 회귀를 차단한다.
+                            let reason = format!(
+                                "cancel_verify_failed: order_no={} limit={} qty={} error={}",
+                                order_no, limit_price, actual_qty, e
                             );
-                        }
-                        if was_preempted {
-                            return Err(KisError::Preempted);
-                        }
-                        return Err(KisError::Internal("지정가 매수 미체결".into()));
-                    }
-                    Err(e) => {
-                        // balance 조회 실패 → 실제 보유 여부 모름 → manual_intervention.
-                        // 2026-04-15 Codex review #4 대응: `KisError::ManualIntervention` 로
-                        // 반환해 상위 `poll_and_enter` 가 일반 진입 실패로 abort_entry 호출 +
-                        // shared lock 해제하는 회귀를 차단한다.
-                        let reason = format!(
-                            "cancel_verify_failed: order_no={} limit={} qty={} error={}",
-                            order_no, limit_price, actual_qty, e
-                        );
-                        if let Some(ref el) = self.event_logger {
-                            el.log_event(
-                                self.stock_code.as_str(),
-                                "order",
-                                "cancel_verify_failed",
-                                "critical",
-                                "cancel 후 balance 조회 실패 — 유령 포지션 가능",
+                            if let Some(ref el) = self.event_logger {
+                                el.log_event(
+                                    self.stock_code.as_str(),
+                                    "order",
+                                    "cancel_verify_failed",
+                                    "critical",
+                                    "cancel 후 balance 조회 실패 — 유령 포지션 가능",
+                                    serde_json::json!({
+                                        "order_no": &order_no,
+                                        "limit_price": limit_price,
+                                        "quantity": actual_qty,
+                                        "error": e.to_string(),
+                                    }),
+                                );
+                            }
+                            self.trigger_manual_intervention(
+                                reason.clone(),
                                 serde_json::json!({
+                                    "trigger": "cancel_verify_failed",
                                     "order_no": &order_no,
                                     "limit_price": limit_price,
                                     "quantity": actual_qty,
                                     "error": e.to_string(),
                                 }),
-                            );
+                                ManualInterventionMode::KeepLock,
+                            )
+                            .await;
+                            return Err(KisError::ManualIntervention(reason));
                         }
-                        self.trigger_manual_intervention(
-                            reason.clone(),
-                            serde_json::json!({
-                                "trigger": "cancel_verify_failed",
-                                "order_no": &order_no,
-                                "limit_price": limit_price,
-                                "quantity": actual_qty,
-                                "error": e.to_string(),
-                            }),
-                            ManualInterventionMode::KeepLock,
-                        )
-                        .await;
-                        return Err(KisError::ManualIntervention(reason));
                     }
                 }
             }
@@ -7443,6 +7813,7 @@ impl LiveRunner {
         let mut filled_price: Option<i64> = None;
         let mut resolution_source = ExitResolutionSource::Unresolved;
         let mut ws_received = false;
+        let mut rest_execution_attempts: Vec<ExecutionQueryDiagnostics> = Vec::new();
 
         // 2026-04-19 Doc revision (Phase 3): timeout 세부 값을 LiveRunnerConfig 참조.
         // exit_ws_notice_timeout_ms / exit_rest_retries / exit_balance_retries 등.
@@ -7482,9 +7853,15 @@ impl LiveRunner {
                 if attempt > 0 {
                     tokio::time::sleep(rest_interval).await;
                 }
-                if let Some((price, qty)) = self.query_execution(order_no).await {
-                    if qty > filled_qty {
-                        filled_qty = qty;
+                let outcome = self
+                    .query_execution_detailed(order_no, "pre_balance", attempt + 1)
+                    .await;
+                let fill = outcome.fill;
+                rest_execution_attempts.push(outcome.diagnostics);
+                if let Some((price, qty)) = fill {
+                    let normalized_qty = qty.min(expected_qty);
+                    if normalized_qty > filled_qty {
+                        filled_qty = normalized_qty;
                         if filled_price.is_none() {
                             filled_price = Some(price);
                             resolution_source = ExitResolutionSource::RestExecution;
@@ -7526,8 +7903,34 @@ impl LiveRunner {
             }
         }
 
+        // Step 3.5: balance 가 0을 확인한 뒤에도 체결가가 없으면 REST 를 한 번 더 본다.
+        // 2026-04-24 관측처럼 시장가 청산 체결이 늦게 발생하면, pre-balance REST 3회가
+        // 체결 전 시점에 모두 소진되고 balance 만 0을 확인해 `balance_only` 로 떨어질 수 있다.
+        if filled_price.is_none() && matches!(holdings_after, Some(0)) && !order_no.is_empty() {
+            for attempt in 0..rest_retries {
+                if attempt > 0 {
+                    tokio::time::sleep(rest_interval).await;
+                }
+                let outcome = self
+                    .query_execution_detailed(order_no, "post_balance_flat", attempt + 1)
+                    .await;
+                let fill = outcome.fill;
+                rest_execution_attempts.push(outcome.diagnostics);
+                if let Some((price, qty)) = fill {
+                    let normalized_qty = qty.min(expected_qty);
+                    if normalized_qty > filled_qty {
+                        filled_qty = normalized_qty;
+                    }
+                    filled_price = Some(price);
+                    resolution_source = ExitResolutionSource::RestExecution;
+                    break;
+                }
+            }
+        }
+
         // WS/REST 모두 누락됐지만 실제 잔고가 감소했으면 BalanceOnly 로 역산
-        if filled_qty == 0
+        if filled_price.is_none()
+            && filled_qty == 0
             && let Some(after) = holdings_after
             && after < holding_before
         {
@@ -7542,6 +7945,7 @@ impl LiveRunner {
             holdings_after,
             resolution_source,
             ws_received,
+            rest_execution_attempts,
         }
     }
 
@@ -7623,6 +8027,9 @@ impl LiveRunner {
                             "order_no": order_no,
                             "ws_received": verification.ws_received,
                             "filled_qty_hint": verification.filled_qty,
+                            "rest_execution_attempts": verification.rest_execution_attempts.len(),
+                            "rest_execution_last_status": verification.rest_execution_last_status(),
+                            "rest_execution_diagnostics": verification.rest_execution_diagnostics_json(),
                             "exit_reason": format!("{:?}", reason),
                         }),
                         sent_at: None,
@@ -7643,6 +8050,9 @@ impl LiveRunner {
                         "order_no": order_no,
                         "ws_received": verification.ws_received,
                         "filled_qty_hint": verification.filled_qty,
+                        "rest_execution_attempts": verification.rest_execution_attempts.len(),
+                        "rest_execution_last_status": verification.rest_execution_last_status(),
+                        "rest_execution_diagnostics": verification.rest_execution_diagnostics_json(),
                         "balance_lookup": "failed",
                     }),
                     ManualInterventionMode::KeepLock,
@@ -7677,6 +8087,8 @@ impl LiveRunner {
                     "order_no": order_no,
                     "resolution_source": verification.resolution_source.label(),
                     "filled_qty_hint": verification.filled_qty,
+                    "rest_execution_attempts": verification.rest_execution_attempts.len(),
+                    "rest_execution_last_status": verification.rest_execution_last_status(),
                 }),
             );
         }
@@ -8334,6 +8746,9 @@ impl LiveRunner {
                     "exit_resolution_source": exit_meta.exit_resolution_source,
                     "ws_received": verification.ws_received,
                     "holdings_after": verification.holdings_after,
+                    "rest_execution_attempts": verification.rest_execution_attempts.len(),
+                    "rest_execution_last_status": verification.rest_execution_last_status(),
+                    "rest_execution_diagnostics": verification.rest_execution_diagnostics_json(),
                 }),
             );
         }
@@ -8374,6 +8789,9 @@ impl LiveRunner {
                 metadata: serde_json::json!({
                     "fill_price_unknown": exit_meta.fill_price_unknown,
                     "ws_received": verification.ws_received,
+                    "rest_execution_attempts": verification.rest_execution_attempts.len(),
+                    "rest_execution_last_status": verification.rest_execution_last_status(),
+                    "rest_execution_diagnostics": verification.rest_execution_diagnostics_json(),
                     "exit_reason": format!("{:?}", reason),
                     "quantity": pos.quantity,
                 }),
@@ -8670,6 +9088,10 @@ impl LiveRunner {
             }
             let prev = state.execution_state;
             state.execution_state = new;
+            if new == ExecutionState::Flat {
+                // 청산 직후 settle window 의 기준 시각.
+                state.last_flat_transition_at = Some(std::time::Instant::now());
+            }
             prev
         };
         info!(
@@ -8958,16 +9380,21 @@ impl LiveRunner {
         false
     }
 
-    async fn wait_until(&self, target: NaiveTime) {
+    async fn wait_until_session_milestone(&self, target: NaiveTime, session_end: NaiveTime) {
+        // 2026-04-24 수정: 장외 재시작은 다음 세션까지 대기해야 하지만,
+        // 장중 핫픽스 재시작은 이미 지난 OR milestone 을 즉시 통과해야 한다.
+        // 그래서 단순 시간 비교가 아니라 "오늘 세션이 아직 유효한가" 를 함께 본다.
+        let deadline =
+            compute_session_wait_deadline(Local::now().naive_local(), target, session_end);
         loop {
             if self.is_stopped() {
                 return;
             }
-            let now = Local::now().time();
-            if now >= target {
+            let now = Local::now().naive_local();
+            if now >= deadline {
                 return;
             }
-            let diff = (target - now).num_seconds().max(1) as u64;
+            let diff = (deadline - now).num_seconds().max(1) as u64;
             let sleep_secs = diff.min(10);
             tokio::select! {
                 _ = tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)) => {}
@@ -9342,6 +9769,17 @@ impl LiveRunner {
 
     /// 체결 내역 API 1회 조회 — (평균가, 체결수량) 반환
     async fn query_execution(&self, order_no: &str) -> Option<(i64, u64)> {
+        self.query_execution_detailed(order_no, "direct", 1)
+            .await
+            .fill
+    }
+
+    async fn query_execution_detailed(
+        &self,
+        order_no: &str,
+        phase: &'static str,
+        attempt: u32,
+    ) -> ExecutionQueryOutcome {
         let query = [
             ("CANO", self.client.account_no()),
             ("ACNT_PRDT_CD", self.client.account_product_code()),
@@ -9370,30 +9808,41 @@ impl LiveRunner {
             )
             .await;
 
-        if let Ok(resp) = resp
-            && let Some(items) = resp.output
-        {
-            for item in &items {
-                let odno = item.get("odno").and_then(|v| v.as_str()).unwrap_or("");
-                if odno == order_no {
-                    let avg_str = item.get("avg_prvs").and_then(|v| v.as_str()).unwrap_or("0");
-                    let avg: f64 = avg_str.parse().unwrap_or(0.0);
-                    let filled_qty: u64 = item
-                        .get("tot_ccld_qty")
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(0);
-                    if avg > 0.0 {
-                        info!(
-                            "{}: 체결 조회 — 주문 {} → 평균 {}원, {}주 체결",
-                            self.stock_name, order_no, avg as i64, filled_qty
-                        );
-                        return Some((avg as i64, filled_qty));
-                    }
+        match resp {
+            Ok(resp) => {
+                let Some(items) = resp.output else {
+                    return ExecutionQueryOutcome {
+                        fill: None,
+                        diagnostics: ExecutionQueryDiagnostics {
+                            phase: phase.to_string(),
+                            attempt,
+                            order_no: order_no.to_string(),
+                            status: "no_output".to_string(),
+                            ..ExecutionQueryDiagnostics::default()
+                        },
+                    };
+                };
+                let outcome = parse_execution_query_items(order_no, phase, attempt, &items);
+                if let Some((price, qty)) = outcome.fill {
+                    info!(
+                        "{}: 체결 조회 — 주문 {} → 평균 {}원, {}주 체결 (phase={}, attempt={})",
+                        self.stock_name, order_no, price, qty, phase, attempt
+                    );
                 }
+                outcome
             }
+            Err(e) => ExecutionQueryOutcome {
+                fill: None,
+                diagnostics: ExecutionQueryDiagnostics {
+                    phase: phase.to_string(),
+                    attempt,
+                    order_no: order_no.to_string(),
+                    status: "http_error".to_string(),
+                    error: Some(e.to_string()),
+                    ..ExecutionQueryDiagnostics::default()
+                },
+            },
         }
-        None
     }
 
     /// REST API로 현재가 조회 (fallback용)
@@ -10057,6 +10506,31 @@ pub(crate) async fn enter_manual_intervention_state(
     stop_notify.notify_waiters();
 }
 
+/// 장중 milestone 대기 종료 시각 계산 — 2026-04-24 수정.
+///
+/// 기존 구현은 `NaiveTime` 만 비교해, target 시각이 오늘 이미 지난 경우 즉시
+/// 통과했다. 장외(예: 22:31) 재시작 후 `wait_until(09:00)` 이 대기 없이 빠져
+/// 러너가 바로 종료되는 버그(2026-04-24 발견)의 원인이었다.
+///
+/// 현재 정책:
+/// - target 전/정각이면 오늘 target 까지 대기.
+/// - target 은 지났지만 `session_end` 전이면 장중 재시작으로 보고 즉시 통과.
+/// - session_end 이후면 다음날 target 까지 대기.
+pub(crate) fn compute_session_wait_deadline(
+    now: chrono::NaiveDateTime,
+    target: NaiveTime,
+    session_end: NaiveTime,
+) -> chrono::NaiveDateTime {
+    let today_target = now.date().and_time(target);
+    if now <= today_target {
+        return today_target;
+    }
+    if now.time() < session_end {
+        return now;
+    }
+    today_target + chrono::Duration::days(1)
+}
+
 /// ETF 호가단위 계산 — KRX ETF 호가단위 표 반영.
 /// 2,000원 미만 1원 / 2,000원 이상~50,000원 미만 5원 / 50,000원 이상 50원.
 fn etf_tick_size(price: i64) -> i64 {
@@ -10240,6 +10714,8 @@ mod stop_action_tests {
             execution_state,
             preflight_metadata: PreflightMetadata::default(),
             last_external_gate_stale: false,
+            last_flat_transition_at: None,
+            last_quote_sanity_issue: None,
             armed_stats: ArmedWatchStats::default(),
             current_armed_signal_id: None,
         }
@@ -10651,6 +11127,8 @@ mod manual_intervention_tests {
             execution_state: super::ExecutionState::Flat,
             preflight_metadata: super::PreflightMetadata::default(),
             last_external_gate_stale: false,
+            last_flat_transition_at: None,
+            last_quote_sanity_issue: None,
             armed_stats: super::ArmedWatchStats::default(),
             current_armed_signal_id: None,
         }
@@ -11060,6 +11538,7 @@ mod exit_verification_tests {
             holdings_after: holdings,
             resolution_source: src,
             ws_received: false,
+            rest_execution_attempts: Vec::new(),
         }
     }
 
@@ -11141,6 +11620,67 @@ mod exit_verification_tests {
         let d = ExitTraceMeta::default();
         assert!(!d.fill_price_unknown);
         assert_eq!(d.exit_resolution_source, "");
+    }
+
+    #[test]
+    fn execution_query_parser_aggregates_matching_rows_by_weighted_average() {
+        let items = vec![
+            serde_json::json!({
+                "odno": "A",
+                "tot_ccld_qty": "10",
+                "avg_prvs": "1000",
+            }),
+            serde_json::json!({
+                "odno": "A",
+                "tot_ccld_qty": "30",
+                "avg_prvs": "1020",
+            }),
+            serde_json::json!({
+                "odno": "B",
+                "tot_ccld_qty": "99",
+                "avg_prvs": "9999",
+            }),
+        ];
+
+        let outcome = super::parse_execution_query_items("A", "post_balance_flat", 2, &items);
+        assert_eq!(outcome.fill, Some((1015, 40)));
+        assert_eq!(outcome.diagnostics.status, "filled");
+        assert_eq!(outcome.diagnostics.output_rows, 3);
+        assert_eq!(outcome.diagnostics.matched_rows, 2);
+        assert_eq!(outcome.diagnostics.priced_qty, 40);
+    }
+
+    #[test]
+    fn execution_query_parser_distinguishes_zero_qty_and_missing_order() {
+        let zero_qty = vec![serde_json::json!({
+            "odno": "A",
+            "tot_ccld_qty": "0",
+            "avg_prvs": "1000",
+        })];
+        let zero = super::parse_execution_query_items("A", "pre_balance", 1, &zero_qty);
+        assert_eq!(zero.fill, None);
+        assert_eq!(zero.diagnostics.status, "matched_zero_qty");
+
+        let missing = super::parse_execution_query_items("B", "pre_balance", 1, &zero_qty);
+        assert_eq!(missing.fill, None);
+        assert_eq!(missing.diagnostics.status, "order_not_found");
+    }
+
+    #[test]
+    fn rest_diagnostics_json_keeps_last_status_for_metadata() {
+        let mut v = make(Some(0), None, ExitResolutionSource::BalanceOnly);
+        v.rest_execution_attempts
+            .push(super::ExecutionQueryDiagnostics {
+                phase: "pre_balance".to_string(),
+                attempt: 1,
+                order_no: "0001".to_string(),
+                status: "matched_zero_qty".to_string(),
+                ..super::ExecutionQueryDiagnostics::default()
+            });
+        assert_eq!(v.rest_execution_last_status(), Some("matched_zero_qty"));
+        let json = v.rest_execution_diagnostics_json();
+        assert_eq!(json[0]["phase"], "pre_balance");
+        assert_eq!(json[0]["status"], "matched_zero_qty");
     }
 }
 
@@ -11230,7 +11770,10 @@ mod restart_recovery_tests {
 /// `ExecutionState` 전이 규칙과 `PreflightMetadata` gate 순수 로직 회귀 테스트.
 #[cfg(test)]
 mod execution_state_tests {
-    use super::{ExecutionState, PreflightMetadata, etf_tick_size, evaluate_spread_gate};
+    use super::{
+        ExecutionState, PreflightMetadata, QuoteSanityEvaluation, etf_tick_size,
+        evaluate_spread_gate, validate_quote_sanity,
+    };
     use chrono::NaiveTime;
 
     #[test]
@@ -11349,6 +11892,13 @@ mod execution_state_tests {
         let mut pf = PreflightMetadata::default();
         pf.subscription_health_ok = false;
         assert!(!pf.all_ok());
+
+        let mut pf = PreflightMetadata::default();
+        pf.quote_issue = Some("off_market".to_string());
+        assert!(
+            !pf.all_ok(),
+            "비정상 호가는 external spread override 와 무관하게 최종 진입을 차단해야 한다"
+        );
     }
 
     #[test]
@@ -11393,5 +11943,118 @@ mod execution_state_tests {
             ..PreflightMetadata::default()
         };
         assert_eq!(pf.spread_in_ticks(), Some(2.0));
+    }
+
+    #[test]
+    fn quote_sanity_accepts_normal_quote_near_current_price() {
+        assert_eq!(
+            validate_quote_sanity(1_405, 1_400, Some(1_402)),
+            QuoteSanityEvaluation::Valid
+        );
+    }
+
+    #[test]
+    fn quote_sanity_rejects_inverted_quote() {
+        assert_eq!(
+            validate_quote_sanity(1_399, 1_400, Some(1_400)),
+            QuoteSanityEvaluation::Invalid("inverted")
+        );
+    }
+
+    #[test]
+    fn quote_sanity_rejects_off_market_quote() {
+        assert_eq!(
+            validate_quote_sanity(20_000, 294_564_483, Some(1_400)),
+            QuoteSanityEvaluation::Invalid("inverted")
+        );
+        assert_eq!(
+            validate_quote_sanity(2_000, 1_990, Some(1_400)),
+            QuoteSanityEvaluation::Invalid("off_market")
+        );
+    }
+}
+
+/// 2026-04-24 세션 milestone 대기 회귀 방지.
+/// 장외 재시작은 다음 세션을 기다리고, 장중 재시작은 이미 지난 milestone 을
+/// 즉시 통과해야 한다.
+#[cfg(test)]
+mod wait_deadline_tests {
+    use super::compute_session_wait_deadline;
+    use chrono::{NaiveDate, NaiveTime};
+
+    fn dt(y: i32, m: u32, d: u32, hh: u32, mm: u32) -> chrono::NaiveDateTime {
+        NaiveDate::from_ymd_opt(y, m, d)
+            .unwrap()
+            .and_hms_opt(hh, mm, 0)
+            .unwrap()
+    }
+
+    #[test]
+    fn deadline_is_today_when_target_still_in_future() {
+        // 01:02 → 09:00: 같은 날 09:00 을 기다려야 한다.
+        let now = dt(2026, 4, 24, 1, 2);
+        let target = NaiveTime::from_hms_opt(9, 0, 0).unwrap();
+        let session_end = NaiveTime::from_hms_opt(15, 25, 0).unwrap();
+        assert_eq!(
+            compute_session_wait_deadline(now, target, session_end),
+            dt(2026, 4, 24, 9, 0)
+        );
+    }
+
+    #[test]
+    fn deadline_rolls_to_next_day_when_target_already_passed_after_session() {
+        // 22:31 → 09:00: 다음 날 09:00 까지 대기해야 한다 (핵심 회귀 케이스).
+        let now = dt(2026, 4, 23, 22, 31);
+        let target = NaiveTime::from_hms_opt(9, 0, 0).unwrap();
+        let session_end = NaiveTime::from_hms_opt(15, 25, 0).unwrap();
+        assert_eq!(
+            compute_session_wait_deadline(now, target, session_end),
+            dt(2026, 4, 24, 9, 0)
+        );
+    }
+
+    #[test]
+    fn deadline_is_immediate_when_market_open_milestone_already_passed() {
+        // 13:39 핫픽스 재시작 → 09:00 장 시작 milestone 은 이미 충족된 것으로 봐야 한다.
+        let now = dt(2026, 4, 24, 13, 39);
+        let target = NaiveTime::from_hms_opt(9, 0, 0).unwrap();
+        let session_end = NaiveTime::from_hms_opt(15, 25, 0).unwrap();
+        assert_eq!(compute_session_wait_deadline(now, target, session_end), now);
+    }
+
+    #[test]
+    fn deadline_waits_for_or_end_when_it_is_still_future_today() {
+        // 09:01 재시작 → 09:05 5분 OR 종료는 아직 미래이므로 기다린다.
+        let now = dt(2026, 4, 24, 9, 1);
+        let target = NaiveTime::from_hms_opt(9, 5, 0).unwrap();
+        let session_end = NaiveTime::from_hms_opt(15, 25, 0).unwrap();
+        assert_eq!(
+            compute_session_wait_deadline(now, target, session_end),
+            dt(2026, 4, 24, 9, 5)
+        );
+    }
+
+    #[test]
+    fn deadline_rolls_after_session_end() {
+        // 16:00 → 09:00: 세션 종료 이후 → 다음 날 장 시작.
+        let now = dt(2026, 4, 24, 16, 0);
+        let target = NaiveTime::from_hms_opt(9, 0, 0).unwrap();
+        let session_end = NaiveTime::from_hms_opt(15, 25, 0).unwrap();
+        assert_eq!(
+            compute_session_wait_deadline(now, target, session_end),
+            dt(2026, 4, 25, 9, 0)
+        );
+    }
+
+    #[test]
+    fn deadline_now_equals_target_returns_today() {
+        // 09:00 정각에 wait_until(09:00) — 즉시 통과해야 하므로 오늘 09:00 deadline.
+        let now = dt(2026, 4, 24, 9, 0);
+        let target = NaiveTime::from_hms_opt(9, 0, 0).unwrap();
+        let session_end = NaiveTime::from_hms_opt(15, 25, 0).unwrap();
+        assert_eq!(
+            compute_session_wait_deadline(now, target, session_end),
+            dt(2026, 4, 24, 9, 0)
+        );
     }
 }
